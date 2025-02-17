@@ -82,6 +82,7 @@ def create_subscribe(
                                         season=subscribe_in.season,
                                         doubanid=subscribe_in.doubanid,
                                         bangumiid=subscribe_in.bangumiid,
+                                        mediaid=subscribe_in.mediaid,
                                         username=current_user.name,
                                         best_version=subscribe_in.best_version,
                                         save_path=subscribe_in.save_path,
@@ -109,6 +110,7 @@ def update_subscribe(
     if not subscribe:
         return schemas.Response(success=False, message="订阅不存在")
     # 避免更新缺失集数
+    old_subscribe_dict = subscribe.to_dict()
     subscribe_dict = subscribe_in.dict()
     if not subscribe_in.lack_episode:
         # 没有缺失集数时，缺失集数清空，避免更新为0
@@ -126,7 +128,8 @@ def update_subscribe(
     # 发送订阅调整事件
     eventmanager.send_event(EventType.SubscribeModified, {
         "subscribe_id": subscribe.id,
-        "subscribe_info": subscribe_dict,
+        "old_subscribe_info": old_subscribe_dict,
+        "subscribe_info": subscribe.to_dict(),
     })
     return schemas.Response(success=True)
 
@@ -146,8 +149,15 @@ def update_subscribe_status(
     valid_states = ["R", "P", "S"]
     if state not in valid_states:
         return schemas.Response(success=False, message="无效的订阅状态")
+    old_subscribe_dict = subscribe.to_dict()
     subscribe.update(db, {
         "state": state
+    })
+    # 发送订阅调整事件
+    eventmanager.send_event(EventType.SubscribeModified, {
+        "subscribe_id": subscribe.id,
+        "old_subscribe_info": old_subscribe_dict,
+        "subscribe_info": subscribe.to_dict(),
     })
     return schemas.Response(success=True)
 
@@ -162,7 +172,6 @@ def subscribe_mediaid(
     """
     根据 TMDBID/豆瓣ID/BangumiId 查询订阅 tmdb:/douban:
     """
-    result = None
     title_check = False
     if mediaid.startswith("tmdb:"):
         tmdbid = mediaid[5:]
@@ -181,6 +190,10 @@ def subscribe_mediaid(
         if not bangumiid or not str(bangumiid).isdigit():
             return Subscribe()
         result = Subscribe.get_by_bangumiid(db, int(bangumiid))
+        if not result and title:
+            title_check = True
+    else:
+        result = Subscribe.get_by_mediaid(db, mediaid)
         if not result and title:
             title_check = True
     # 使用名称检查订阅
@@ -213,10 +226,17 @@ def reset_subscribes(
     """
     subscribe = Subscribe.get(db, subid)
     if subscribe:
+        old_subscribe_dict = subscribe.to_dict()
         subscribe.update(db, {
             "note": [],
             "lack_episode": subscribe.total_episode,
             "state": "R"
+        })
+        # 发送订阅调整事件
+        eventmanager.send_event(EventType.SubscribeModified, {
+            "subscribe_id": subscribe.id,
+            "old_subscribe_info": old_subscribe_dict,
+            "subscribe_info": subscribe.to_dict(),
         })
         return schemas.Response(success=True)
     return schemas.Response(success=False, message="订阅不存在")
@@ -293,6 +313,10 @@ def delete_subscribe_by_mediaid(
         if not doubanid:
             return schemas.Response(success=False)
         subscribe = Subscribe().get_by_doubanid(db, doubanid)
+        if subscribe:
+            delete_subscribes.append(subscribe)
+    else:
+        subscribe = Subscribe().get_by_mediaid(db, mediaid)
         if subscribe:
             delete_subscribes.append(subscribe)
     for subscribe in delete_subscribes:

@@ -1,4 +1,4 @@
-from typing import Optional
+from typing import Optional, List
 
 from fastapi import Depends, HTTPException
 from sqlalchemy.orm import Session
@@ -51,6 +51,12 @@ class UserOper(DbOper):
     用户管理
     """
 
+    def list(self) -> List[User]:
+        """
+        获取用户列表
+        """
+        return User.list(self._db)
+
     def add(self, **kwargs):
         """
         新增用户
@@ -89,4 +95,17 @@ class UserOper(DbOper):
         settings = self.get_settings(name)
         if settings:
             return settings.get(key)
+        return None
+
+    def get_name(self, **kwargs) -> Optional[str]:
+        """
+        根据绑定账号获取用户名称
+        """
+        users = self.list()
+        for user in users:
+            user_setting = user.settings
+            if user_setting:
+                for k, v in kwargs.items():
+                    if user_setting.get(k) == str(v):
+                        return user.name
         return None

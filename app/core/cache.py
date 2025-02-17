@@ -90,6 +90,30 @@ class CacheBackend(ABC):
         """
         return f"region:{region}" if region else "region:default"
 
+    @staticmethod
+    def get_cache_key(func, args, kwargs):
+        """
+        获取缓存的键，通过哈希函数对函数的参数进行处理
+        :param func: 被装饰的函数
+        :param args: 位置参数
+        :param kwargs: 关键字参数
+        :return: 缓存键
+        """
+        signature = inspect.signature(func)
+        # 绑定传入的参数并应用默认值
+        bound = signature.bind(*args, **kwargs)
+        bound.apply_defaults()
+        # 忽略第一个参数，如果它是实例(self)或类(cls)
+        parameters = list(signature.parameters.keys())
+        if parameters and parameters[0] in ("self", "cls"):
+            bound.arguments.pop(parameters[0], None)
+        # 按照函数签名顺序提取参数值列表
+        keys = [
+            bound.arguments[param] for param in signature.parameters if param in bound.arguments
+        ]
+        # 使用有序参数生成缓存键
+        return f"{func.__name__}_{hashkey(*keys)}"
+
 
 class CacheToolsBackend(CacheBackend):
     """
@@ -218,6 +242,10 @@ class RedisBackend(CacheBackend):
     - Pickle 反序列化可能存在安全风险，需进一步重构调用来源，避免复杂对象缓存
     """
 
+    # 类型缓存集合，针对非容器简单类型
+    _complex_serializable_types = set()
+    _simple_serializable_types = set()
+
     def __init__(self, redis_url: str = "redis://localhost", ttl: int = 1800):
         """
         初始化 Redis 缓存实例
@@ -258,19 +286,42 @@ class RedisBackend(CacheBackend):
             logger.error(f"Failed to set Redis maxmemory or policy: {e}")
 
     @staticmethod
-    def serialize(value: Any) -> bytes:
+    def is_container_type(t):
+        return t in (list, dict, tuple, set)
+
+    @classmethod
+    def serialize(cls, value: Any) -> bytes:
         """
         将值序列化为二进制数据，根据序列化方式标识格式
         """
-        try:
-            # 尝试 JSON 序列化
-            return b"JSON" + b"\x00" + json.dumps(value).encode("utf-8")
-        except TypeError:
-            # 如果 JSON 序列化失败，使用 Pickle 序列化
-            return b"PICKLE" + b"\x00" + pickle.dumps(value)
+        vt = type(value)
+        # 针对非容器类型使用缓存策略
+        if not cls.is_container_type(vt):
+            # 如果已知需要复杂序列化
+            if vt in cls._complex_serializable_types:
+                return b"PICKLE" + b"\x00" + pickle.dumps(value)
+            # 如果已知可以简单序列化
+            if vt in cls._simple_serializable_types:
+                json_data = json.dumps(value).encode("utf-8")
+                return b"JSON" + b"\x00" + json_data
+            # 对于未知的非容器类型，尝试简单序列化，如抛出异常，再使用复杂序列化
+            try:
+                json_data = json.dumps(value).encode("utf-8")
+                cls._simple_serializable_types.add(vt)
+                return b"JSON" + b"\x00" + json_data
+            except TypeError:
+                cls._complex_serializable_types.add(vt)
+                return b"PICKLE" + b"\x00" + pickle.dumps(value)
+        # 针对容器类型，每次尝试简单序列化，不使用缓存
+        else:
+            try:
+                json_data = json.dumps(value).encode("utf-8")
+                return b"JSON" + b"\x00" + json_data
+            except TypeError:
+                return b"PICKLE" + b"\x00" + pickle.dumps(value)
 
-    @staticmethod
-    def deserialize(value: bytes) -> Any:
+    @classmethod
+    def deserialize(cls, value: bytes) -> Any:
         """
         将二进制数据反序列化为原始值，根据格式标识区分序列化方式
         """
@@ -449,28 +500,20 @@ def cached(region: Optional[str] = None, maxsize: int = 1000, ttl: int = 1800,
             return False
         return True
 
-    def get_cache_key(func, args, kwargs):
+    def is_valid_cache_value(cache_key: str, cached_value: Any, cache_region: str) -> bool:
         """
-        获取缓存的键，通过哈希函数对函数的参数进行处理
-        :param func: 被装饰的函数
-        :param args: 位置参数
-        :param kwargs: 关键字参数
-        :return: 缓存键
+        判断指定的值是否为一个有效的缓存值
+
+        :param cache_key: 缓存的键
+        :param cached_value: 缓存的值
+        :param cache_region: 缓存的区
+        :return: 若值是有效的缓存值返回 True，否则返回 False
         """
-        # 获取方法签名
-        signature = inspect.signature(func)
-        resolved_kwargs = {}
-        # 获取默认值并结合传递的参数（如果有）
-        for param, value in signature.parameters.items():
-            if param in kwargs:
-                # 使用显式传递的参数
-                resolved_kwargs[param] = kwargs[param]
-            elif value.default is not inspect.Parameter.empty:
-                # 没有传递参数时使用默认值
-                resolved_kwargs[param] = value.default
-        # 构造缓存键，忽略实例（self 或 cls）
-        params_to_hash = args[1:] if len(args) > 1 else []
-        return f"{func.__name__}_{hashkey(*params_to_hash, **resolved_kwargs)}"
+        # 如果 skip_none 为 False，且 value 为 None，需要判断缓存实际是否存在
+        if not skip_none and cached_value is None:
+            if not cache_backend.exists(key=cache_key, region=cache_region):
+                return False
+        return True
 
     def decorator(func):
 
@@ -480,10 +523,10 @@ def cached(region: Optional[str] = None, maxsize: int = 1000, ttl: int = 1800,
         @wraps(func)
         def wrapper(*args, **kwargs):
             # 获取缓存键
-            cache_key = get_cache_key(func, args, kwargs)
+            cache_key = cache_backend.get_cache_key(func, args, kwargs)
             # 尝试获取缓存
             cached_value = cache_backend.get(cache_key, region=cache_region)
-            if should_cache(cached_value):
+            if should_cache(cached_value) and is_valid_cache_value(cache_key, cached_value, cache_region):
                 return cached_value
             # 执行函数并缓存结果
             result = func(*args, **kwargs)

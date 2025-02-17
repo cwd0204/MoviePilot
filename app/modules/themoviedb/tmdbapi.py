@@ -494,7 +494,7 @@ class TmdbApi:
             return ret_info
 
     @cached(maxsize=settings.CACHE_CONF["tmdb"], ttl=settings.CACHE_CONF["meta"])
-    @rate_limit_exponential(source="match_tmdb_web", max_wait=1800, enable_logging=True)
+    @rate_limit_exponential(source="match_tmdb_web", base_wait=5, max_wait=1800, enable_logging=True)
     def match_web(self, name: str, mtype: MediaType) -> Optional[dict]:
         """
         搜索TMDB网站，直接抓取结果，结果只有一条时才返回
@@ -601,12 +601,76 @@ class TmdbApi:
             tmdb_info['genre_ids'] = __get_genre_ids(tmdb_info.get('genres'))
             # 别名和译名
             tmdb_info['names'] = self.__get_names(tmdb_info)
+            # 内容分级
+            tmdb_info['content_rating'] = self.__get_content_rating(tmdb_info)
             # 转换多语种标题
             self.__update_tmdbinfo_extra_title(tmdb_info)
             # 转换中文标题
             self.__update_tmdbinfo_cn_title(tmdb_info)
 
         return tmdb_info
+
+    @staticmethod
+    def __get_content_rating(tmdb_info: dict) -> Optional[str]:
+        """
+        获得tmdb中的内容评级
+        :param tmdb_info: TMDB信息
+        :return: 内容评级
+        """
+        if not tmdb_info:
+            return None
+        # dict[地区:分级]
+        ratings = {}
+        if results := (tmdb_info.get("release_dates") or {}).get("results"):
+            """
+            [
+                {
+                    "iso_3166_1": "AR",
+                    "release_dates": [
+                        {
+                            "certification": "+13",
+                            "descriptors": [],
+                            "iso_639_1": "",
+                            "note": "",
+                            "release_date": "2025-01-23T00:00:00.000Z",
+                            "type": 3
+                        }
+                    ]
+                }
+            ]
+            """
+            for item in results:
+                iso_3166_1 = item.get("iso_3166_1")
+                if not iso_3166_1:
+                    continue
+                dates = item.get("release_dates")
+                if not dates:
+                    continue
+                certification = dates[0].get("certification")
+                if not certification:
+                    continue
+                ratings[iso_3166_1] = certification
+        elif results := (tmdb_info.get("content_ratings") or {}).get("results"):
+            """
+            [
+                {
+                    "descriptors": [],
+                    "iso_3166_1": "US",
+                    "rating": "TV-MA"
+                }
+            ]
+            """
+            for item in results:
+                iso_3166_1 = item.get("iso_3166_1")
+                if not iso_3166_1:
+                    continue
+                rating = item.get("rating")
+                if not rating:
+                    continue
+                ratings[iso_3166_1] = rating
+        if not ratings:
+            return None
+        return ratings.get("CN") or ratings.get("US")
 
     @staticmethod
     def __update_tmdbinfo_cn_title(tmdb_info: dict):
@@ -700,6 +764,7 @@ class TmdbApi:
                                                      "credits,"
                                                      "alternative_titles,"
                                                      "translations,"
+                                                     "release_dates,"
                                                      "external_ids") -> Optional[dict]:
         """
         获取电影的详情
@@ -812,6 +877,7 @@ class TmdbApi:
                                                   "credits,"
                                                   "alternative_titles,"
                                                   "translations,"
+                                                  "content_ratings,"
                                                   "external_ids") -> Optional[dict]:
         """
         获取电视剧的详情
@@ -1080,18 +1146,17 @@ class TmdbApi:
             logger.error(str(e))
             return {}
 
-    def discover_movies(self, **kwargs) -> List[dict]:
+    def discover_movies(self, params: dict) -> List[dict]:
         """
         发现电影
-        :param kwargs:
+        :param params: 参数
         :return:
         """
         if not self.discover:
             return []
         try:
-            logger.debug(f"正在发现电影：{kwargs}...")
-            params_tuple = tuple(kwargs.items())
-            tmdbinfo = self.discover.discover_movies(params_tuple)
+            logger.debug(f"正在发现电影：{params}...")
+            tmdbinfo = self.discover.discover_movies(tuple(params.items()))
             if tmdbinfo:
                 for info in tmdbinfo:
                     info['media_type'] = MediaType.MOVIE
@@ -1100,18 +1165,17 @@ class TmdbApi:
             logger.error(str(e))
             return []
 
-    def discover_tvs(self, **kwargs) -> List[dict]:
+    def discover_tvs(self, params: dict) -> List[dict]:
         """
         发现电视剧
-        :param kwargs:
+        :param params: 参数
         :return:
         """
         if not self.discover:
             return []
         try:
-            logger.debug(f"正在发现电视剧：{kwargs}...")
-            params_tuple = tuple(kwargs.items())
-            tmdbinfo = self.discover.discover_tv_shows(params_tuple)
+            logger.debug(f"正在发现电视剧：{params}...")
+            tmdbinfo = self.discover.discover_tv_shows(tuple(params.items()))
             if tmdbinfo:
                 for info in tmdbinfo:
                     info['media_type'] = MediaType.TV

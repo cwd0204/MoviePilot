@@ -427,9 +427,12 @@ class FanartModule(_ModuleBase):
         else:
             image_url = cls._tv_url % queryid
         try:
-            ret = RequestUtils(proxies=cls._proxies, timeout=10).get_res(image_url)
+            ret = RequestUtils(proxies=cls._proxies, timeout=10).get_res(image_url, raise_exception=True)
             if ret:
                 return ret.json()
+            else:
+                logger.debug(f"未能获取到 {queryid} 的Fanart图片")
+                return {}
         except Exception as err:
             logger.error(f"获取{queryid}的Fanart图片失败：{str(err)}")
-        return None
+            return None

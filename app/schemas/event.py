@@ -3,7 +3,7 @@ from typing import Optional, Dict, Any, List, Set
 
 from pydantic import BaseModel, Field, root_validator
 
-from app.schemas import MessageChannel
+from app.schemas import MessageChannel, FileItem
 
 
 class BaseEventData(BaseModel):
@@ -50,7 +50,7 @@ class AuthCredentials(ChainEventData):
     service: Optional[str] = Field(default=None, description="服务名称")
 
     @root_validator(pre=True)
-    def check_fields_based_on_grant_type(cls, values): # noqa
+    def check_fields_based_on_grant_type(cls, values):  # noqa
         grant_type = values.get("grant_type")
         if not grant_type:
             values["grant_type"] = "password"
@@ -202,3 +202,98 @@ class ResourceDownloadEventData(ChainEventData):
     cancel: bool = Field(default=False, description="是否取消下载")
     source: str = Field(default="未知拦截源", description="拦截源")
     reason: str = Field(default="", description="拦截原因")
+
+
+class TransferInterceptEventData(ChainEventData):
+    """
+    TransferIntercept 事件的数据模型
+
+    Attributes:
+        # 输入参数
+        fileitem (FileItem): 源文件
+        target_storage (str): 目标存储
+        target_path (Path): 目标路径
+        transfer_type (str): 整理方式（copy、move、link、softlink等）
+        options (dict): 其他参数
+
+        # 输出参数
+        cancel (bool): 是否取消下载，默认值为 False
+        source (str): 拦截源，默认值为 "未知拦截源"
+        reason (str): 拦截原因，描述拦截的具体原因
+    """
+    # 输入参数
+    fileitem: FileItem = Field(..., description="源文件")
+    mediainfo: Any = Field(..., description="媒体信息")
+    target_storage: str = Field(..., description="目标存储")
+    target_path: Path = Field(..., description="目标路径")
+    transfer_type: str = Field(..., description="整理方式")
+    options: Optional[dict] = Field(default=None, description="其他参数")
+
+    # 输出参数
+    cancel: bool = Field(default=False, description="是否取消整理")
+    source: str = Field(default="未知拦截源", description="拦截源")
+    reason: str = Field(default="", description="拦截原因")
+
+
+class DiscoverMediaSource(BaseModel):
+    """
+    探索媒体数据源的基类
+    """
+    name: str = Field(..., description="数据源名称")
+    mediaid_prefix: str = Field(..., description="媒体ID的前缀，不含:")
+    api_path: str = Field(..., description="媒体数据源API地址")
+    filter_params: Optional[Dict[str, Any]] = Field(default=None, description="过滤参数")
+    filter_ui: Optional[List[dict]] = Field(default=[], description="过滤参数UI配置")
+    depends: Optional[Dict[str, list]] = Field(default=None, description="UI依赖关系字典")
+
+
+class DiscoverSourceEventData(ChainEventData):
+    """
+    DiscoverSource 事件的数据模型
+
+    Attributes:
+        # 输出参数
+        extra_sources (List[DiscoverMediaSource]): 额外媒体数据源
+    """
+    # 输出参数
+    extra_sources: List[DiscoverMediaSource] = Field(default_factory=list, description="额外媒体数据源")
+
+
+class RecommendMediaSource(BaseModel):
+    """
+    推荐媒体数据源的基类
+    """
+    name: str = Field(..., description="数据源名称")
+    api_path: str = Field(..., description="媒体数据源API地址")
+
+
+class RecommendSourceEventData(ChainEventData):
+    """
+    RecommendSource 事件的数据模型
+
+    Attributes:
+        # 输出参数
+        extra_sources (List[RecommendMediaSource]): 额外媒体数据源
+    """
+    # 输出参数
+    extra_sources: List[RecommendMediaSource] = Field(default_factory=list, description="额外媒体数据源")
+
+
+class MediaRecognizeConvertEventData(ChainEventData):
+    """
+    MediaRecognizeConvert 事件的数据模型
+
+    Attributes:
+        # 输入参数
+        mediaid (str): 媒体ID，格式为`前缀:ID值`，如 tmdb:12345、douban:1234567
+        convert_type (str): 转换类型 仅支持：themoviedb/douban，需要转换为对应的媒体数据并返回
+
+        # 输出参数
+        media_dict (dict): TheMovieDb/豆瓣的媒体数据
+    """
+    # 输入参数
+    mediaid: str = Field(..., description="媒体ID")
+    convert_type: str = Field(..., description="转换类型（themoviedb/douban）")
+
+    # 输出参数
+    media_dict: dict = Field(default=dict, description="转换后的媒体信息（TheMovieDb/豆瓣）")

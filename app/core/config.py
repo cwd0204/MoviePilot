@@ -118,7 +118,7 @@ class ConfigModel(BaseModel):
     # 自动检查和更新站点资源包（站点索引、认证等）
     AUTO_UPDATE_RESOURCE: bool = True
     # 是否启用DOH解析域名
-    DOH_ENABLE: bool = True
+    DOH_ENABLE: bool = False
     # 使用 DOH 解析的域名列表
     DOH_DOMAINS: str = ("api.themoviedb.org,"
                         "api.tmdb.org,"
@@ -236,11 +236,18 @@ class ConfigModel(BaseModel):
                                  "doubanio.com",
                                  "lain.bgm.tv",
                                  "raw.githubusercontent.com",
-                                 "github.com"]
+                                 "github.com",
+                                 "thetvdb.com",
+                                 "cctvpic.com",
+                                 "iqiyipic.com",
+                                 "hdslb.com",
+                                 "cmvideo.cn",
+                                 "ykimg.com",
+                                 "qpic.cn"]
     )
     # 允许的图片文件后缀格式
     SECURITY_IMAGE_SUFFIXES: List[str] = Field(
-        default_factory=lambda: [".jpg", ".jpeg", ".png", ".webp", ".gif", ".svg"]
+        default_factory=lambda: [".jpg", ".jpeg", ".png", ".webp", ".gif", ".svg", ".avif"]
     )
     # 重命名时支持的S0别名
     RENAME_FORMAT_S0_NAMES: List[str] = Field(
@@ -248,6 +255,8 @@ class ConfigModel(BaseModel):
     )
     # 启用分词搜索
     TOKENIZED_SEARCH: bool = False
+    # 为指定默认字幕添加.default后缀,默认不启用
+    DEFAULT_SUB: Optional[str] = None
 
 
 class Settings(BaseSettings, ConfigModel, LogConfigModel):
