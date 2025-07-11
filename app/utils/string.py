@@ -15,6 +15,8 @@ from app.schemas.types import MediaType
 _special_domains = [
     'u2.dmhy.org',
     'pt.ecust.pp.ua',
+    'pt.gtkpw.xyz',
+    'pt.gtk.pw'
 ]
 
 # 内置版本号转换字典
@@ -206,7 +208,7 @@ class StringUtils:
             return [StringUtils.clear(x) for x in text]
 
     @staticmethod
-    def clear_upper(text: str) -> str:
+    def clear_upper(text: Optional[str]) -> str:
         """
         去除特殊字符，同时大写
         """
@@ -595,7 +597,7 @@ class StringUtils:
         return mtype, key_word, season_num, episode_num, year, content
 
     @staticmethod
-    def str_title(s: str) -> str:
+    def str_title(s: Optional[str]) -> str:
         """
         大写首字母兼容None
         """
@@ -641,13 +643,14 @@ class StringUtils:
         if len(parts) > 3:
             # 处理不希望包含多个冒号的情况（除了协议后的冒号）
             return None, None
-        # 不含端口地址
-        domain = ":".join(parts[:-1]).rstrip('/')
-        # 端口号
-        try:
+        elif len(parts) == 3:
             port = int(parts[-1])
-        except ValueError:
-            # 端口号不是整数，返回 None 表示无效
+            # 不含端口地址
+            domain = ":".join(parts[:-1]).rstrip('/')
+        elif len(parts) == 2:
+            port = 443 if address.startswith("https") else 80
+            domain = address
+        else:
             return None, None
         return domain, port
 
@@ -905,3 +908,20 @@ class StringUtils:
         :return: 如果elem有效（非None且长度大于0），返回True；否则返回False
         """
         return elem is not None and len(elem) > 0
+
+    @staticmethod
+    def is_link(text: str) -> bool:
+        """
+        检查文件是否为链接地址，支持各类协议
+        :param text: 要检查的文本
+        :return: 如果URL有效，返回True；否则返回False
+        """
+        if not text:
+            return False
+        # 检查是否以http、https、ftp等协议开头
+        if re.match(r'^(http|https|ftp|ftps|sftp|ws|wss)://', text):
+            return True
+        # 检查是否为IP地址或域名
+        if re.match(r'^[a-zA-Z0-9.-]+(\.[a-zA-Z]{2,})?$', text):
+            return True
+        return False

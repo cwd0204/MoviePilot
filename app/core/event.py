@@ -6,11 +6,9 @@ import threading
 import time
 import traceback
 import uuid
-from functools import lru_cache
 from queue import Empty, PriorityQueue
 from typing import Callable, Dict, List, Optional, Union
 
-from app.helper.message import MessageHelper
 from app.helper.thread import ThreadHelper
 from app.log import logger
 from app.schemas import ChainEventData
@@ -31,7 +29,7 @@ class Event:
 
     def __init__(self, event_type: Union[EventType, ChainEventType],
                  event_data: Optional[Union[Dict, ChainEventData]] = None,
-                 priority: int = DEFAULT_EVENT_PRIORITY):
+                 priority: Optional[int] = DEFAULT_EVENT_PRIORITY):
         """
         :param event_type: 事件的类型，支持 EventType 或 ChainEventType
         :param event_data: 可选，事件携带的数据，默认为空字典
@@ -71,11 +69,7 @@ class EventManager(metaclass=Singleton):
     EventManager 负责管理和调度广播事件和链式事件，包括订阅、发送和处理事件
     """
 
-    # 退出事件
-    __event = threading.Event()
-
     def __init__(self):
-        self.__messagehelper = MessageHelper()
         self.__executor = ThreadHelper()  # 动态线程池，用于消费事件
         self.__consumer_threads = []  # 用于保存启动的事件消费者线程
         self.__event_queue = PriorityQueue()  # 优先级队列
@@ -84,6 +78,7 @@ class EventManager(metaclass=Singleton):
         self.__disabled_handlers = set()  # 禁用的事件处理器集合
         self.__disabled_classes = set()  # 禁用的事件处理器类集合
         self.__lock = threading.Lock()  # 线程锁
+        self.__event = threading.Event()  # 退出事件
 
     def start(self):
         """
@@ -130,7 +125,7 @@ class EventManager(metaclass=Singleton):
             )
 
     def send_event(self, etype: Union[EventType, ChainEventType], data: Optional[Union[Dict, ChainEventData]] = None,
-                   priority: int = DEFAULT_EVENT_PRIORITY) -> Optional[Event]:
+                   priority: Optional[int] = DEFAULT_EVENT_PRIORITY) -> Optional[Event]:
         """
         发送事件，根据事件类型决定是广播事件还是链式事件
         :param etype: 事件类型 (EventType 或 ChainEventType)
@@ -140,14 +135,15 @@ class EventManager(metaclass=Singleton):
         """
         event = Event(etype, data, priority)
         if isinstance(etype, EventType):
-            self.__trigger_broadcast_event(event)
+            return self.__trigger_broadcast_event(event)
         elif isinstance(etype, ChainEventType):
             return self.__trigger_chain_event(event)
         else:
             logger.error(f"Unknown event type: {etype}")
+        return None
 
     def add_event_listener(self, event_type: Union[EventType, ChainEventType], handler: Callable,
-                           priority: int = DEFAULT_EVENT_PRIORITY):
+                           priority: Optional[int] = DEFAULT_EVENT_PRIORITY):
         """
         注册事件处理器，将处理器添加到对应的事件订阅列表中
         :param event_type: 事件类型 (EventType 或 ChainEventType)
@@ -264,7 +260,6 @@ class EventManager(metaclass=Singleton):
         return handler_info
 
     @classmethod
-    @lru_cache(maxsize=1000)
     def __get_handler_identifier(cls, target: Union[Callable, type]) -> Optional[str]:
         """
         获取处理器或处理器类的唯一标识符，包括模块名和类名/方法名
@@ -280,7 +275,6 @@ class EventManager(metaclass=Singleton):
         return f"{module_name}.{qualname}"
 
     @classmethod
-    @lru_cache(maxsize=1000)
     def __get_class_from_callable(cls, handler: Callable) -> Optional[str]:
         """
         获取可调用对象所属类的唯一标识符
@@ -293,7 +287,7 @@ class EventManager(metaclass=Singleton):
 
         # 对于类实例（实现了 __call__ 方法）
         if not inspect.isfunction(handler) and hasattr(handler, "__call__"):
-            handler_cls = handler.__class__ # noqa
+            handler_cls = handler.__class__  # noqa
             return cls.__get_handler_identifier(handler_cls)
 
         # 对于未绑定方法、静态方法、类方法，使用 __qualname__ 提取类信息
@@ -303,6 +297,7 @@ class EventManager(metaclass=Singleton):
             module = inspect.getmodule(handler)
             module_name = module.__name__ if module else "unknown_module"
             return f"{module_name}.{class_name}"
+        return None
 
     def __is_handler_enabled(self, handler: Callable) -> bool:
         """
@@ -398,16 +393,28 @@ class EventManager(metaclass=Singleton):
 
         try:
             from app.core.plugin import PluginManager
+            from app.core.module import ModuleManager
 
             if class_name in PluginManager().get_plugin_ids():
-                # 定义一个插件调用函数
                 def plugin_callable():
+                    """
+                    插件调用函数
+                    """
                     PluginManager().run_plugin_method(class_name, method_name, event_to_process)
 
                 if is_broadcast_event:
                     self.__executor.submit(plugin_callable)
                 else:
                     plugin_callable()
+            elif class_name in ModuleManager().get_module_ids():
+                module = ModuleManager().get_running_module(class_name)
+                if module:
+                    method = getattr(module, method_name, None)
+                    if method:
+                        if is_broadcast_event:
+                            self.__executor.submit(method, event_to_process)
+                        else:
+                            method(event_to_process)
             else:
                 # 获取全局对象或模块类的实例
                 class_obj = self.__get_class_instance(class_name)
@@ -438,22 +445,25 @@ class EventManager(metaclass=Singleton):
 
         # 如果类不在全局变量中，尝试动态导入模块并创建实例
         try:
-            if class_name == "Command":
-                module_name = "app.command"
+            if class_name.endswith("Manager"):
+                module_name = f"app.core.{class_name[:-7].lower()}"
                 module = importlib.import_module(module_name)
             elif class_name.endswith("Chain"):
                 module_name = f"app.chain.{class_name[:-5].lower()}"
                 module = importlib.import_module(module_name)
+            elif class_name.endswith("Helper"):
+                module_name = f"app.helper.{class_name[:-6].lower()}"
+                module = importlib.import_module(module_name)
             else:
-                logger.debug(f"事件处理出错：无效的 Chain 类名: {class_name}，类名必须以 'Chain' 结尾")
-                return None
+                module_name = f"app.{class_name.lower()}"
+                module = importlib.import_module(module_name)
             if hasattr(module, class_name):
                 class_obj = getattr(module, class_name)()
                 return class_obj
             else:
                 logger.debug(f"事件处理出错：模块 {module_name} 中没有找到类 {class_name}")
         except Exception as e:
-            logger.error(f"事件处理出错：{str(e)} - {traceback.format_exc()}")
+            logger.debug(f"事件处理出错：{str(e)} - {traceback.format_exc()}")
         return None
 
     def __broadcast_consumer_loop(self):
@@ -491,9 +501,11 @@ class EventManager(metaclass=Singleton):
         names = handler.__qualname__.split(".")
         class_name, method_name = names[0], names[1]
 
-        self.__messagehelper.put(title=f"{event.event_type} 事件处理出错",
-                                 message=f"{class_name}.{method_name}：{str(e)}",
-                                 role="system")
+        # 发送系统错误通知
+        from app.helper.message import MessageHelper
+        MessageHelper().put(title=f"{event.event_type} 事件处理出错",
+                            message=f"{class_name}.{method_name}：{str(e)}",
+                            role="system")
         self.send_event(
             EventType.SystemError,
             {
@@ -506,7 +518,7 @@ class EventManager(metaclass=Singleton):
         )
 
     def register(self, etype: Union[EventType, ChainEventType, List[Union[EventType, ChainEventType]], type],
-                 priority: int = DEFAULT_EVENT_PRIORITY):
+                 priority: Optional[int] = DEFAULT_EVENT_PRIORITY):
         """
         事件注册装饰器，用于将函数注册为事件的处理器
         :param etype:

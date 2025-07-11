@@ -1,4 +1,5 @@
 import time
+from typing import Optional
 
 from sqlalchemy import Column, Integer, String, Sequence, Float, JSON
 from sqlalchemy.orm import Session
@@ -83,10 +84,12 @@ class Subscribe(Base):
     media_category = Column(String)
     # 过滤规则组
     filter_groups = Column(JSON, default=list)
+    # 选择的剧集组
+    episode_group = Column(String)
 
     @staticmethod
     @db_query
-    def exists(db: Session, tmdbid: int = None, doubanid: str = None, season: int = None):
+    def exists(db: Session, tmdbid: Optional[int] = None, doubanid: Optional[str] = None, season: Optional[int] = None):
         if tmdbid:
             if season:
                 return db.query(Subscribe).filter(Subscribe.tmdbid == tmdbid,
@@ -101,16 +104,14 @@ class Subscribe(Base):
     def get_by_state(db: Session, state: str):
         # 如果 state 为空或 None，返回所有订阅
         if not state:
-            result = db.query(Subscribe).all()
+            return db.query(Subscribe).all()
         else:
             # 如果传入的状态不为空，拆分成多个状态
-            states = state.split(',')
-            result = db.query(Subscribe).filter(Subscribe.state.in_(states)).all()
-        return list(result)
+            return db.query(Subscribe).filter(Subscribe.state.in_(state.split(','))).all()
 
     @staticmethod
     @db_query
-    def get_by_title(db: Session, title: str, season: int = None):
+    def get_by_title(db: Session, title: str, season: Optional[int] = None):
         if season:
             return db.query(Subscribe).filter(Subscribe.name == title,
                                               Subscribe.season == season).first()
@@ -118,13 +119,12 @@ class Subscribe(Base):
 
     @staticmethod
     @db_query
-    def get_by_tmdbid(db: Session, tmdbid: int, season: int = None):
+    def get_by_tmdbid(db: Session, tmdbid: int, season: Optional[int] = None):
         if season:
-            result = db.query(Subscribe).filter(Subscribe.tmdbid == tmdbid,
-                                                Subscribe.season == season).all()
+            return db.query(Subscribe).filter(Subscribe.tmdbid == tmdbid,
+                                              Subscribe.season == season).all()
         else:
-            result = db.query(Subscribe).filter(Subscribe.tmdbid == tmdbid).all()
-        return list(result)
+            return db.query(Subscribe).filter(Subscribe.tmdbid == tmdbid).all()
 
     @staticmethod
     @db_query
@@ -164,29 +164,27 @@ class Subscribe(Base):
 
     @staticmethod
     @db_query
-    def list_by_username(db: Session, username: str, state: str = None, mtype: str = None):
+    def list_by_username(db: Session, username: str, state: Optional[str] = None, mtype: Optional[str] = None):
         if mtype:
             if state:
-                result = db.query(Subscribe).filter(Subscribe.state == state,
-                                                    Subscribe.username == username,
-                                                    Subscribe.type == mtype).all()
+                return db.query(Subscribe).filter(Subscribe.state == state,
+                                                  Subscribe.username == username,
+                                                  Subscribe.type == mtype).all()
             else:
-                result = db.query(Subscribe).filter(Subscribe.username == username,
-                                                    Subscribe.type == mtype).all()
+                return db.query(Subscribe).filter(Subscribe.username == username,
+                                                  Subscribe.type == mtype).all()
         else:
             if state:
-                result = db.query(Subscribe).filter(Subscribe.state == state,
-                                                    Subscribe.username == username).all()
+                return db.query(Subscribe).filter(Subscribe.state == state,
+                                                  Subscribe.username == username).all()
             else:
-                result = db.query(Subscribe).filter(Subscribe.username == username).all()
-        return list(result)
+                return db.query(Subscribe).filter(Subscribe.username == username).all()
 
     @staticmethod
     @db_query
     def list_by_type(db: Session, mtype: str, days: int):
-        result = db.query(Subscribe) \
+        return db.query(Subscribe) \
             .filter(Subscribe.type == mtype,
                     Subscribe.date >= time.strftime("%Y-%m-%d %H:%M:%S",
                                                     time.localtime(time.time() - 86400 * int(days)))
                     ).all()
-        return list(result)

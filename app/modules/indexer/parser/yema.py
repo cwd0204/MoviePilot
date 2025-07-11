@@ -56,7 +56,11 @@ class TYemaSiteUserInfo(SiteParserBase):
         self.join_at = StringUtils.unify_datetime_str(user_info.get("registerTime"))
 
         self.upload = user_info.get('uploadSize')
-        self.download = user_info.get('downloadSize')
+        # 使用 promotionDownloadSize 获取真实下载量（考虑促销因素）
+        if "promotionDownloadSize" in user_info:
+            self.download = user_info.get('promotionDownloadSize')
+        else:
+            self.download = user_info.get('downloadSize')
         self.ratio = round(self.upload / (self.download or 1), 2)
         self.bonus = user_info.get("bonus")
         self.message_unread = 0
@@ -73,7 +77,7 @@ class TYemaSiteUserInfo(SiteParserBase):
         """
         pass
 
-    def _parse_user_torrent_seeding_info(self, html_text: str, multi_page: bool = False) -> Optional[str]:
+    def _parse_user_torrent_seeding_info(self, html_text: str, multi_page: Optional[bool] = False) -> Optional[str]:
         """
         解析用户做种信息
         """

@@ -1,5 +1,5 @@
 import traceback
-from typing import Generator, Optional, Tuple, Any, Union
+from typing import Generator, Optional, Tuple, Any, Union, List
 
 from app.core.config import settings
 from app.core.event import eventmanager
@@ -16,14 +16,14 @@ class ModuleManager(metaclass=Singleton):
     模块管理器
     """
 
-    # 模块列表
-    _modules: dict = {}
-    # 运行态模块列表
-    _running_modules: dict = {}
     # 子模块类型集合
     SubType = Union[DownloaderType, MediaServerType, MessageChannel, StorageSchema, OtherModulesType]
 
     def __init__(self):
+        # 模块列表
+        self._modules: dict = {}
+        # 运行态模块列表
+        self._running_modules: dict = {}
         self.load_modules()
 
     def load_modules(self):
@@ -121,7 +121,7 @@ class ModuleManager(metaclass=Singleton):
         获取实现了同一方法的模块列表
         """
         if not self._running_modules:
-            return []
+            return
         for _, module in self._running_modules.items():
             if hasattr(module, method) \
                     and ObjectUtils.check_method(getattr(module, method)):
@@ -132,7 +132,7 @@ class ModuleManager(metaclass=Singleton):
         获取指定类型的模块列表
         """
         if not self._running_modules:
-            return []
+            return
         for _, module in self._running_modules.items():
             if hasattr(module, 'get_type') \
                     and module.get_type() == module_type:
@@ -143,7 +143,7 @@ class ModuleManager(metaclass=Singleton):
         获取指定子类型的模块
         """
         if not self._running_modules:
-            return []
+            return
         for _, module in self._running_modules.items():
             if hasattr(module, 'get_subtype') \
                     and module.get_subtype() == module_subtype:
@@ -164,3 +164,9 @@ class ModuleManager(metaclass=Singleton):
         获取模块列表
         """
         return self._modules
+
+    def get_module_ids(self) -> List[str]:
+        """
+        获取模块id列表
+        """
+        return list(self._modules.keys())

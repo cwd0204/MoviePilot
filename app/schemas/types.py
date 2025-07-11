@@ -61,6 +61,10 @@ class EventType(Enum):
     MetadataScrape = "metadata.scrape"
     # 模块需要重载
     ModuleReload = "module.reload"
+    # 配置项更新
+    ConfigChanged = "config.updated"
+    # 消息交互动作
+    MessageAction = "message.action"
 
 
 # 同步链式事件
@@ -87,6 +91,10 @@ class ChainEventType(Enum):
     MediaRecognizeConvert = "media.recognize.convert"
     # 推荐数据源
     RecommendSource = "recommend.source"
+    # 工作流执行
+    WorkflowExecution = "workflow.execution"
+    # 存储操作选择
+    StorageOperSelection = "storage.operation"
 
 
 # 系统配置Key字典
@@ -137,6 +145,8 @@ class SystemConfigKey(Enum):
     UserInstalledPlugins = "UserInstalledPlugins"
     # 插件安装统计
     PluginInstallReport = "PluginInstallReport"
+    # 插件文件夹分组配置
+    PluginFolders = "PluginFolders"
     # 默认电影订阅规则
     DefaultMovieSubscribeConfig = "DefaultMovieSubscribeConfig"
     # 默认电视剧订阅规则
@@ -145,6 +155,12 @@ class SystemConfigKey(Enum):
     UserSiteAuthParams = "UserSiteAuthParams"
     # Follow订阅分享者
     FollowSubscribers = "FollowSubscribers"
+    # 通知发送时间
+    NotificationSendTime = "NotificationSendTime"
+    # 通知消息格式模板
+    NotificationTemplates = "NotificationTemplates"
+    # 刮削开关设置
+    ScrapingSwitchs = "ScrapingSwitchs"
 
 
 # 处理进度Key字典
@@ -183,6 +199,21 @@ class NotificationType(Enum):
     Other = "其它"
 
 
+class ContentType(str, Enum):
+    """
+    消息内容类型
+    操作状态的通知消息类型标识
+    """
+    # 订阅添加成功
+    SubscribeAdded = "subscribeAdded"
+    # 订阅完成
+    SubscribeComplete = "subscribeComplete"
+    # 入库成功
+    OrganizeSuccess = "organizeSuccess"
+    # 下载开始(添加下载任务成功)
+    DownloadAdded = "downloadAdded"
+
+
 # 消息渠道
 class MessageChannel(Enum):
     """
@@ -215,6 +246,8 @@ class MediaServerType(Enum):
     Jellyfin = "Jellyfin"
     # Plex
     Plex = "Plex"
+    # 飞牛影视
+    TrimeMedia = "TrimeMedia"
 
 
 # 识别器类型
@@ -257,6 +290,7 @@ class StorageSchema(Enum):
     U115 = "u115"
     Rclone = "rclone"
     Alist = "alist"
+    SMB = "smb"
 
 
 # 模块类型

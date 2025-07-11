@@ -73,6 +73,8 @@ class Subscribe(BaseModel):
     media_category: Optional[str] = None
     # 过滤规则组
     filter_groups: Optional[List[str]] = Field(default_factory=list)
+    # 剧集组
+    episode_group: Optional[str] = None
 
     class Config:
         orm_mode = True
@@ -130,6 +132,8 @@ class SubscribeShare(BaseModel):
     custom_words: Optional[str] = None
     # 自定义媒体类别
     media_category: Optional[str] = None
+    # 自定义剧集组
+    episode_group: Optional[str] = None
     # 复用人次
     count: Optional[int] = 0
 

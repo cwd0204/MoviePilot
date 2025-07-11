@@ -28,9 +28,9 @@ class LogConfigModel(BaseModel):
     # 日志文件最大大小（单位：MB）
     LOG_MAX_FILE_SIZE: int = 5
     # 备份的日志文件数量
-    LOG_BACKUP_COUNT: int = 3
+    LOG_BACKUP_COUNT: int = 10
     # 控制台日志格式
-    LOG_CONSOLE_FORMAT: str = "%(leveltext)s%(message)s"
+    LOG_CONSOLE_FORMAT: str = "%(leveltext)s[%(name)s] %(asctime)s %(message)s"
     # 文件日志格式
     LOG_FILE_FORMAT: str = "【%(levelname)s】%(asctime)s - %(message)s"
 
@@ -98,6 +98,24 @@ class LoggerManager:
     _default_log_file = "moviepilot.log"
     # 线程锁
     _lock = threading.Lock()
+
+    def get_logger(self, name: str) -> logging.Logger:
+        """
+        获取一个指定名称的、独立的日志记录器。
+        创建一个独立的日志文件，例如 'diag_memory.log'。
+        :param name: 日志记录器的名称，也将用作文件名。
+        :return: 一个配置好的 logging.Logger 实例。
+        """
+        # 使用名称作为日志文件名
+        logfile = f"{name}.log"
+        with LoggerManager._lock:
+            # 检查是否已经创建过这个 logger
+            _logger = self._loggers.get(logfile)
+            if not _logger:
+                # 如果没有，就使用现有的 __setup_logger 来创建一个新的
+                _logger = self.__setup_logger(log_file=logfile)
+                self._loggers[logfile] = _logger
+        return _logger
 
     @staticmethod
     def __get_caller():
@@ -189,6 +207,9 @@ class LoggerManager:
         file_handler.setFormatter(file_formatter)
         _logger.addHandler(file_handler)
 
+        # 禁止向父级log传递
+        _logger.propagate = False
+
         return _logger
 
     def update_loggers(self):
@@ -246,12 +267,12 @@ class LoggerManager:
         else:
             # 使用默认日志文件
             logfile = self._default_log_file
-
-        # 获取调用者的模块的logger
-        _logger = self._loggers.get(logfile)
-        if not _logger:
-            _logger = self.__setup_logger(log_file=logfile)
-            self._loggers[logfile] = _logger
+        with LoggerManager._lock:  # 添加锁
+            # 获取调用者的模块的logger
+            _logger = self._loggers.get(logfile)
+            if not _logger:
+                _logger = self.__setup_logger(log_file=logfile)
+                self._loggers[logfile] = _logger
         # 调用logger的方法打印日志
         if hasattr(_logger, method):
             log_method = getattr(_logger, method)

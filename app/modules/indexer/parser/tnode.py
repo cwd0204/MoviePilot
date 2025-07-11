@@ -59,13 +59,13 @@ class TNodeSiteUserInfo(SiteParserBase):
             "unreadSystem", 0)
         pass
 
-    def _parse_user_torrent_seeding_info(self, html_text: str, multi_page: bool = False) -> Optional[str]:
+    def _parse_user_torrent_seeding_info(self, html_text: str, multi_page: Optional[bool] = False) -> Optional[str]:
         """
         解析用户做种信息
         """
         seeding_info = json.loads(html_text)
         if seeding_info.get("status") != 200:
-            return
+            return None
 
         torrents = seeding_info.get("data", {}).get("torrents", [])
 

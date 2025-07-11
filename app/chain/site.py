@@ -1,7 +1,7 @@
 import base64
+import gc
 import re
 from datetime import datetime
-from time import time
 from typing import Optional, Tuple, Union, Dict
 from urllib.parse import urljoin
 
@@ -17,7 +17,6 @@ from app.helper.browser import PlaywrightHelper
 from app.helper.cloudflare import under_challenge
 from app.helper.cookie import CookieHelper
 from app.helper.cookiecloud import CookieCloudHelper
-from app.helper.message import MessageHelper
 from app.helper.rss import RssHelper
 from app.helper.sites import SitesHelper
 from app.log import logger
@@ -35,13 +34,6 @@ class SiteChain(ChainBase):
 
     def __init__(self):
         super().__init__()
-        self.siteoper = SiteOper()
-        self.siteshelper = SitesHelper()
-        self.rsshelper = RssHelper()
-        self.cookiehelper = CookieHelper()
-        self.message = MessageHelper()
-        self.cookiecloud = CookieCloudHelper()
-        self.systemconfig = SystemConfigOper()
 
         # 特殊站点登录验证
         self.special_site_test = {
@@ -52,6 +44,7 @@ class SiteChain(ChainBase):
             "1ptba.com": self.__indexphp_test,
             "star-space.net": self.__indexphp_test,
             "yemapt.org": self.__yema_test,
+            "hddolby.com": self.__hddolby_test,
         }
 
     def refresh_userdata(self, site: dict = None) -> Optional[SiteUserData]:
@@ -62,9 +55,9 @@ class SiteChain(ChainBase):
         """
         userdata: SiteUserData = self.run_module("refresh_userdata", site=site)
         if userdata:
-            self.siteoper.update_userdata(domain=StringUtils.get_url_domain(site.get("domain")),
-                                          name=site.get("name"),
-                                          payload=userdata.dict())
+            SiteOper().update_userdata(domain=StringUtils.get_url_domain(site.get("domain")),
+                                       name=site.get("name"),
+                                       payload=userdata.dict())
             # 发送事件
             EventManager().send_event(EventType.SiteRefreshed, {
                 "site_id": site.get("id")
@@ -100,10 +93,9 @@ class SiteChain(ChainBase):
         """
         刷新所有站点的用户数据
         """
-        sites = self.siteshelper.get_indexers()
         any_site_updated = False
         result = {}
-        for site in sites:
+        for site in SitesHelper().get_indexers():
             if global_vars.is_system_stopped:
                 return None
             if site.get("is_active"):
@@ -115,6 +107,11 @@ class SiteChain(ChainBase):
             EventManager().send_event(EventType.SiteRefreshed, {
                 "site_id": "*"
             })
+
+        # 如果不是大内存模式，进行垃圾回收
+        if not settings.BIG_MEMORY_MODE:
+            gc.collect()
+
         return result
 
     def is_special_site(self, domain: str) -> bool:
@@ -177,12 +174,9 @@ class SiteChain(ChainBase):
         domain = StringUtils.get_url_domain(site.url)
         url = f"https://api.{domain}/api/member/profile"
         headers = {
-            "Content-Type": "application/json",
             "User-Agent": user_agent,
             "Accept": "application/json, text/plain, */*",
-            "Authorization": site.token,
             "x-api-key": site.apikey,
-            "ts": str(int(time()))
         }
         res = RequestUtils(
             headers=headers,
@@ -192,27 +186,10 @@ class SiteChain(ChainBase):
         if res is None:
             return False, "无法打开网站！"
         if res.status_code == 200:
-            state = False
-            message = "鉴权已过期或无效"
             user_info = res.json() or {}
             if user_info.get("data"):
-                # 更新最后访问时间
-                del headers["x-api-key"]
-                res = RequestUtils(headers=headers,
-                                   timeout=site.timeout or 15,
-                                   proxies=settings.PROXY if site.proxy else None,
-                                   referer=f"{site.url}index"
-                                   ).post_res(url=f"https://api.{domain}/api/member/updateLastBrowse")
-                state = True
-                message = "连接成功，但更新状态失败"
-                if res and res.status_code == 200:
-                    update_info = res.json() or {}
-                    if "code" in update_info and int(update_info["code"]) == 0:
-                        message = "连接成功"
-            elif user_info.get("message"):
-                # 使用馒头的错误提示
-                message = user_info.get("message")
-            return state, message
+                return True, "连接成功"
+            return False, user_info.get("message", "鉴权已过期或无效")
         else:
             return False, f"错误：{res.status_code} {res.reason}"
 
@@ -252,6 +229,32 @@ class SiteChain(ChainBase):
         return self.__test(site)
 
     @staticmethod
+    def __hddolby_test(site: Site) -> Tuple[bool, str]:
+        """
+        判断站点是否已经登陆：hddolby
+        """
+        url = f"{site.url}api/v1/user/data"
+        headers = {
+            "Content-Type": "application/json",
+            "Accept": "application/json, text/plain, */*",
+            "x-api-key": site.apikey,
+        }
+        res = RequestUtils(
+            headers=headers,
+            proxies=settings.PROXY if site.proxy else None,
+            timeout=site.timeout or 15
+        ).get_res(url=url)
+        if res is None:
+            return False, "无法打开网站！"
+        if res.status_code == 200:
+            user_info = res.json()
+            if user_info and user_info.get("status") == 0:
+                return True, "连接成功"
+            return False, "APIKEY已过期"
+        else:
+            return False, f"错误：{res.status_code} {res.reason}"
+
+    @staticmethod
     def __parse_favicon(url: str, cookie: str, ua: str) -> Tuple[str, Optional[str]]:
         """
         解析站点favicon,返回base64 fav图标
@@ -268,16 +271,20 @@ class SiteChain(ChainBase):
             logger.error(f"获取站点页面失败：{url}")
             return favicon_url, None
         html = etree.HTML(html_text)
-        if StringUtils.is_valid_html_element(html):
-            fav_link = html.xpath('//head/link[contains(@rel, "icon")]/@href')
-            if fav_link:
-                favicon_url = urljoin(url, fav_link[0])
+        try:
+            if StringUtils.is_valid_html_element(html):
+                fav_link = html.xpath('//head/link[contains(@rel, "icon")]/@href')
+                if fav_link:
+                    favicon_url = urljoin(url, fav_link[0])
 
-        res = RequestUtils(cookies=cookie, timeout=15, ua=ua).get_res(url=favicon_url)
-        if res:
-            return favicon_url, base64.b64encode(res.content).decode()
-        else:
-            logger.error(f"获取站点图标失败：{favicon_url}")
+            res = RequestUtils(cookies=cookie, timeout=15, ua=ua).get_res(url=favicon_url)
+            if res:
+                return favicon_url, base64.b64encode(res.content).decode()
+            else:
+                logger.error(f"获取站点图标失败：{favicon_url}")
+        finally:
+            if html is not None:
+                del html
         return favicon_url, None
 
     def sync_cookies(self, manual=False) -> Tuple[bool, str]:
@@ -291,27 +298,30 @@ class SiteChain(ChainBase):
             """
             if StringUtils.get_url_domain(inx.get("domain")) == sub_domain:
                 return inx.get("domain")
-            for ext_d in inx.get("ext_domains"):
+            for ext_d in inx.get("ext_domains", []):
                 if StringUtils.get_url_domain(ext_d) == sub_domain:
                     return ext_d
             return sub_domain
 
         logger.info("开始同步CookieCloud站点 ...")
-        cookies, msg = self.cookiecloud.download()
+        cookies, msg = CookieCloudHelper().download()
         if not cookies:
             logger.error(f"CookieCloud同步失败：{msg}")
             if manual:
-                self.message.put(msg, title="CookieCloud同步失败", role="system")
+                self.messagehelper.put(msg, title="CookieCloud同步失败", role="system")
             return False, msg
         # 保存Cookie或新增站点
         _update_count = 0
         _add_count = 0
         _fail_count = 0
+        siteshelper = SitesHelper()
+        siteoper = SiteOper()
+        rsshelper = RssHelper()
         for domain, cookie in cookies.items():
             # 索引器信息
-            indexer = self.siteshelper.get_indexer(domain)
+            indexer = siteshelper.get_indexer(domain)
             # 数据库的站点信息
-            site_info = self.siteoper.get_by_domain(domain)
+            site_info = siteoper.get_by_domain(domain)
             if site_info and site_info.is_active == 1:
                 # 站点已存在，检查站点连通性
                 status, msg = self.test(domain)
@@ -321,7 +331,7 @@ class SiteChain(ChainBase):
                     # 更新站点rss地址
                     if not site_info.public and not site_info.rss:
                         # 自动生成rss地址
-                        rss_url, errmsg = self.rsshelper.get_rss_link(
+                        rss_url, errmsg = rsshelper.get_rss_link(
                             url=site_info.url,
                             cookie=cookie,
                             ua=site_info.ua or settings.USER_AGENT,
@@ -329,13 +339,13 @@ class SiteChain(ChainBase):
                         )
                         if rss_url:
                             logger.info(f"更新站点 {domain} RSS地址 ...")
-                            self.siteoper.update_rss(domain=domain, rss=rss_url)
+                            siteoper.update_rss(domain=domain, rss=rss_url)
                         else:
                             logger.warn(errmsg)
                     continue
                 # 更新站点Cookie
                 logger.info(f"更新站点 {domain} Cookie ...")
-                self.siteoper.update_cookie(domain=domain, cookies=cookie)
+                siteoper.update_cookie(domain=domain, cookies=cookie)
                 _update_count += 1
             elif indexer:
                 if settings.COOKIECLOUD_BLACKLIST and any(
@@ -350,9 +360,10 @@ class SiteChain(ChainBase):
                                    ua=settings.USER_AGENT
                                    ).get_res(url=domain_url)
                 if res and res.status_code in [200, 500, 403]:
-                    if not indexer.get("public") and not SiteUtils.is_logged_in(res.text):
+                    content = res.text
+                    if not indexer.get("public") and not SiteUtils.is_logged_in(content):
                         _fail_count += 1
-                        if under_challenge(res.text):
+                        if under_challenge(content):
                             logger.warn(f"站点 {indexer.get('name')} 被Cloudflare防护，无法登录，无法添加站点")
                             continue
                         logger.warn(
@@ -390,21 +401,21 @@ class SiteChain(ChainBase):
                 rss_url = None
                 if not indexer.get("public") and domain_url:
                     # 自动生成rss地址
-                    rss_url, errmsg = self.rsshelper.get_rss_link(url=domain_url,
-                                                                  cookie=cookie,
-                                                                  ua=settings.USER_AGENT,
-                                                                  proxy=proxy)
+                    rss_url, errmsg = rsshelper.get_rss_link(url=domain_url,
+                                                             cookie=cookie,
+                                                             ua=settings.USER_AGENT,
+                                                             proxy=proxy)
                     if errmsg:
                         logger.warn(errmsg)
                 # 插入数据库
                 logger.info(f"新增站点 {indexer.get('name')} ...")
-                self.siteoper.add(name=indexer.get("name"),
-                                  url=domain_url,
-                                  domain=domain,
-                                  cookie=cookie,
-                                  rss=rss_url,
-                                  proxy=1 if proxy else 0,
-                                  public=1 if indexer.get("public") else 0)
+                siteoper.add(name=indexer.get("name"),
+                             url=domain_url,
+                             domain=domain,
+                             cookie=cookie,
+                             rss=rss_url,
+                             proxy=1 if proxy else 0,
+                             public=1 if indexer.get("public") else 0)
                 _add_count += 1
 
             # 通知站点更新
@@ -417,7 +428,7 @@ class SiteChain(ChainBase):
         if _fail_count > 0:
             ret_msg += f"，{_fail_count}个站点添加失败，下次同步时将重试，也可以手动添加"
         if manual:
-            self.message.put(ret_msg, title="CookieCloud同步成功", role="system")
+            self.messagehelper.put(ret_msg, title="CookieCloud同步成功", role="system")
         logger.info(f"CookieCloud同步成功：{ret_msg}")
         return True, ret_msg
 
@@ -436,29 +447,31 @@ class SiteChain(ChainBase):
         if str(domain).startswith("http"):
             domain = StringUtils.get_url_domain(domain)
         # 站点信息
-        siteinfo = self.siteoper.get_by_domain(domain)
+        siteoper = SiteOper()
+        siteshelper = SitesHelper()
+        siteinfo = siteoper.get_by_domain(domain)
         if not siteinfo:
             logger.warn(f"未维护站点 {domain} 信息！")
             return
         # Cookie
         cookie = siteinfo.cookie
         # 索引器
-        indexer = self.siteshelper.get_indexer(domain)
+        indexer = siteshelper.get_indexer(domain)
         if not indexer:
             logger.warn(f"站点 {domain} 索引器不存在！")
             return
         # 查询站点图标
-        site_icon = self.siteoper.get_icon_by_domain(domain)
+        site_icon = siteoper.get_icon_by_domain(domain)
         if not site_icon or not site_icon.base64:
             logger.info(f"开始缓存站点 {indexer.get('name')} 图标 ...")
             icon_url, icon_base64 = self.__parse_favicon(url=indexer.get("domain"),
                                                          cookie=cookie,
                                                          ua=settings.USER_AGENT)
             if icon_url:
-                self.siteoper.update_icon(name=indexer.get("name"),
-                                          domain=domain,
-                                          icon_url=icon_url,
-                                          icon_base64=icon_base64)
+                siteoper.update_icon(name=indexer.get("name"),
+                                     domain=domain,
+                                     icon_url=icon_url,
+                                     icon_base64=icon_base64)
                 logger.info(f"缓存站点 {indexer.get('name')} 图标成功")
             else:
                 logger.warn(f"缓存站点 {indexer.get('name')} 图标失败")
@@ -478,11 +491,12 @@ class SiteChain(ChainBase):
         # 获取主域名中间那段
         domain_host = StringUtils.get_url_host(domain)
         # 查询以"site.domain_host"开头的配置项，并清除
-        site_keys = self.systemconfig.all().keys()
+        systemconfig = SystemConfigOper()
+        site_keys = systemconfig.all().keys()
         for key in site_keys:
             if key.startswith(f"site.{domain_host}"):
                 logger.info(f"清理站点配置：{key}")
-                self.systemconfig.delete(key)
+                systemconfig.delete(key)
 
     @eventmanager.register(EventType.SiteUpdated)
     def cache_site_userdata(self, event: Event):
@@ -498,7 +512,7 @@ class SiteChain(ChainBase):
             return
         if str(domain).startswith("http"):
             domain = StringUtils.get_url_domain(domain)
-        indexer = self.siteshelper.get_indexer(domain)
+        indexer = SitesHelper().get_indexer(domain)
         if not indexer:
             return
         # 刷新站点用户数据
@@ -512,7 +526,8 @@ class SiteChain(ChainBase):
         """
         # 检查域名是否可用
         domain = StringUtils.get_url_domain(url)
-        site_info = self.siteoper.get_by_domain(domain)
+        siteoper = SiteOper()
+        site_info = siteoper.get_by_domain(domain)
         if not site_info:
             return False, f"站点【{url}】不存在"
 
@@ -529,9 +544,9 @@ class SiteChain(ChainBase):
             # 统计
             seconds = (datetime.now() - start_time).seconds
             if state:
-                self.siteoper.success(domain=domain, seconds=seconds)
+                siteoper.success(domain=domain, seconds=seconds)
             else:
-                self.siteoper.fail(domain)
+                siteoper.fail(domain)
             return state, message
         except Exception as e:
             return False, f"{str(e)}！"
@@ -566,8 +581,9 @@ class SiteChain(ChainBase):
                                ).get_res(url=site_url)
             # 判断登录状态
             if res and res.status_code in [200, 500, 403]:
-                if not public and not SiteUtils.is_logged_in(res.text):
-                    if under_challenge(res.text):
+                content = res.text
+                if not public and not SiteUtils.is_logged_in(content):
+                    if under_challenge(content):
                         msg = "站点被Cloudflare防护，请打开站点浏览器仿真"
                     elif res.status_code == 200:
                         msg = "Cookie已失效"
@@ -583,11 +599,11 @@ class SiteChain(ChainBase):
         return True, "连接成功"
 
     def remote_list(self, channel: MessageChannel,
-                    userid: Union[str, int] = None, source: str = None):
+                    userid: Union[str, int] = None, source: Optional[str] = None):
         """
         查询所有站点，发送消息
         """
-        site_list = self.siteoper.list()
+        site_list = SiteOper().list()
         if not site_list:
             self.post_message(Notification(
                 channel=channel,
@@ -617,7 +633,7 @@ class SiteChain(ChainBase):
         )
 
     def remote_disable(self, arg_str: str, channel: MessageChannel,
-                       userid: Union[str, int] = None, source: str = None):
+                       userid: Union[str, int] = None, source: Optional[str] = None):
         """
         禁用站点
         """
@@ -627,7 +643,8 @@ class SiteChain(ChainBase):
         if not arg_str.isdigit():
             return
         site_id = int(arg_str)
-        site = self.siteoper.get(site_id)
+        siteoper = SiteOper()
+        site = siteoper.get(site_id)
         if not site:
             self.post_message(Notification(
                 channel=channel,
@@ -635,40 +652,42 @@ class SiteChain(ChainBase):
                 userid=userid))
             return
         # 禁用站点
-        self.siteoper.update(site_id, {
+        siteoper.update(site_id, {
             "is_active": False
         })
         # 重新发送消息
         self.remote_list(channel=channel, userid=userid, source=source)
 
     def remote_enable(self, arg_str: str, channel: MessageChannel,
-                      userid: Union[str, int] = None, source: str = None):
+                      userid: Union[str, int] = None, source: Optional[str] = None):
         """
         启用站点
         """
         if not arg_str:
             return
         arg_strs = str(arg_str).split()
+        siteoper = SiteOper()
         for arg_str in arg_strs:
             arg_str = arg_str.strip()
             if not arg_str.isdigit():
                 continue
             site_id = int(arg_str)
-            site = self.siteoper.get(site_id)
+            site = siteoper.get(site_id)
             if not site:
                 self.post_message(Notification(
                     channel=channel,
                     title=f"站点编号 {site_id} 不存在！", userid=userid))
                 return
             # 禁用站点
-            self.siteoper.update(site_id, {
+            siteoper.update(site_id, {
                 "is_active": True
             })
         # 重新发送消息
         self.remote_list(channel=channel, userid=userid, source=source)
 
-    def update_cookie(self, site_info: Site,
-                      username: str, password: str, two_step_code: str = None) -> Tuple[bool, str]:
+    @staticmethod
+    def update_cookie(site_info: Site,
+                      username: str, password: str, two_step_code: Optional[str] = None) -> Tuple[bool, str]:
         """
         根据用户名密码更新站点Cookie
         :param site_info: 站点信息
@@ -678,7 +697,7 @@ class SiteChain(ChainBase):
         :return: (是否成功, 错误信息)
         """
         # 更新站点Cookie
-        result = self.cookiehelper.get_site_cookie_ua(
+        result = CookieHelper().get_site_cookie_ua(
             url=site_info.url,
             username=username,
             password=password,
@@ -689,7 +708,7 @@ class SiteChain(ChainBase):
             cookie, ua, msg = result
             if not cookie:
                 return False, msg
-            self.siteoper.update(site_info.id, {
+            SiteOper().update(site_info.id, {
                 "cookie": cookie,
                 "ua": ua
             })
@@ -697,7 +716,7 @@ class SiteChain(ChainBase):
         return False, "未知错误"
 
     def remote_cookie(self, arg_str: str, channel: MessageChannel,
-                      userid: Union[str, int] = None, source: str = None):
+                      userid: Union[str, int] = None, source: Optional[str] = None):
         """
         使用用户名密码更新站点Cookie
         """
@@ -731,7 +750,7 @@ class SiteChain(ChainBase):
         # 站点ID
         site_id = int(site_id)
         # 站点信息
-        site_info = self.siteoper.get(site_id)
+        site_info = SiteOper().get(site_id)
         if not site_info:
             self.post_message(Notification(
                 channel=channel,
@@ -767,7 +786,7 @@ class SiteChain(ChainBase):
                 userid=userid))
 
     def remote_refresh_userdatas(self, channel: MessageChannel,
-                                 userid: Union[str, int] = None, source: str = None):
+                                 userid: Union[str, int] = None, source: Optional[str] = None):
         """
         刷新所有站点用户数据
         """

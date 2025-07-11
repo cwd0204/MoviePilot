@@ -10,10 +10,15 @@ import socket
 import struct
 import urllib
 import urllib.request
+from threading import Lock
 from typing import Dict, Optional
 
 from app.core.config import settings
+from app.core.event import Event, eventmanager
 from app.log import logger
+from app.schemas import ConfigChangeEventData
+from app.schemas.types import EventType
+from app.utils.singleton import Singleton
 
 # 定义一个全局线程池执行器
 _executor = concurrent.futures.ThreadPoolExecutor()
@@ -21,41 +26,67 @@ _executor = concurrent.futures.ThreadPoolExecutor()
 # 定义默认的DoH配置
 _doh_timeout = 5
 _doh_cache: Dict[str, str] = {}
+_doh_lock = Lock()
+# 保存原始的 socket.getaddrinfo 方法
+_orig_getaddrinfo = socket.getaddrinfo
 
 
-def _patched_getaddrinfo(host, *args, **kwargs):
+def enable_doh(enable: bool):
     """
-    socket.getaddrinfo的补丁版本。
+    对 socket.getaddrinfo 进行补丁
     """
-    if host not in settings.DOH_DOMAINS.split(","):
+
+    def _patched_getaddrinfo(host, *args, **kwargs):
+        """
+        socket.getaddrinfo的补丁版本。
+        """
+        if host not in settings.DOH_DOMAINS.split(","):
+            return _orig_getaddrinfo(host, *args, **kwargs)
+        # 检查主机是否已解析
+        with _doh_lock:
+            ip = _doh_cache.get("host", None)
+        if ip is not None:
+            logger.info("已解析 [%s] 为 [%s] (缓存)", host, ip)
+            return _orig_getaddrinfo(ip, *args, **kwargs)
+        # 使用DoH解析主机
+        futures = []
+        for resolver in settings.DOH_RESOLVERS.split(","):
+            futures.append(_executor.submit(_doh_query, resolver, host))
+        for future in concurrent.futures.as_completed(futures):
+            ip = future.result()
+            if ip is not None:
+                logger.info("已解析 [%s] 为 [%s]", host, ip)
+                with _doh_lock:
+                    _doh_cache[host] = ip
+                host = ip
+                break
         return _orig_getaddrinfo(host, *args, **kwargs)
 
-    # 检查主机是否已解析
-    if host in _doh_cache:
-        ip = _doh_cache[host]
-        logger.info("已解析 [%s] 为 [%s] (缓存)", host, ip)
-        return _orig_getaddrinfo(ip, *args, **kwargs)
-
-    # 使用DoH解析主机
-    futures = []
-    for resolver in settings.DOH_RESOLVERS.split(","):
-        futures.append(_executor.submit(_doh_query, resolver, host))
-
-    for future in concurrent.futures.as_completed(futures):
-        ip = future.result()
-        if ip is not None:
-            logger.info("已解析 [%s] 为 [%s]", host, ip)
-            _doh_cache[host] = ip
-            host = ip
-            break
-
-    return _orig_getaddrinfo(host, *args, **kwargs)
+    if enable:
+        # 替换 socket.getaddrinfo 方法
+        socket.getaddrinfo = _patched_getaddrinfo
+    else:
+        socket.getaddrinfo = _orig_getaddrinfo
 
 
-# 对 socket.getaddrinfo 进行补丁
-if settings.DOH_ENABLE:
-    _orig_getaddrinfo = socket.getaddrinfo
-    socket.getaddrinfo = _patched_getaddrinfo
+class DohHelper(metaclass=Singleton):
+    """
+    DoH帮助类，用于处理DNS over HTTPS解析。
+    """
+    def __init__(self):
+        enable_doh(settings.DOH_ENABLE)
+
+    @eventmanager.register(EventType.ConfigChanged)
+    def handle_config_changed(self, event: Event):
+        if not event:
+            return
+        event_data: ConfigChangeEventData = event.event_data
+        if event_data.key not in ["DOH_ENABLE", "DOH_DOMAINS", "DOH_RESOLVERS"]:
+            return
+        with _doh_lock:
+            # DOH配置有变动的情况下，清空缓存
+            _doh_cache.clear()
+        enable_doh(settings.DOH_ENABLE)
 
 
 def _doh_query(resolver: str, host: str) -> Optional[str]:
@@ -129,7 +160,7 @@ def doh_query_json(resolver: str, host: str) -> Optional[str]:
             if response.status != 200:
                 return None
             response_body = response.read().decode("utf-8")
-            logger.debug("<==  body: %s", response_body)
+            logger.debug("<== body: %s", response_body)
             answer = json.loads(response_body)["Answer"]
             return answer[0]["data"]
     except Exception as e:

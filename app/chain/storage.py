@@ -14,15 +14,17 @@ class StorageChain(ChainBase):
     存储处理链
     """
 
-    def __init__(self):
-        super().__init__()
-        self.directoryhelper = DirectoryHelper()
-
     def save_config(self, storage: str, conf: dict) -> None:
         """
         保存存储配置
         """
         self.run_module("save_config", storage=storage, conf=conf)
+
+    def reset_config(self, storage: str) -> None:
+        """
+        重置存储配置
+        """
+        self.run_module("reset_config", storage=storage)
 
     def generate_qrcode(self, storage: str) -> Optional[Tuple[dict, str]]:
         """
@@ -63,7 +65,7 @@ class StorageChain(ChainBase):
         return self.run_module("download_file", fileitem=fileitem, path=path)
 
     def upload_file(self, fileitem: schemas.FileItem, path: Path,
-                    new_name: str = None) -> Optional[schemas.FileItem]:
+                    new_name: Optional[str] = None) -> Optional[schemas.FileItem]:
         """
         上传文件
         :param fileitem: 保存目录项
@@ -84,6 +86,12 @@ class StorageChain(ChainBase):
         """
         return self.run_module("rename_file", fileitem=fileitem, name=name)
 
+    def exists(self, fileitem: schemas.FileItem) -> Optional[bool]:
+        """
+        判断文件或目录是否存在
+        """
+        return True if self.get_item(fileitem) else False
+
     def get_item(self, fileitem: schemas.FileItem) -> Optional[schemas.FileItem]:
         """
         查询目录或文件
@@ -102,11 +110,17 @@ class StorageChain(ChainBase):
         """
         return self.run_module("get_parent_item", fileitem=fileitem)
 
-    def snapshot_storage(self, storage: str, path: Path) -> Optional[Dict[str, float]]:
+    def snapshot_storage(self, storage: str, path: Path,
+                         last_snapshot_time: float = None, max_depth: int = 5) -> Optional[Dict[str, Dict]]:
         """
         快照存储
+        :param storage: 存储类型
+        :param path: 路径
+        :param last_snapshot_time: 上次快照时间，用于增量快照
+        :param max_depth: 最大递归深度，避免过深遍历
         """
-        return self.run_module("snapshot_storage", storage=storage, path=path)
+        return self.run_module("snapshot_storage", storage=storage, path=path,
+                               last_snapshot_time=last_snapshot_time, max_depth=max_depth)
 
     def storage_usage(self, storage: str) -> Optional[schemas.StorageUsage]:
         """
@@ -125,44 +139,62 @@ class StorageChain(ChainBase):
         """
         删除媒体文件，以及不含媒体文件的目录
         """
+
+        def __is_bluray_dir(_fileitem: schemas.FileItem) -> bool:
+            """
+            检查是否蓝光目录
+            """
+            _dir_files = self.list_files(fileitem=_fileitem, recursion=False)
+            if _dir_files:
+                for _f in _dir_files:
+                    if _f.type == "dir" and _f.name in ["BDMV", "CERTIFICATE"]:
+                        return True
+            return False
+
         media_exts = settings.RMT_MEDIAEXT + settings.DOWNLOAD_TMPEXT
         if fileitem.path == "/" or len(Path(fileitem.path).parts) <= 2:
             logger.warn(f"【{fileitem.storage}】{fileitem.path} 根目录或一级目录不允许删除")
             return False
         if fileitem.type == "dir":
             # 本身是目录
-            if _blue_dir := self.list_files(fileitem=fileitem, recursion=False):
-                # 删除蓝光目录
-                for _f in _blue_dir:
-                    if _f.type == "dir" and _f.name in ["BDMV", "CERTIFICATE"]:
-                        logger.warn(f"【{fileitem.storage}】{_f.path} 删除蓝光目录")
-                        self.delete_file(_f)
-            if self.any_files(fileitem, extensions=media_exts) is False:
-                logger.warn(f"【{fileitem.storage}】{fileitem.path} 不存在其它媒体文件，删除空目录")
-                return self.delete_file(fileitem)
-            return False
+            if __is_bluray_dir(fileitem):
+                logger.warn(f"正在删除蓝光原盘目录：【{fileitem.storage}】{fileitem.path}")
+                if not self.delete_file(fileitem):
+                    logger.warn(f"【{fileitem.storage}】{fileitem.path} 删除失败")
+                    return False
+            elif self.any_files(fileitem, extensions=media_exts) is False:
+                logger.warn(f"【{fileitem.storage}】{fileitem.path} 不存在其它媒体文件，正在删除空目录")
+                if not self.delete_file(fileitem):
+                    logger.warn(f"【{fileitem.storage}】{fileitem.path} 删除失败")
+                    return False
+            # 不处理父目录
+            return True
         elif delete_self:
-            # 本身是文件
-            logger.warn(f"正在删除【{fileitem.storage}】{fileitem.path}")
+            # 本身是文件，需要删除文件
+            logger.warn(f"正在删除文件【{fileitem.storage}】{fileitem.path}")
             if not self.delete_file(fileitem):
                 logger.warn(f"【{fileitem.storage}】{fileitem.path} 删除失败")
                 return False
+
         if mtype:
             # 重命名格式
             rename_format = settings.TV_RENAME_FORMAT \
                 if mtype == MediaType.TV else settings.MOVIE_RENAME_FORMAT
-            # 计算重命名中的文件夹层数
-            rename_format_level = len(rename_format.split("/")) - 1
-            if rename_format_level < 1:
+            media_path = DirectoryHelper.get_media_root_path(
+                rename_format, rename_path=Path(fileitem.path)
+            )
+            if not media_path:
                 return True
-            # 处理上级目录
-            dir_item = self.get_file_item(storage=fileitem.storage,
-                                          path=Path(fileitem.path).parents[rename_format_level - 1])
+            # 处理媒体文件根目录
+            dir_item = self.get_file_item(storage=fileitem.storage, path=media_path)
         else:
+            # 处理上级目录
             dir_item = self.get_parent_item(fileitem)
+
+        # 检查和删除上级目录
         if dir_item and len(Path(dir_item.path).parts) > 2:
             # 如何目录是所有下载目录、媒体库目录的上级，则不处理
-            for d in self.directoryhelper.get_dirs():
+            for d in DirectoryHelper().get_dirs():
                 if d.download_path and Path(d.download_path).is_relative_to(Path(dir_item.path)):
                     logger.debug(f"【{dir_item.storage}】{dir_item.path} 是下载目录本级或上级目录，不删除")
                     return True
@@ -171,7 +203,9 @@ class StorageChain(ChainBase):
                     return True
             # 不存在其他媒体文件，删除空目录
             if self.any_files(dir_item, extensions=media_exts) is False:
-                logger.warn(f"【{dir_item.storage}】{dir_item.path} 不存在其它媒体文件，删除空目录")
-                return self.delete_file(dir_item)
+                logger.warn(f"【{dir_item.storage}】{dir_item.path} 不存在其它媒体文件，正在删除空目录")
+                if not self.delete_file(dir_item):
+                    logger.warn(f"【{dir_item.storage}】{dir_item.path} 删除失败")
+                    return False
 
         return True

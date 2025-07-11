@@ -27,15 +27,9 @@ class SearchChain(ChainBase):
 
     __result_temp_file = "__search_result__"
 
-    def __init__(self):
-        super().__init__()
-        self.siteshelper = SitesHelper()
-        self.progress = ProgressHelper()
-        self.systemconfig = SystemConfigOper()
-        self.torrenthelper = TorrentHelper()
-
-    def search_by_id(self, tmdbid: int = None, doubanid: str = None,
-                     mtype: MediaType = None, area: str = "title", season: int = None) -> List[Context]:
+    def search_by_id(self, tmdbid: Optional[int] = None, doubanid: Optional[str] = None,
+                     mtype: MediaType = None, area: Optional[str] = "title", season: Optional[int] = None,
+                     sites: List[int] = None, cache_local: bool = False) -> List[Context]:
         """
         根据TMDBID/豆瓣ID搜索资源，精确匹配，不过滤本地存在的资源
         :param tmdbid: TMDB ID
@@ -43,6 +37,8 @@ class SearchChain(ChainBase):
         :param mtype: 媒体，电影 or 电视剧
         :param area: 搜索范围，title or imdbid
         :param season: 季数
+        :param sites: 站点ID列表
+        :param cache_local: 是否缓存到本地
         """
         mediainfo = self.recognize_media(tmdbid=tmdbid, doubanid=doubanid, mtype=mtype)
         if not mediainfo:
@@ -55,25 +51,27 @@ class SearchChain(ChainBase):
                     season: NotExistMediaInfo(episodes=[])
                 }
             }
-        results = self.process(mediainfo=mediainfo, area=area, no_exists=no_exists)
+        results = self.process(mediainfo=mediainfo, sites=sites, area=area, no_exists=no_exists)
         # 保存到本地文件
-        bytes_results = pickle.dumps(results)
-        self.save_cache(bytes_results, self.__result_temp_file)
+        if cache_local:
+            self.save_cache(pickle.dumps(results), self.__result_temp_file)
         return results
 
-    def search_by_title(self, title: str, page: int = 0, site: int = None) -> List[Context]:
+    def search_by_title(self, title: str, page: Optional[int] = 0,
+                        sites: List[int] = None, cache_local: Optional[bool] = False) -> List[Context]:
         """
         根据标题搜索资源，不识别不过滤，直接返回站点内容
         :param title: 标题，为空时返回所有站点首页内容
         :param page: 页码
-        :param site: 站点ID
+        :param sites: 站点ID列表
+        :param cache_local: 是否缓存到本地
         """
         if title:
             logger.info(f'开始搜索资源，关键词：{title} ...')
         else:
-            logger.info(f'开始浏览资源，站点：{site} ...')
+            logger.info(f'开始浏览资源，站点：{sites} ...')
         # 搜索
-        torrents = self.__search_all_sites(keywords=[title], sites=[site] if site else None, page=page) or []
+        torrents = self.__search_all_sites(keywords=[title], sites=sites, page=page) or []
         if not torrents:
             logger.warn(f'{title} 未搜索到资源')
             return []
@@ -81,8 +79,8 @@ class SearchChain(ChainBase):
         contexts = [Context(meta_info=MetaInfo(title=torrent.title, subtitle=torrent.description),
                             torrent_info=torrent) for torrent in torrents]
         # 保存到本地文件
-        bytes_results = pickle.dumps(contexts)
-        self.save_cache(bytes_results, self.__result_temp_file)
+        if cache_local:
+            self.save_cache(pickle.dumps(contexts), self.__result_temp_file)
         return contexts
 
     def last_search_results(self) -> List[Context]:
@@ -100,11 +98,11 @@ class SearchChain(ChainBase):
             return []
 
     def process(self, mediainfo: MediaInfo,
-                keyword: str = None,
+                keyword: Optional[str] = None,
                 no_exists: Dict[int, Dict[int, NotExistMediaInfo]] = None,
                 sites: List[int] = None,
                 rule_groups: List[str] = None,
-                area: str = "title",
+                area: Optional[str] = "title",
                 custom_words: List[str] = None,
                 filter_params: Dict[str, str] = None) -> List[Context]:
         """
@@ -179,19 +177,20 @@ class SearchChain(ChainBase):
             return []
 
         # 开始新进度
-        self.progress.start(ProgressKey.Search)
+        progress = ProgressHelper()
+        progress.start(ProgressKey.Search)
 
         # 开始过滤
-        self.progress.update(value=0, text=f'开始过滤，总 {len(torrents)} 个资源，请稍候...',
-                             key=ProgressKey.Search)
+        progress.update(value=0, text=f'开始过滤，总 {len(torrents)} 个资源，请稍候...',
+                        key=ProgressKey.Search)
         # 匹配订阅附加参数
         if filter_params:
             logger.info(f'开始附加参数过滤，附加参数：{filter_params} ...')
-            torrents = [torrent for torrent in torrents if self.torrenthelper.filter_torrent(torrent, filter_params)]
+            torrents = [torrent for torrent in torrents if TorrentHelper().filter_torrent(torrent, filter_params)]
         # 开始过滤规则过滤
         if rule_groups is None:
             # 取搜索过滤规则
-            rule_groups: List[str] = self.systemconfig.get(SystemConfigKey.SearchFilterRuleGroups)
+            rule_groups: List[str] = SystemConfigOper().get(SystemConfigKey.SearchFilterRuleGroups)
         if rule_groups:
             logger.info(f'开始过滤规则/剧集过滤，使用规则组：{rule_groups} ...')
             torrents = __do_filter(torrents)
@@ -201,26 +200,27 @@ class SearchChain(ChainBase):
             logger.info(f"过滤规则/剧集过滤完成，剩余 {len(torrents)} 个资源")
 
         # 过滤完成
-        self.progress.update(value=50, text=f'过滤完成，剩余 {len(torrents)} 个资源', key=ProgressKey.Search)
+        progress.update(value=50, text=f'过滤完成，剩余 {len(torrents)} 个资源', key=ProgressKey.Search)
 
-        # 开始匹配
-        _match_torrents = []
         # 总数
         _total = len(torrents)
         # 已处理数
         _count = 0
 
-        if mediainfo:
+        # 开始匹配
+        _match_torrents = []
+        torrenthelper = TorrentHelper()
+        try:
             # 英文标题应该在别名/原标题中，不需要再匹配
             logger.info(f"开始匹配结果 标题：{mediainfo.title}，原标题：{mediainfo.original_title}，别名：{mediainfo.names}")
-            self.progress.update(value=51, text=f'开始匹配，总 {_total} 个资源 ...', key=ProgressKey.Search)
+            progress.update(value=51, text=f'开始匹配，总 {_total} 个资源 ...', key=ProgressKey.Search)
             for torrent in torrents:
                 if global_vars.is_system_stopped:
                     break
                 _count += 1
-                self.progress.update(value=(_count / _total) * 96,
-                                     text=f'正在匹配 {torrent.site_name}，已完成 {_count} / {_total} ...',
-                                     key=ProgressKey.Search)
+                progress.update(value=(_count / _total) * 96,
+                                text=f'正在匹配 {torrent.site_name}，已完成 {_count} / {_total} ...',
+                                key=ProgressKey.Search)
                 if not torrent.title:
                     continue
 
@@ -231,10 +231,9 @@ class SearchChain(ChainBase):
                     logger.info(f"种子名称应用识别词后发生改变：{torrent.title} => {torrent_meta.org_string}")
                 # 季集数过滤
                 if season_episodes \
-                    and not self.torrenthelper.match_season_episodes(
-                        torrent=torrent,
-                        meta=torrent_meta,
-                        season_episodes=season_episodes):
+                        and not torrenthelper.match_season_episodes(torrent=torrent,
+                                                                    meta=torrent_meta,
+                                                                    season_episodes=season_episodes):
                     continue
                 # 比对IMDBID
                 if torrent.imdbid \
@@ -245,40 +244,42 @@ class SearchChain(ChainBase):
                     continue
 
                 # 比对种子
-                if self.torrenthelper.match_torrent(mediainfo=mediainfo,
-                                                    torrent_meta=torrent_meta,
-                                                    torrent=torrent):
+                if torrenthelper.match_torrent(mediainfo=mediainfo,
+                                               torrent_meta=torrent_meta,
+                                               torrent=torrent):
                     # 匹配成功
                     _match_torrents.append((torrent, torrent_meta))
                     continue
             # 匹配完成
             logger.info(f"匹配完成，共匹配到 {len(_match_torrents)} 个资源")
-            self.progress.update(value=97,
-                                 text=f'匹配完成，共匹配到 {len(_match_torrents)} 个资源',
-                                 key=ProgressKey.Search)
-        else:
-            _match_torrents = [(t, MetaInfo(title=t.title, subtitle=t.description)) for t in torrents]
+            progress.update(value=97,
+                            text=f'匹配完成，共匹配到 {len(_match_torrents)} 个资源',
+                            key=ProgressKey.Search)
 
-        # 去掉mediainfo中多余的数据
-        mediainfo.clear()
-
-        # 组装上下文
-        contexts = [Context(torrent_info=t[0],
-                            media_info=mediainfo,
-                            meta_info=t[1]) for t in _match_torrents]
+            # 去掉mediainfo中多余的数据
+            mediainfo.clear()
+            # 组装上下文
+            contexts = [Context(torrent_info=t[0],
+                                media_info=mediainfo,
+                                meta_info=t[1]) for t in _match_torrents]
+        finally:
+            torrents.clear()
+            del torrents
+            _match_torrents.clear()
+            del _match_torrents
 
         # 排序
-        self.progress.update(value=99,
-                             text=f'正在对 {len(contexts)} 个资源进行排序，请稍候...',
-                             key=ProgressKey.Search)
-        contexts = self.torrenthelper.sort_torrents(contexts)
+        progress.update(value=99,
+                        text=f'正在对 {len(contexts)} 个资源进行排序，请稍候...',
+                        key=ProgressKey.Search)
+        contexts = torrenthelper.sort_torrents(contexts)
 
         # 结束进度
         logger.info(f'搜索完成，共 {len(contexts)} 个资源')
-        self.progress.update(value=100,
-                             text=f'搜索完成，共 {len(contexts)} 个资源',
-                             key=ProgressKey.Search)
-        self.progress.end(ProgressKey.Search)
+        progress.update(value=100,
+                        text=f'搜索完成，共 {len(contexts)} 个资源',
+                        key=ProgressKey.Search)
+        progress.end(ProgressKey.Search)
 
         # 返回
         return contexts
@@ -286,8 +287,8 @@ class SearchChain(ChainBase):
     def __search_all_sites(self, keywords: List[str],
                            mediainfo: Optional[MediaInfo] = None,
                            sites: List[int] = None,
-                           page: int = 0,
-                           area: str = "title") -> Optional[List[TorrentInfo]]:
+                           page: Optional[int] = 0,
+                           area: Optional[str] = "title") -> Optional[List[TorrentInfo]]:
         """
         多线程搜索多个站点
         :param mediainfo:  识别的媒体信息
@@ -302,23 +303,19 @@ class SearchChain(ChainBase):
 
         # 配置的索引站点
         if not sites:
-            sites = self.systemconfig.get(SystemConfigKey.IndexerSites) or []
+            sites = SystemConfigOper().get(SystemConfigKey.IndexerSites) or []
 
-        for indexer in self.siteshelper.get_indexers():
+        for indexer in SitesHelper().get_indexers():
             # 检查站点索引开关
             if not sites or indexer.get("id") in sites:
-                # 站点流控
-                state, msg = self.siteshelper.check(indexer.get("domain"))
-                if state:
-                    logger.warn(msg)
-                    continue
                 indexer_sites.append(indexer)
         if not indexer_sites:
             logger.warn('未开启任何有效站点，无法搜索资源')
             return []
 
         # 开始进度
-        self.progress.start(ProgressKey.Search)
+        progress = ProgressHelper()
+        progress.start(ProgressKey.Search)
         # 开始计时
         start_time = datetime.now()
         # 总数
@@ -326,48 +323,49 @@ class SearchChain(ChainBase):
         # 完成数
         finish_count = 0
         # 更新进度
-        self.progress.update(value=0,
-                             text=f"开始搜索，共 {total_num} 个站点 ...",
-                             key=ProgressKey.Search)
-        # 多线程
-        executor = ThreadPoolExecutor(max_workers=len(indexer_sites))
-        all_task = []
-        for site in indexer_sites:
-            if area == "imdbid":
-                # 搜索IMDBID
-                task = executor.submit(self.search_torrents, site=site,
-                                       keywords=[mediainfo.imdb_id] if mediainfo else None,
-                                       mtype=mediainfo.type if mediainfo else None,
-                                       page=page)
-            else:
-                # 搜索标题
-                task = executor.submit(self.search_torrents, site=site,
-                                       keywords=keywords,
-                                       mtype=mediainfo.type if mediainfo else None,
-                                       page=page)
-            all_task.append(task)
+        progress.update(value=0,
+                        text=f"开始搜索，共 {total_num} 个站点 ...",
+                        key=ProgressKey.Search)
         # 结果集
         results = []
-        for future in as_completed(all_task):
-            if global_vars.is_system_stopped:
-                break
-            finish_count += 1
-            result = future.result()
-            if result:
-                results.extend(result)
-            logger.info(f"站点搜索进度：{finish_count} / {total_num}")
-            self.progress.update(value=finish_count / total_num * 100,
-                                 text=f"正在搜索{keywords or ''}，已完成 {finish_count} / {total_num} 个站点 ...",
-                                 key=ProgressKey.Search)
+        # 多线程
+        with ThreadPoolExecutor(max_workers=len(indexer_sites)) as executor:
+            all_task = []
+            for site in indexer_sites:
+                if area == "imdbid":
+                    # 搜索IMDBID
+                    task = executor.submit(self.search_torrents, site=site,
+                                           keywords=[mediainfo.imdb_id] if mediainfo else None,
+                                           mtype=mediainfo.type if mediainfo else None,
+                                           page=page)
+                else:
+                    # 搜索标题
+                    task = executor.submit(self.search_torrents, site=site,
+                                           keywords=keywords,
+                                           mtype=mediainfo.type if mediainfo else None,
+                                           page=page)
+                all_task.append(task)
+            for future in as_completed(all_task):
+                if global_vars.is_system_stopped:
+                    break
+                finish_count += 1
+                result = future.result()
+                if result:
+                    results.extend(result)
+                logger.info(f"站点搜索进度：{finish_count} / {total_num}")
+                progress.update(value=finish_count / total_num * 100,
+                                text=f"正在搜索{keywords or ''}，已完成 {finish_count} / {total_num} 个站点 ...",
+                                key=ProgressKey.Search)
         # 计算耗时
         end_time = datetime.now()
         # 更新进度
-        self.progress.update(value=100,
-                             text=f"站点搜索完成，有效资源数：{len(results)}，总耗时 {(end_time - start_time).seconds} 秒",
-                             key=ProgressKey.Search)
+        progress.update(value=100,
+                        text=f"站点搜索完成，有效资源数：{len(results)}，总耗时 {(end_time - start_time).seconds} 秒",
+                        key=ProgressKey.Search)
         logger.info(f"站点搜索完成，有效资源数：{len(results)}，总耗时 {(end_time - start_time).seconds} 秒")
         # 结束进度
-        self.progress.end(ProgressKey.Search)
+        progress.end(ProgressKey.Search)
+
         # 返回
         return results
 

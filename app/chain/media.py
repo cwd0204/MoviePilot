@@ -10,29 +10,67 @@ from app.core.context import Context, MediaInfo
 from app.core.event import eventmanager, Event
 from app.core.meta import MetaBase
 from app.core.metainfo import MetaInfo, MetaInfoPath
+from app.db.systemconfig_oper import SystemConfigOper
 from app.log import logger
 from app.schemas import FileItem
-from app.schemas.types import EventType, MediaType, ChainEventType
+from app.schemas.types import EventType, MediaType, ChainEventType, SystemConfigKey
 from app.utils.http import RequestUtils
-from app.utils.singleton import Singleton
 from app.utils.string import StringUtils
 
 recognize_lock = Lock()
 scraping_lock = Lock()
-scraping_files = []
 
 
-class MediaChain(ChainBase, metaclass=Singleton):
+class MediaChain(ChainBase):
     """
     媒体信息处理链，单例运行
     """
 
-    def __init__(self):
-        super().__init__()
-        self.storagechain = StorageChain()
+    @staticmethod
+    def _get_scraping_switchs() -> dict:
+        """
+        获取刮削开关配置
+        """
+        switchs = SystemConfigOper().get(SystemConfigKey.ScrapingSwitchs) or {}
+        # 默认配置
+        default_switchs = {
+            'movie_nfo': True,  # 电影NFO
+            'movie_poster': True,  # 电影海报
+            'movie_backdrop': True,  # 电影背景图
+            'movie_logo': True,  # 电影Logo
+            'movie_disc': True,  # 电影光盘图
+            'movie_banner': True,  # 电影横幅图
+            'movie_thumb': True,  # 电影缩略图
+            'tv_nfo': True,  # 电视剧NFO
+            'tv_poster': True,  # 电视剧海报
+            'tv_backdrop': True,  # 电视剧背景图
+            'tv_banner': True,  # 电视剧横幅图
+            'tv_logo': True,  # 电视剧Logo
+            'tv_thumb': True,  # 电视剧缩略图
+            'season_nfo': True,  # 季NFO
+            'season_poster': True,  # 季海报
+            'season_banner': True,  # 季横幅图
+            'season_thumb': True,  # 季缩略图
+            'episode_nfo': True,  # 集NFO
+            'episode_thumb': True  # 集缩略图
+        }
+        # 合并用户配置和默认配置
+        for key, default_value in default_switchs.items():
+            if key not in switchs:
+                switchs[key] = default_value
+        return switchs
+
+    @staticmethod
+    def set_scraping_switchs(switchs: dict) -> bool:
+        """
+        设置刮削开关配置
+        :param switchs: 开关配置字典
+        :return: 是否设置成功
+        """
+        return SystemConfigOper().set(SystemConfigKey.ScrapingSwitchs, switchs)
 
     def metadata_nfo(self, meta: MetaBase, mediainfo: MediaInfo,
-                     season: int = None, episode: int = None) -> Optional[str]:
+                     season: Optional[int] = None, episode: Optional[int] = None) -> Optional[str]:
         """
         获取NFO文件内容文本
         :param meta: 元数据
@@ -42,13 +80,13 @@ class MediaChain(ChainBase, metaclass=Singleton):
         """
         return self.run_module("metadata_nfo", meta=meta, mediainfo=mediainfo, season=season, episode=episode)
 
-    def recognize_by_meta(self, metainfo: MetaBase) -> Optional[MediaInfo]:
+    def recognize_by_meta(self, metainfo: MetaBase, episode_group: Optional[str] = None) -> Optional[MediaInfo]:
         """
         根据主副标题识别媒体信息
         """
         title = metainfo.title
         # 识别媒体信息
-        mediainfo: MediaInfo = self.recognize_media(meta=metainfo)
+        mediainfo: MediaInfo = self.recognize_media(meta=metainfo, episode_group=episode_group)
         if not mediainfo:
             # 尝试使用辅助识别，如果有注册响应事件的话
             if eventmanager.check(ChainEventType.NameRecognize):
@@ -112,7 +150,7 @@ class MediaChain(ChainBase, metaclass=Singleton):
         # 重新识别
         return self.recognize_media(meta=org_meta)
 
-    def recognize_by_path(self, path: str) -> Optional[Context]:
+    def recognize_by_path(self, path: str, episode_group: Optional[str] = None) -> Optional[Context]:
         """
         根据文件路径识别媒体信息
         """
@@ -121,7 +159,7 @@ class MediaChain(ChainBase, metaclass=Singleton):
         # 元数据
         file_meta = MetaInfoPath(file_path)
         # 识别媒体信息
-        mediainfo = self.recognize_media(meta=file_meta)
+        mediainfo = self.recognize_media(meta=file_meta, episode_group=episode_group)
         if not mediainfo:
             # 尝试使用辅助识别，如果有注册响应事件的话
             if eventmanager.check(ChainEventType.NameRecognize):
@@ -238,7 +276,7 @@ class MediaChain(ChainBase, metaclass=Singleton):
         return None
 
     def get_doubaninfo_by_tmdbid(self, tmdbid: int,
-                                 mtype: MediaType = None, season: int = None) -> Optional[dict]:
+                                 mtype: MediaType = None, season: Optional[int] = None) -> Optional[dict]:
         """
         根据TMDBID获取豆瓣信息
         """
@@ -305,23 +343,49 @@ class MediaChain(ChainBase, metaclass=Singleton):
             return
         event_data = event.event_data or {}
         fileitem: FileItem = event_data.get("fileitem")
+        file_list: List[str] = event_data.get("file_list", [])
         meta: MetaBase = event_data.get("meta")
         mediainfo: MediaInfo = event_data.get("mediainfo")
         overwrite = event_data.get("overwrite", False)
         if not fileitem:
             return
+
         # 刮削锁
         with scraping_lock:
-            if fileitem.path in scraping_files:
+            # 检查文件项是否存在
+            storagechain = StorageChain()
+            if not storagechain.get_item(fileitem):
+                logger.warn(f"文件项不存在：{fileitem.path}")
                 return
-            scraping_files.append(fileitem.path)
-        try:
-            # 执行刮削
-            self.scrape_metadata(fileitem=fileitem, meta=meta, mediainfo=mediainfo, overwrite=overwrite)
-        finally:
-            # 释放锁
-            with scraping_lock:
-                scraping_files.remove(fileitem.path)
+            # 检查是否为目录
+            if fileitem.type == "file":
+                # 单个文件刮削
+                self.scrape_metadata(fileitem=fileitem,
+                                     mediainfo=mediainfo,
+                                     init_folder=False,
+                                     parent=storagechain.get_parent_item(fileitem),
+                                     overwrite=overwrite)
+            else:
+                # 检查目的目录下是否已经有nfo刮削文件
+                has_nfo_file = storagechain.any_files(fileitem, extensions=['.nfo'])
+                if has_nfo_file and file_list:
+                    logger.info(f"目录 {fileitem.path} 已有NFO文件，开始增量刮削...")
+                    for file_path in file_list:
+                        file_item = storagechain.get_file_item(storage=fileitem.storage,
+                                                               path=Path(file_path))
+                        if file_item:
+                            # 对于电视剧文件，应该保存到与视频文件相同的目录
+                            # 而不是电视剧根目录
+                            self.scrape_metadata(fileitem=file_item,
+                                                 mediainfo=mediainfo,
+                                                 init_folder=False,
+                                                 parent=None,  # 让函数内部自动获取正确的父目录
+                                                 overwrite=overwrite)
+                else:
+                    # 执行全量刮削
+                    logger.info(f"开始全量刮削目录 {fileitem.path} ...")
+                    self.scrape_metadata(fileitem=fileitem, meta=meta, init_folder=True,
+                                         mediainfo=mediainfo, overwrite=overwrite)
 
     def scrape_metadata(self, fileitem: schemas.FileItem,
                         meta: MetaBase = None, mediainfo: MediaInfo = None,
@@ -337,6 +401,8 @@ class MediaChain(ChainBase, metaclass=Singleton):
         :param overwrite: 是否覆盖已有文件
         """
 
+        storagechain = StorageChain()
+
         def is_bluray_folder(_fileitem: schemas.FileItem) -> bool:
             """
             判断是否为原盘目录
@@ -346,7 +412,7 @@ class MediaChain(ChainBase, metaclass=Singleton):
             # 蓝光原盘目录必备的文件或文件夹
             required_files = ['BDMV', 'CERTIFICATE']
             # 检查目录下是否存在所需文件或文件夹
-            for item in self.storagechain.list_files(_fileitem):
+            for item in storagechain.list_files(_fileitem):
                 if item.name in required_files:
                     return True
             return False
@@ -355,7 +421,7 @@ class MediaChain(ChainBase, metaclass=Singleton):
             """
             列出下级文件
             """
-            return self.storagechain.list_files(fileitem=_fileitem)
+            return storagechain.list_files(fileitem=_fileitem)
 
         def __save_file(_fileitem: schemas.FileItem, _path: Path, _content: Union[bytes, str]):
             """
@@ -371,11 +437,11 @@ class MediaChain(ChainBase, metaclass=Singleton):
             tmp_file.write_bytes(_content)
             # 获取文件的父目录
             try:
-                item = self.storagechain.upload_file(fileitem=_fileitem, path=tmp_file, new_name=_path.name)
+                item = storagechain.upload_file(fileitem=_fileitem, path=tmp_file, new_name=_path.name)
                 if item:
                     logger.info(f"已保存文件：{item.path}")
                 else:
-                    logger.warn(f"文件保存失败：{item.path}")
+                    logger.warn(f"文件保存失败：{_path}")
             finally:
                 if tmp_file.exists():
                     tmp_file.unlink()
@@ -386,7 +452,7 @@ class MediaChain(ChainBase, metaclass=Singleton):
             """
             try:
                 logger.info(f"正在下载图片：{_url} ...")
-                r = RequestUtils(proxies=settings.PROXY).get_res(url=_url)
+                r = RequestUtils(proxies=settings.PROXY, ua=settings.USER_AGENT).get_res(url=_url)
                 if r:
                     return r.content
                 else:
@@ -394,6 +460,9 @@ class MediaChain(ChainBase, metaclass=Singleton):
             except Exception as err:
                 logger.error(f"{_url} 图片下载失败：{str(err)}！")
             return None
+
+        if not fileitem:
+            return
 
         # 当前文件路径
         filepath = Path(fileitem.path)
@@ -407,65 +476,95 @@ class MediaChain(ChainBase, metaclass=Singleton):
         if not mediainfo:
             logger.warn(f"{filepath} 无法识别文件媒体信息！")
             return
+
+        # 获取刮削开关配置
+        scraping_switchs = self._get_scraping_switchs()
         logger.info(f"开始刮削：{filepath} ...")
         if mediainfo.type == MediaType.MOVIE:
             # 电影
             if fileitem.type == "file":
-                # 是否已存在
-                nfo_path = filepath.with_suffix(".nfo")
-                if overwrite or not self.storagechain.get_file_item(storage=fileitem.storage, path=nfo_path):
-                    # 电影文件
-                    movie_nfo = self.metadata_nfo(meta=meta, mediainfo=mediainfo)
-                    if movie_nfo:
-                        # 保存或上传nfo文件到上级目录
-                        __save_file(_fileitem=parent, _path=nfo_path, _content=movie_nfo)
-                    else:
-                        logger.warn(f"{filepath.name} nfo文件生成失败！")
-                else:
-                    logger.info(f"已存在nfo文件：{nfo_path}")
-            else:
-                # 电影目录
-                if is_bluray_folder(fileitem):
-                    # 原盘目录
-                    nfo_path = filepath / (filepath.name + ".nfo")
-                    if overwrite or not self.storagechain.get_file_item(storage=fileitem.storage, path=nfo_path):
-                        # 生成原盘nfo
+                # 检查电影NFO开关
+                if scraping_switchs.get('movie_nfo', True):
+                    # 是否已存在
+                    nfo_path = filepath.with_suffix(".nfo")
+                    if overwrite or not storagechain.get_file_item(storage=fileitem.storage, path=nfo_path):
+                        # 电影文件
                         movie_nfo = self.metadata_nfo(meta=meta, mediainfo=mediainfo)
                         if movie_nfo:
-                            # 保存或上传nfo文件到当前目录
-                            __save_file(_fileitem=fileitem, _path=nfo_path, _content=movie_nfo)
+                            # 保存或上传nfo文件到上级目录
+                            if not parent:
+                                parent = storagechain.get_parent_item(fileitem)
+                            __save_file(_fileitem=parent, _path=nfo_path, _content=movie_nfo)
                         else:
                             logger.warn(f"{filepath.name} nfo文件生成失败！")
                     else:
                         logger.info(f"已存在nfo文件：{nfo_path}")
                 else:
+                    logger.info("电影NFO刮削已关闭，跳过")
+            else:
+                # 电影目录
+                if is_bluray_folder(fileitem):
+                    # 原盘目录
+                    if scraping_switchs.get('movie_nfo', True):
+                        nfo_path = filepath / (filepath.name + ".nfo")
+                        if overwrite or not storagechain.get_file_item(storage=fileitem.storage, path=nfo_path):
+                            # 生成原盘nfo
+                            movie_nfo = self.metadata_nfo(meta=meta, mediainfo=mediainfo)
+                            if movie_nfo:
+                                # 保存或上传nfo文件到当前目录
+                                __save_file(_fileitem=fileitem, _path=nfo_path, _content=movie_nfo)
+                            else:
+                                logger.warn(f"{filepath.name} nfo文件生成失败！")
+                        else:
+                            logger.info(f"已存在nfo文件：{nfo_path}")
+                    else:
+                        logger.info("电影NFO刮削已关闭，跳过")
+                else:
                     # 处理目录内的文件
                     files = __list_files(_fileitem=fileitem)
                     for file in files:
                         self.scrape_metadata(fileitem=file,
-                                             meta=meta, mediainfo=mediainfo,
-                                             init_folder=False, parent=fileitem,
+                                             mediainfo=mediainfo,
+                                             init_folder=False,
+                                             parent=fileitem,
                                              overwrite=overwrite)
                 # 生成目录内图片文件
                 if init_folder:
                     # 图片
-                    for attr_name, attr_value in vars(mediainfo).items():
-                        if attr_value \
-                                and attr_name.endswith("_path") \
-                                and attr_value \
-                                and isinstance(attr_value, str) \
-                                and attr_value.startswith("http"):
-                            image_name = attr_name.replace("_path", "") + Path(attr_value).suffix
-                            image_path = filepath / image_name
-                            if overwrite or not self.storagechain.get_file_item(storage=fileitem.storage,
-                                                                                path=image_path):
-                                # 下载图片
-                                content = __download_image(_url=attr_value)
-                                # 写入图片到当前目录
-                                if content:
-                                    __save_file(_fileitem=fileitem, _path=image_path, _content=content)
+                    image_dict = self.metadata_img(mediainfo=mediainfo)
+                    if image_dict:
+                        for image_name, image_url in image_dict.items():
+                            # 根据图片类型检查开关
+                            if 'poster' in image_name.lower():
+                                should_scrape = scraping_switchs.get('movie_poster', True)
+                            elif ('backdrop' in image_name.lower()
+                                  or 'fanart' in image_name.lower()
+                                  or 'background' in image_name.lower()):
+                                should_scrape = scraping_switchs.get('movie_backdrop', True)
+                            elif 'logo' in image_name.lower():
+                                should_scrape = scraping_switchs.get('movie_logo', True)
+                            elif 'disc' in image_name.lower() or 'cdart' in image_name.lower():
+                                should_scrape = scraping_switchs.get('movie_disc', True)
+                            elif 'banner' in image_name.lower():
+                                should_scrape = scraping_switchs.get('movie_banner', True)
+                            elif 'thumb' in image_name.lower():
+                                should_scrape = scraping_switchs.get('movie_thumb', True)
                             else:
-                                logger.info(f"已存在图片文件：{image_path}")
+                                should_scrape = True  # 未知类型默认刮削
+
+                            if should_scrape:
+                                image_path = filepath.with_name(image_name)
+                                if overwrite or not storagechain.get_file_item(storage=fileitem.storage,
+                                                                               path=image_path):
+                                    # 下载图片
+                                    content = __download_image(image_url)
+                                    # 写入图片到当前目录
+                                    if content:
+                                        __save_file(_fileitem=fileitem, _path=image_path, _content=content)
+                                else:
+                                    logger.info(f"已存在图片文件：{image_path}")
+                            else:
+                                logger.info(f"电影图片刮削已关闭，跳过：{image_name}")
         else:
             # 电视剧
             if fileitem.type == "file":
@@ -474,47 +573,56 @@ class MediaChain(ChainBase, metaclass=Singleton):
                 if not file_meta.begin_episode:
                     logger.warn(f"{filepath.name} 无法识别文件集数！")
                     return
-                file_mediainfo = self.recognize_media(meta=file_meta, tmdbid=mediainfo.tmdb_id)
+                file_mediainfo = self.recognize_media(meta=file_meta, tmdbid=mediainfo.tmdb_id,
+                                                      episode_group=mediainfo.episode_group)
                 if not file_mediainfo:
                     logger.warn(f"{filepath.name} 无法识别文件媒体信息！")
                     return
-                # 是否已存在
-                nfo_path = filepath.with_suffix(".nfo")
-                if overwrite or not self.storagechain.get_file_item(storage=fileitem.storage, path=nfo_path):
-                    # 获取集的nfo文件
-                    episode_nfo = self.metadata_nfo(meta=file_meta, mediainfo=file_mediainfo,
-                                                    season=file_meta.begin_season, episode=file_meta.begin_episode)
-                    if episode_nfo:
-                        # 保存或上传nfo文件到上级目录
-                        if not parent:
-                            parent = self.storagechain.get_parent_item(fileitem)
-                        __save_file(_fileitem=parent, _path=nfo_path, _content=episode_nfo)
-                    else:
-                        logger.warn(f"{filepath.name} nfo文件生成失败！")
-                else:
-                    logger.info(f"已存在nfo文件：{nfo_path}")
-                # 获取集的图片
-                image_dict = self.metadata_img(mediainfo=file_mediainfo,
-                                               season=file_meta.begin_season, episode=file_meta.begin_episode)
-                if image_dict:
-                    for episode, image_url in image_dict.items():
-                        image_path = filepath.with_suffix(Path(image_url).suffix)
-                        if overwrite or not self.storagechain.get_file_item(storage=fileitem.storage, path=image_path):
-                            # 下载图片
-                            content = __download_image(image_url)
-                            # 保存图片文件到当前目录
-                            if content:
-                                if not parent:
-                                    parent = self.storagechain.get_parent_item(fileitem)
-                                __save_file(_fileitem=parent, _path=image_path, _content=content)
+                # 检查集NFO开关
+                if scraping_switchs.get('episode_nfo', True):
+                    # 是否已存在
+                    nfo_path = filepath.with_suffix(".nfo")
+                    if overwrite or not storagechain.get_file_item(storage=fileitem.storage, path=nfo_path):
+                        # 获取集的nfo文件
+                        episode_nfo = self.metadata_nfo(meta=file_meta, mediainfo=file_mediainfo,
+                                                        season=file_meta.begin_season,
+                                                        episode=file_meta.begin_episode)
+                        if episode_nfo:
+                            # 保存或上传nfo文件到上级目录
+                            if not parent:
+                                parent = storagechain.get_parent_item(fileitem)
+                            __save_file(_fileitem=parent, _path=nfo_path, _content=episode_nfo)
                         else:
-                            logger.info(f"已存在图片文件：{image_path}")
+                            logger.warn(f"{filepath.name} nfo文件生成失败！")
+                    else:
+                        logger.info(f"已存在nfo文件：{nfo_path}")
+                else:
+                    logger.info("集NFO刮削已关闭，跳过")
+                # 获取集的图片
+                if scraping_switchs.get('episode_thumb', True):
+                    image_dict = self.metadata_img(mediainfo=file_mediainfo,
+                                                   season=file_meta.begin_season, episode=file_meta.begin_episode)
+                    if image_dict:
+                        for episode, image_url in image_dict.items():
+                            image_path = filepath.with_suffix(Path(image_url).suffix)
+                            if overwrite or not storagechain.get_file_item(storage=fileitem.storage, path=image_path):
+                                # 下载图片
+                                content = __download_image(image_url)
+                                # 保存图片文件到当前目录
+                                if content:
+                                    if not parent:
+                                        parent = storagechain.get_parent_item(fileitem)
+                                    __save_file(_fileitem=parent, _path=image_path, _content=content)
+                            else:
+                                logger.info(f"已存在图片文件：{image_path}")
+                else:
+                    logger.info("集缩略图刮削已关闭，跳过")
             else:
-                # 当前为目录，处理目录内的文件
+                # 当前为电视剧目录，处理目录内的文件
                 files = __list_files(_fileitem=fileitem)
                 for file in files:
                     self.scrape_metadata(fileitem=file,
-                                         meta=meta, mediainfo=mediainfo,
+                                         mediainfo=mediainfo,
                                          parent=fileitem if file.type == "file" else None,
                                          init_folder=True if file.type == "dir" else False,
                                          overwrite=overwrite)
@@ -526,71 +634,96 @@ class MediaChain(ChainBase, metaclass=Singleton):
                     if filepath.name in settings.RENAME_FORMAT_S0_NAMES:
                         season_meta.begin_season = 0
                     if season_meta.begin_season is not None:
-                        # 是否已存在
-                        nfo_path = filepath / "season.nfo"
-                        if overwrite or not self.storagechain.get_file_item(storage=fileitem.storage, path=nfo_path):
-                            # 当前目录有季号，生成季nfo
-                            season_nfo = self.metadata_nfo(meta=meta, mediainfo=mediainfo,
-                                                           season=season_meta.begin_season)
-                            if season_nfo:
-                                # 写入nfo到根目录
-                                __save_file(_fileitem=fileitem, _path=nfo_path, _content=season_nfo)
-                            else:
-                                logger.warn(f"无法生成电视剧季nfo文件：{meta.name}")
-                        else:
-                            logger.info(f"已存在nfo文件：{nfo_path}")
-                        # TMDB季poster图片
-                        image_dict = self.metadata_img(mediainfo=mediainfo, season=season_meta.begin_season)
-                        if image_dict:
-                            for image_name, image_url in image_dict.items():
-                                image_path = filepath.with_name(image_name)
-                                if overwrite or not self.storagechain.get_file_item(storage=fileitem.storage,
-                                                                                    path=image_path):
-                                    # 下载图片
-                                    content = __download_image(image_url)
-                                    # 保存图片文件到剧集目录
-                                    if content:
-                                        if not parent:
-                                            parent = self.storagechain.get_parent_item(fileitem)
-                                        __save_file(_fileitem=parent, _path=image_path, _content=content)
+                        # 检查季NFO开关
+                        if scraping_switchs.get('season_nfo', True):
+                            # 是否已存在
+                            nfo_path = filepath / "season.nfo"
+                            if overwrite or not storagechain.get_file_item(storage=fileitem.storage, path=nfo_path):
+                                # 当前目录有季号，生成季nfo
+                                season_nfo = self.metadata_nfo(meta=meta, mediainfo=mediainfo,
+                                                               season=season_meta.begin_season)
+                                if season_nfo:
+                                    # 写入nfo到根目录
+                                    __save_file(_fileitem=fileitem, _path=nfo_path, _content=season_nfo)
                                 else:
-                                    logger.info(f"已存在图片文件：{image_path}")
+                                    logger.warn(f"无法生成电视剧季nfo文件：{meta.name}")
+                            else:
+                                logger.info(f"已存在nfo文件：{nfo_path}")
+                        else:
+                            logger.info("季NFO刮削已关闭，跳过")
+                        # TMDB季poster图片
+                        if scraping_switchs.get('season_poster', True):
+                            image_dict = self.metadata_img(mediainfo=mediainfo, season=season_meta.begin_season)
+                            if image_dict:
+                                for image_name, image_url in image_dict.items():
+                                    image_path = filepath.with_name(image_name)
+                                    if overwrite or not storagechain.get_file_item(storage=fileitem.storage,
+                                                                                   path=image_path):
+                                        # 下载图片
+                                        content = __download_image(image_url)
+                                        # 保存图片文件到剧集目录
+                                        if content:
+                                            if not parent:
+                                                parent = storagechain.get_parent_item(fileitem)
+                                            __save_file(_fileitem=parent, _path=image_path, _content=content)
+                                    else:
+                                        logger.info(f"已存在图片文件：{image_path}")
+                        else:
+                            logger.info("季海报刮削已关闭，跳过")
                         # 额外fanart季图片：poster thumb banner
                         image_dict = self.metadata_img(mediainfo=mediainfo)
                         if image_dict:
                             for image_name, image_url in image_dict.items():
                                 if image_name.startswith("season"):
-                                    image_path = filepath.with_name(image_name)
-                                    # 只下载当前刮削季的图片
-                                    image_season = "00" if "specials" in image_name else image_name[6:8]
-                                    if image_season != str(season_meta.begin_season).rjust(2, '0'):
-                                        logger.info(f"当前刮削季为：{season_meta.begin_season}，跳过文件：{image_path}")
-                                        continue
-                                    if overwrite or not self.storagechain.get_file_item(storage=fileitem.storage,
-                                                                                        path=image_path):
-                                        # 下载图片
-                                        content = __download_image(image_url)
-                                        # 保存图片文件到当前目录
-                                        if content:
-                                            if not parent:
-                                                parent = self.storagechain.get_parent_item(fileitem)
-                                            __save_file(_fileitem=parent, _path=image_path, _content=content)
+                                    # 根据季图片类型检查开关
+                                    if 'poster' in image_name.lower():
+                                        should_scrape = scraping_switchs.get('season_poster', True)
+                                    elif 'banner' in image_name.lower():
+                                        should_scrape = scraping_switchs.get('season_banner', True)
+                                    elif 'thumb' in image_name.lower():
+                                        should_scrape = scraping_switchs.get('season_thumb', True)
                                     else:
-                                        logger.info(f"已存在图片文件：{image_path}")
+                                        should_scrape = True  # 未知类型默认刮削
+
+                                    if should_scrape:
+                                        image_path = filepath.with_name(image_name)
+                                        # 只下载当前刮削季的图片
+                                        image_season = "00" if "specials" in image_name else image_name[6:8]
+                                        if image_season != str(season_meta.begin_season).rjust(2, '0'):
+                                            logger.info(
+                                                f"当前刮削季为：{season_meta.begin_season}，跳过文件：{image_path}")
+                                            continue
+                                        if overwrite or not storagechain.get_file_item(storage=fileitem.storage,
+                                                                                       path=image_path):
+                                            # 下载图片
+                                            content = __download_image(image_url)
+                                            # 保存图片文件到当前目录
+                                            if content:
+                                                if not parent:
+                                                    parent = storagechain.get_parent_item(fileitem)
+                                                __save_file(_fileitem=parent, _path=image_path, _content=content)
+                                        else:
+                                            logger.info(f"已存在图片文件：{image_path}")
+                                    else:
+                                        logger.info(f"季图片刮削已关闭，跳过：{image_name}")
                     # 判断当前目录是不是剧集根目录
                     if not season_meta.season:
-                        # 是否已存在
-                        nfo_path = filepath / "tvshow.nfo"
-                        if overwrite or not self.storagechain.get_file_item(storage=fileitem.storage, path=nfo_path):
-                            # 当前目录有名称，生成tvshow nfo 和 tv图片
-                            tv_nfo = self.metadata_nfo(meta=meta, mediainfo=mediainfo)
-                            if tv_nfo:
-                                # 写入tvshow nfo到根目录
-                                __save_file(_fileitem=fileitem, _path=nfo_path, _content=tv_nfo)
+                        # 检查电视剧NFO开关
+                        if scraping_switchs.get('tv_nfo', True):
+                            # 是否已存在
+                            nfo_path = filepath / "tvshow.nfo"
+                            if overwrite or not storagechain.get_file_item(storage=fileitem.storage, path=nfo_path):
+                                # 当前目录有名称，生成tvshow nfo 和 tv图片
+                                tv_nfo = self.metadata_nfo(meta=meta, mediainfo=mediainfo)
+                                if tv_nfo:
+                                    # 写入tvshow nfo到根目录
+                                    __save_file(_fileitem=fileitem, _path=nfo_path, _content=tv_nfo)
+                                else:
+                                    logger.warn(f"无法生成电视剧nfo文件：{meta.name}")
                             else:
-                                logger.warn(f"无法生成电视剧nfo文件：{meta.name}")
+                                logger.info(f"已存在nfo文件：{nfo_path}")
                         else:
-                            logger.info(f"已存在nfo文件：{nfo_path}")
+                            logger.info("电视剧NFO刮削已关闭，跳过")
                         # 生成目录图片
                         image_dict = self.metadata_img(mediainfo=mediainfo)
                         if image_dict:
@@ -598,14 +731,33 @@ class MediaChain(ChainBase, metaclass=Singleton):
                                 # 不下载季图片
                                 if image_name.startswith("season"):
                                     continue
-                                image_path = filepath / image_name
-                                if overwrite or not self.storagechain.get_file_item(storage=fileitem.storage,
-                                                                                    path=image_path):
-                                    # 下载图片
-                                    content = __download_image(image_url)
-                                    # 保存图片文件到当前目录
-                                    if content:
-                                        __save_file(_fileitem=fileitem, _path=image_path, _content=content)
+                                # 根据电视剧图片类型检查开关
+                                if 'poster' in image_name.lower():
+                                    should_scrape = scraping_switchs.get('tv_poster', True)
+                                elif ('backdrop' in image_name.lower()
+                                      or 'fanart' in image_name.lower()
+                                      or 'background' in image_name.lower()):
+                                    should_scrape = scraping_switchs.get('tv_backdrop', True)
+                                elif 'banner' in image_name.lower():
+                                    should_scrape = scraping_switchs.get('tv_banner', True)
+                                elif 'logo' in image_name.lower():
+                                    should_scrape = scraping_switchs.get('tv_logo', True)
+                                elif 'thumb' in image_name.lower():
+                                    should_scrape = scraping_switchs.get('tv_thumb', True)
                                 else:
-                                    logger.info(f"已存在图片文件：{image_path}")
+                                    should_scrape = True  # 未知类型默认刮削
+
+                                if should_scrape:
+                                    image_path = filepath / image_name
+                                    if overwrite or not storagechain.get_file_item(storage=fileitem.storage,
+                                                                                   path=image_path):
+                                        # 下载图片
+                                        content = __download_image(image_url)
+                                        # 保存图片文件到当前目录
+                                        if content:
+                                            __save_file(_fileitem=fileitem, _path=image_path, _content=content)
+                                    else:
+                                        logger.info(f"已存在图片文件：{image_path}")
+                                else:
+                                    logger.info(f"电视剧图片刮削已关闭，跳过：{image_name}")
         logger.info(f"{filepath.name} 刮削完成")

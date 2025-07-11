@@ -24,9 +24,9 @@ db_kwargs = {
 # 当使用 QueuePool 时，添加 QueuePool 特有的参数
 if pool_class == QueuePool:
     db_kwargs.update({
-        "pool_size": settings.DB_POOL_SIZE,
+        "pool_size": settings.CONF.dbpool,
         "pool_timeout": settings.DB_POOL_TIMEOUT,
-        "max_overflow": settings.DB_MAX_OVERFLOW
+        "max_overflow": settings.CONF.dbpooloverflow
     })
 # 创建数据库引擎
 Engine = create_engine(**db_kwargs)
@@ -221,8 +221,7 @@ class Base:
     @classmethod
     @db_query
     def list(cls, db: Session) -> List[Self]:
-        result = db.query(cls).all()
-        return list(result)
+        return db.query(cls).all()
 
     def to_dict(self):
         return {c.name: getattr(self, c.name, None) for c in self.__table__.columns} # noqa
@@ -236,7 +235,6 @@ class DbOper:
     """
     数据库操作基类
     """
-    _db: Session = None
 
     def __init__(self, db: Session = None):
         self._db = db

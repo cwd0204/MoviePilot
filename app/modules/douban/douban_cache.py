@@ -10,16 +10,16 @@ from app.core.config import settings
 from app.core.meta import MetaBase
 from app.core.metainfo import MetaInfo
 from app.log import logger
-from app.utils.singleton import Singleton
+from app.utils.singleton import WeakSingleton
 from app.schemas.types import MediaType
 
 lock = RLock()
 
 CACHE_EXPIRE_TIMESTAMP_STR = "cache_expire_timestamp"
-EXPIRE_TIMESTAMP = settings.CACHE_CONF["meta"]
+EXPIRE_TIMESTAMP = settings.CONF.meta
 
 
-class DoubanCache(metaclass=Singleton):
+class DoubanCache(metaclass=WeakSingleton):
     """
     豆瓣缓存数据
     {
@@ -29,9 +29,6 @@ class DoubanCache(metaclass=Singleton):
         "type": MediaType
     }
     """
-    _meta_data: dict = {}
-    # 缓存文件路径
-    _meta_path: Path = None
     # TMDB缓存过期
     _tmdb_cache_expire: bool = True
 
@@ -165,7 +162,7 @@ class DoubanCache(metaclass=Singleton):
                 # None时不缓存，此时代表网络错误，允许重复请求
                 self._meta_data[self.__get_key(meta)] = {'id': "0"}
 
-    def save(self, force: bool = False) -> None:
+    def save(self, force: Optional[bool] = False) -> None:
         """
         保存缓存数据到文件
         """
@@ -233,3 +230,6 @@ class DoubanCache(metaclass=Singleton):
         if not cache_media_info:
             return
         self._meta_data[key]['title'] = cn_title
+
+    def __del__(self):
+        self.save()

@@ -1,7 +1,7 @@
 import io
 import tempfile
 from pathlib import Path
-from typing import List
+from typing import List, Optional
 
 import pillow_avif  # noqa 用于自动注册AVIF支持
 from PIL import Image
@@ -29,12 +29,8 @@ class RecommendChain(ChainBase, metaclass=Singleton):
     推荐处理链，单例运行
     """
 
-    def __init__(self):
-        super().__init__()
-        self.tmdbchain = TmdbChain()
-        self.doubanchain = DoubanChain()
-        self.bangumichain = BangumiChain()
-        self.cache_max_pages = 5
+    # 推荐数据的缓存页数
+    cache_max_pages = 5
 
     def refresh_recommend(self):
         """
@@ -162,45 +158,19 @@ class RecommendChain(ChainBase, metaclass=Singleton):
 
     @log_execution_time(logger=logger)
     @cached(ttl=recommend_ttl, region=recommend_cache_region)
-    def tmdb_movies(self, sort_by: str = "popularity.desc",
-                    with_genres: str = "",
-                    with_original_language: str = "",
-                    with_keywords: str = "",
-                    with_watch_providers: str = "",
-                    vote_average: float = 0,
-                    vote_count: int = 0,
-                    release_date: str = "",
-                    page: int = 1) -> List[dict]:
+    def tmdb_movies(self, sort_by: Optional[str] = "popularity.desc",
+                    with_genres: Optional[str] = "",
+                    with_original_language: Optional[str] = "",
+                    with_keywords: Optional[str] = "",
+                    with_watch_providers: Optional[str] = "",
+                    vote_average: Optional[float] = 0.0,
+                    vote_count: Optional[int] = 0,
+                    release_date: Optional[str] = "",
+                    page: Optional[int] = 1) -> List[dict]:
         """
         TMDB热门电影
         """
-        movies = self.tmdbchain.tmdb_discover(mtype=MediaType.MOVIE,
-                                              sort_by=sort_by,
-                                              with_genres=with_genres,
-                                              with_original_language=with_original_language,
-                                              with_keywords=with_keywords,
-                                              with_watch_providers=with_watch_providers,
-                                              vote_average=vote_average,
-                                              vote_count=vote_count,
-                                              release_date=release_date,
-                                              page=page)
-        return [movie.to_dict() for movie in movies] if movies else []
-
-    @log_execution_time(logger=logger)
-    @cached(ttl=recommend_ttl, region=recommend_cache_region)
-    def tmdb_tvs(self, sort_by: str = "popularity.desc",
-                 with_genres: str = "",
-                 with_original_language: str = "zh|en|ja|ko",
-                 with_keywords: str = "",
-                 with_watch_providers: str = "",
-                 vote_average: float = 0,
-                 vote_count: int = 0,
-                 release_date: str = "",
-                 page: int = 1) -> List[dict]:
-        """
-        TMDB热门电视剧
-        """
-        tvs = self.tmdbchain.tmdb_discover(mtype=MediaType.TV,
+        movies = TmdbChain().tmdb_discover(mtype=MediaType.MOVIE,
                                            sort_by=sort_by,
                                            with_genres=with_genres,
                                            with_original_language=with_original_language,
@@ -210,105 +180,133 @@ class RecommendChain(ChainBase, metaclass=Singleton):
                                            vote_count=vote_count,
                                            release_date=release_date,
                                            page=page)
+        return [movie.to_dict() for movie in movies] if movies else []
+
+    @log_execution_time(logger=logger)
+    @cached(ttl=recommend_ttl, region=recommend_cache_region)
+    def tmdb_tvs(self, sort_by: Optional[str] = "popularity.desc",
+                 with_genres: Optional[str] = "",
+                 with_original_language: Optional[str] = "zh|en|ja|ko",
+                 with_keywords: Optional[str] = "",
+                 with_watch_providers: Optional[str] = "",
+                 vote_average: Optional[float] = 0.0,
+                 vote_count: Optional[int] = 0,
+                 release_date: Optional[str] = "",
+                 page: Optional[int] = 1) -> List[dict]:
+        """
+        TMDB热门电视剧
+        """
+        tvs = TmdbChain().tmdb_discover(mtype=MediaType.TV,
+                                        sort_by=sort_by,
+                                        with_genres=with_genres,
+                                        with_original_language=with_original_language,
+                                        with_keywords=with_keywords,
+                                        with_watch_providers=with_watch_providers,
+                                        vote_average=vote_average,
+                                        vote_count=vote_count,
+                                        release_date=release_date,
+                                        page=page)
         return [tv.to_dict() for tv in tvs] if tvs else []
 
     @log_execution_time(logger=logger)
     @cached(ttl=recommend_ttl, region=recommend_cache_region)
-    def tmdb_trending(self, page: int = 1) -> List[dict]:
+    def tmdb_trending(self, page: Optional[int] = 1) -> List[dict]:
         """
         TMDB流行趋势
         """
-        infos = self.tmdbchain.tmdb_trending(page=page)
+        infos = TmdbChain().tmdb_trending(page=page)
         return [info.to_dict() for info in infos] if infos else []
 
     @log_execution_time(logger=logger)
     @cached(ttl=recommend_ttl, region=recommend_cache_region)
-    def bangumi_calendar(self, page: int = 1, count: int = 30) -> List[dict]:
+    def bangumi_calendar(self, page: Optional[int] = 1, count: Optional[int] = 30) -> List[dict]:
         """
         Bangumi每日放送
         """
-        medias = self.bangumichain.calendar()
+        medias = BangumiChain().calendar()
         return [media.to_dict() for media in medias[(page - 1) * count: page * count]] if medias else []
 
     @log_execution_time(logger=logger)
     @cached(ttl=recommend_ttl, region=recommend_cache_region)
-    def douban_movie_showing(self, page: int = 1, count: int = 30) -> List[dict]:
+    def douban_movie_showing(self, page: Optional[int] = 1, count: Optional[int] = 30) -> List[dict]:
         """
         豆瓣正在热映
         """
-        movies = self.doubanchain.movie_showing(page=page, count=count)
+        movies = DoubanChain().movie_showing(page=page, count=count)
         return [media.to_dict() for media in movies] if movies else []
 
     @log_execution_time(logger=logger)
     @cached(ttl=recommend_ttl, region=recommend_cache_region)
-    def douban_movies(self, sort: str = "R", tags: str = "", page: int = 1, count: int = 30) -> List[dict]:
+    def douban_movies(self, sort: Optional[str] = "R", tags: Optional[str] = "",
+                      page: Optional[int] = 1, count: Optional[int] = 30) -> List[dict]:
         """
         豆瓣最新电影
         """
-        movies = self.doubanchain.douban_discover(mtype=MediaType.MOVIE,
-                                                  sort=sort, tags=tags, page=page, count=count)
+        movies = DoubanChain().douban_discover(mtype=MediaType.MOVIE,
+                                               sort=sort, tags=tags, page=page, count=count)
         return [media.to_dict() for media in movies] if movies else []
 
     @log_execution_time(logger=logger)
     @cached(ttl=recommend_ttl, region=recommend_cache_region)
-    def douban_tvs(self, sort: str = "R", tags: str = "", page: int = 1, count: int = 30) -> List[dict]:
+    def douban_tvs(self, sort: Optional[str] = "R", tags: Optional[str] = "",
+                   page: Optional[int] = 1, count: Optional[int] = 30) -> List[dict]:
         """
         豆瓣最新电视剧
         """
-        tvs = self.doubanchain.douban_discover(mtype=MediaType.TV,
-                                               sort=sort, tags=tags, page=page, count=count)
+        tvs = DoubanChain().douban_discover(mtype=MediaType.TV,
+                                            sort=sort, tags=tags, page=page, count=count)
         return [media.to_dict() for media in tvs] if tvs else []
 
     @log_execution_time(logger=logger)
     @cached(ttl=recommend_ttl, region=recommend_cache_region)
-    def douban_movie_top250(self, page: int = 1, count: int = 30) -> List[dict]:
+    def douban_movie_top250(self, page: Optional[int] = 1, count: Optional[int] = 30) -> List[dict]:
         """
         豆瓣电影TOP250
         """
-        movies = self.doubanchain.movie_top250(page=page, count=count)
+        movies = DoubanChain().movie_top250(page=page, count=count)
         return [media.to_dict() for media in movies] if movies else []
 
     @log_execution_time(logger=logger)
     @cached(ttl=recommend_ttl, region=recommend_cache_region)
-    def douban_tv_weekly_chinese(self, page: int = 1, count: int = 30) -> List[dict]:
+    def douban_tv_weekly_chinese(self, page: Optional[int] = 1, count: Optional[int] = 30) -> List[dict]:
         """
         豆瓣国产剧集榜
         """
-        tvs = self.doubanchain.tv_weekly_chinese(page=page, count=count)
+        tvs = DoubanChain().tv_weekly_chinese(page=page, count=count)
         return [media.to_dict() for media in tvs] if tvs else []
 
     @log_execution_time(logger=logger)
     @cached(ttl=recommend_ttl, region=recommend_cache_region)
-    def douban_tv_weekly_global(self, page: int = 1, count: int = 30) -> List[dict]:
+    def douban_tv_weekly_global(self, page: Optional[int] = 1, count: Optional[int] = 30) -> List[dict]:
         """
         豆瓣全球剧集榜
         """
-        tvs = self.doubanchain.tv_weekly_global(page=page, count=count)
+        tvs = DoubanChain().tv_weekly_global(page=page, count=count)
         return [media.to_dict() for media in tvs] if tvs else []
 
     @log_execution_time(logger=logger)
     @cached(ttl=recommend_ttl, region=recommend_cache_region)
-    def douban_tv_animation(self, page: int = 1, count: int = 30) -> List[dict]:
+    def douban_tv_animation(self, page: Optional[int] = 1, count: Optional[int] = 30) -> List[dict]:
         """
         豆瓣热门动漫
         """
-        tvs = self.doubanchain.tv_animation(page=page, count=count)
+        tvs = DoubanChain().tv_animation(page=page, count=count)
         return [media.to_dict() for media in tvs] if tvs else []
 
     @log_execution_time(logger=logger)
     @cached(ttl=recommend_ttl, region=recommend_cache_region)
-    def douban_movie_hot(self, page: int = 1, count: int = 30) -> List[dict]:
+    def douban_movie_hot(self, page: Optional[int] = 1, count: Optional[int] = 30) -> List[dict]:
         """
         豆瓣热门电影
         """
-        movies = self.doubanchain.movie_hot(page=page, count=count)
+        movies = DoubanChain().movie_hot(page=page, count=count)
         return [media.to_dict() for media in movies] if movies else []
 
     @log_execution_time(logger=logger)
     @cached(ttl=recommend_ttl, region=recommend_cache_region)
-    def douban_tv_hot(self, page: int = 1, count: int = 30) -> List[dict]:
+    def douban_tv_hot(self, page: Optional[int] = 1, count: Optional[int] = 30) -> List[dict]:
         """
         豆瓣热门电视剧
         """
-        tvs = self.doubanchain.tv_hot(page=page, count=count)
+        tvs = DoubanChain().tv_hot(page=page, count=count)
         return [media.to_dict() for media in tvs] if tvs else []

@@ -1,25 +1,23 @@
 from datetime import timedelta
-from typing import Any, List
+from typing import Any, List, Annotated
 
 from fastapi import APIRouter, Depends, Form, HTTPException
 from fastapi.security import OAuth2PasswordRequestForm
 
 from app import schemas
-from app.chain.tmdb import TmdbChain
 from app.chain.user import UserChain
-from app.chain.mediaserver import MediaServerChain
 from app.core import security
 from app.core.config import settings
 from app.helper.sites import SitesHelper
-from app.utils.web import WebUtils
+from app.helper.wallpaper import WallpaperHelper
 
 router = APIRouter()
 
 
 @router.post("/access-token", summary="获取token", response_model=schemas.Token)
 def login_access_token(
-        form_data: OAuth2PasswordRequestForm = Depends(),
-        otp_password: str = Form(None)
+        form_data: Annotated[OAuth2PasswordRequestForm, Depends()],
+        otp_password: Annotated[str | None, Form()] = None
 ) -> Any:
     """
     获取认证Token
@@ -45,7 +43,8 @@ def login_access_token(
         user_id=user_or_message.id,
         user_name=user_or_message.name,
         avatar=user_or_message.avatar,
-        level=level
+        level=level,
+        permissions= user_or_message.permissions or {},
     )
 
 
@@ -54,12 +53,7 @@ def wallpaper() -> Any:
     """
     获取登录页面电影海报
     """
-    if settings.WALLPAPER == "bing":
-        url = WebUtils.get_bing_wallpaper()
-    elif settings.WALLPAPER == "mediaserver":
-        url = MediaServerChain().get_latest_wallpaper()
-    else:
-        url = TmdbChain().get_random_wallpager()
+    url = WallpaperHelper().get_wallpaper()
     if url:
         return schemas.Response(
             success=True,
@@ -73,9 +67,4 @@ def wallpapers() -> Any:
     """
     获取登录页面电影海报
     """
-    if settings.WALLPAPER == "bing":
-        return WebUtils.get_bing_wallpapers()
-    elif settings.WALLPAPER == "mediaserver":
-        return MediaServerChain().get_latest_wallpapers()
-    else:
-        return TmdbChain().get_trending_wallpapers()
+    return WallpaperHelper().get_wallpapers()

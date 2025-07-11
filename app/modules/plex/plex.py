@@ -14,6 +14,7 @@ from app.log import logger
 from app.schemas import MediaType
 from app.utils.http import RequestUtils
 from app.utils.url import UrlUtils
+from app.schemas import MediaServerItem
 
 
 class Plex:
@@ -21,7 +22,7 @@ class Plex:
     _session = None
     _sync_libraries: List[str] = []
 
-    def __init__(self, host: str = None, token: str = None, play_host: str = None,
+    def __init__(self, host: Optional[str] = None, token: Optional[str] = None, play_host: Optional[str] = None,
                  sync_libraries: list = None, **kwargs):
         if not host or not token:
             logger.error("Plex服务器配置不完整！")
@@ -83,7 +84,7 @@ class Plex:
             logger.error(f"Authentication failed: {e}")
         return None
 
-    @cached(maxsize=100, ttl=86400)
+    @cached(maxsize=32, ttl=86400)
     def __get_library_images(self, library_key: str, mtype: int) -> Optional[List[str]]:
         """
         获取媒体服务器最近添加的媒体的图片列表
@@ -121,7 +122,7 @@ class Plex:
         return [f"{self._host.rstrip('/') + url}?X-Plex-Token={self._token}" for url in
                 list(poster_urls.keys())[:total_size]]
 
-    def get_librarys(self, hidden: bool = False) -> List[schemas.MediaServerLibrary]:
+    def get_librarys(self, hidden: Optional[bool] = False) -> List[schemas.MediaServerLibrary]:
         """
         获取媒体服务器所有媒体库列表
         """
@@ -137,15 +138,14 @@ class Plex:
             if hidden and self._sync_libraries and "all" not in self._sync_libraries \
                     and str(library.key) not in self._sync_libraries:
                 continue
-            match library.type:
-                case "movie":
-                    library_type = MediaType.MOVIE.value
-                    image_list = self.__get_library_images(library.key, 1)
-                case "show":
-                    library_type = MediaType.TV.value
-                    image_list = self.__get_library_images(library.key, 2)
-                case _:
-                    continue
+            if library.type == "movie":
+                library_type = MediaType.MOVIE.value
+                image_list = self.__get_library_images(library.key, 1)
+            elif library.type == "show":
+                library_type = MediaType.TV.value
+                image_list = self.__get_library_images(library.key, 2)
+            else:
+                continue
             libraries.append(
                 schemas.MediaServerLibrary(
                     id=library.key,
@@ -186,9 +186,9 @@ class Plex:
 
     def get_movies(self,
                    title: str,
-                   original_title: str = None,
-                   year: str = None,
-                   tmdb_id: int = None) -> Optional[List[schemas.MediaServerItem]]:
+                   original_title: Optional[str] = None,
+                   year: Optional[str] = None,
+                   tmdb_id: Optional[int] = None) -> Optional[List[schemas.MediaServerItem]]:
         """
         根据标题和年份，检查电影是否在Plex中存在，存在则返回列表
         :param title: 标题
@@ -241,12 +241,12 @@ class Plex:
         return ret_movies
 
     def get_tv_episodes(self,
-                        item_id: str = None,
-                        title: str = None,
-                        original_title: str = None,
-                        year: str = None,
-                        tmdb_id: int = None,
-                        season: int = None) -> Tuple[Optional[str], Optional[Dict[int, list]]]:
+                        item_id: Optional[str] = None,
+                        title: Optional[str] = None,
+                        original_title: Optional[str] = None,
+                        year: Optional[str] = None,
+                        tmdb_id: Optional[int] = None,
+                        season: Optional[int] = None) -> Tuple[Optional[str], Optional[Dict[int, list]]]:
         """
         根据标题、年份、季查询电视剧所有集信息
         :param item_id: 媒体ID
@@ -296,8 +296,8 @@ class Plex:
     def get_remote_image_by_id(self,
                                item_id: str,
                                image_type: str,
-                               depth: int = 0,
-                               plex_url: bool = True) -> Optional[str]:
+                               depth: Optional[int] = 0,
+                               plex_url: Optional[bool] = True) -> Optional[str]:
         """
         根据ItemId从Plex查询图片地址
         :param item_id: 在Plex中的ID
@@ -367,7 +367,7 @@ class Plex:
             return False
         return self._plex.library.update()
 
-    def refresh_library_by_items(self, items: List[schemas.RefreshMediaItem]) -> bool:
+    def refresh_library_by_items(self, items: List[schemas.RefreshMediaItem]) -> Optional[bool]:
         """
         按路径刷新媒体库 item: target_path
         """
@@ -511,8 +511,8 @@ class Plex:
             user_state=user_state,
         )
 
-    def get_items(self, parent: Union[str, int], start_index: int = 0, limit: Optional[int] = -1) \
-            -> Optional[Generator]:
+    def get_items(self, parent: Union[str, int], start_index: Optional[int] = 0, limit: Optional[int] = -1) \
+            -> Generator[MediaServerItem | None, Any, None]:
         """
         获取媒体服务器项目列表，支持分页和不分页逻辑，默认不分页获取所有数据
 
@@ -703,6 +703,8 @@ class Plex:
             eventItem.image_url = self.get_remote_image_by_id(item_id=eventItem.item_id,
                                                               image_type="Backdrop")
 
+        eventItem.json_object = message
+
         return eventItem
 
     def get_plex(self):
@@ -718,7 +720,7 @@ class Plex:
         """
         return f'{self._playhost or self._host}web/index.html#!/server/{self._plex.machineIdentifier}/details?key={item_id}'
 
-    def get_resume(self, num: int = 12) -> Optional[List[schemas.MediaServerPlayItem]]:
+    def get_resume(self, num: Optional[int] = 12) -> Optional[List[schemas.MediaServerPlayItem]]:
         """
         获取继续观看的媒体
         """
@@ -754,7 +756,7 @@ class Plex:
             ))
         return ret_resume[:num]
 
-    def get_latest(self, num: int = 20) -> Optional[List[schemas.MediaServerPlayItem]]:
+    def get_latest(self, num: Optional[int] = 20) -> Optional[List[schemas.MediaServerPlayItem]]:
         """
         获取最近添加媒体
         """
@@ -786,7 +788,7 @@ class Plex:
 
             # 合并排序
             for hub in hubs:
-                for item in hub.items:
+                for item in hub.items():
                     sub_result.append(item)
             sub_result.sort(key=lambda x: x.addedAt, reverse=True)
 
@@ -855,7 +857,7 @@ class Plex:
         :param kwargs: 其他请求参数，如headers, cookies, proxies等
         """
         if not self._session:
-            return
+            return None
         try:
             url = UrlUtils.adapt_request_url(host=self._host, endpoint=endpoint)
             kwargs.setdefault("headers", self.__get_request_headers())
@@ -888,3 +890,7 @@ class Plex:
         session = Session()
         session.headers = headers
         return session
+
+    def close(self):
+        if self._session:
+            self._session.close()

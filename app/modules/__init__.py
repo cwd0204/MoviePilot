@@ -29,7 +29,6 @@ class _ModuleBase(metaclass=ABCMeta):
         pass
 
     @staticmethod
-    @abstractmethod
     def get_name() -> str:
         """
         获取模块名称
@@ -37,7 +36,6 @@ class _ModuleBase(metaclass=ABCMeta):
         pass
 
     @staticmethod
-    @abstractmethod
     def get_type() -> ModuleType:
         """
         获取模块类型
@@ -45,7 +43,6 @@ class _ModuleBase(metaclass=ABCMeta):
         pass
 
     @staticmethod
-    @abstractmethod
     def get_subtype() -> Union[DownloaderType, MediaServerType, MessageChannel, StorageSchema, OtherModulesType]:
         """
         获取模块子类型（下载器、媒体服务器、消息通道、存储类型、其他杂项模块类型）
@@ -53,7 +50,6 @@ class _ModuleBase(metaclass=ABCMeta):
         pass
 
     @staticmethod
-    @abstractmethod
     def get_priority() -> int:
         """
         获取模块优先级，数字越小优先级越高，只有同一接口下优先级才生效
@@ -116,7 +112,7 @@ class ServiceBase(Generic[TService, TConf], metaclass=ABCMeta):
             # 通过服务类型或工厂函数来创建实例
             if isinstance(service_type, type):
                 # 如果传入的是类类型，调用构造函数实例化
-                self._instances[conf.name] = service_type(**conf.config)
+                self._instances[conf.name] = service_type(name=conf.name, **conf.config)
             else:
                 # 如果传入的是工厂函数，直接调用工厂函数
                 self._instances[conf.name] = service_type(conf)
@@ -195,8 +191,6 @@ class _MessageBase(ServiceBase[TService, NotificationConf]):
 
         :return: 返回消息通知的配置字典
         """
-        if self._configs is not None:
-            return self._configs
         configs = ServiceConfigHelper.get_notification_configs()
         if not self._service_name:
             return {}
@@ -216,8 +210,8 @@ class _MessageBase(ServiceBase[TService, NotificationConf]):
         # 检查消息来源
         if message.source and message.source != source:
             return False
-        # 检查消息类型开关
-        if message.mtype:
+        # 不是定向发送时，检查消息类型开关
+        if not message.userid and message.mtype:
             conf = self.get_config(source)
             if conf:
                 switchs = conf.switchs or []
@@ -264,8 +258,6 @@ class _DownloaderBase(ServiceBase[TService, DownloaderConf]):
 
         :return: 返回下载器配置字典
         """
-        if self._configs is not None:
-            return self._configs
         configs = ServiceConfigHelper.get_downloader_configs()
         if not self._service_name:
             return {}
@@ -283,8 +275,6 @@ class _MediaServerBase(ServiceBase[TService, MediaServerConf]):
 
         :return: 返回媒体服务器配置字典
         """
-        if self._configs is not None:
-            return self._configs
         configs = ServiceConfigHelper.get_mediaserver_configs()
         if not self._service_name:
             return {}

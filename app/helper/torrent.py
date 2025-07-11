@@ -1,10 +1,9 @@
 import datetime
 import re
 from pathlib import Path
-from typing import Tuple, Optional, List, Union, Dict
+from typing import Tuple, Optional, List, Union, Dict, Any
 from urllib.parse import unquote
 
-from requests import Response
 from torrentool.api import Torrent
 
 from app.core.config import settings
@@ -16,27 +15,23 @@ from app.db.systemconfig_oper import SystemConfigOper
 from app.log import logger
 from app.schemas.types import MediaType, SystemConfigKey
 from app.utils.http import RequestUtils
-from app.utils.singleton import Singleton
+from app.utils.singleton import WeakSingleton
 from app.utils.string import StringUtils
 
 
-class TorrentHelper(metaclass=Singleton):
+class TorrentHelper(metaclass=WeakSingleton):
     """
     种子帮助类
     """
 
-    # 失败的种子：站点链接
-    _invalid_torrents = []
-
     def __init__(self):
-        self.system_config = SystemConfigOper()
-        self.site_oper = SiteOper()
+        self._invalid_torrents = []
 
     def download_torrent(self, url: str,
-                         cookie: str = None,
-                         ua: str = None,
-                         referer: str = None,
-                         proxy: bool = False) \
+                         cookie: Optional[str] = None,
+                         ua: Optional[str] = None,
+                         referer: Optional[str] = None,
+                         proxy: Optional[bool] = False) \
             -> Tuple[Optional[Path], Optional[Union[str, bytes]], Optional[str], Optional[list], Optional[str]]:
         """
         把种子下载到本地
@@ -174,7 +169,7 @@ class TorrentHelper(metaclass=Singleton):
             return "", []
 
     @staticmethod
-    def get_url_filename(req: Response, url: str) -> str:
+    def get_url_filename(req: Any, url: str) -> str:
         """
         从下载请求中获取种子文件名
         """
@@ -192,7 +187,8 @@ class TorrentHelper(metaclass=Singleton):
             file_name = str(datetime.datetime.now())
         return file_name
 
-    def sort_torrents(self, torrent_list: List[Context]) -> List[Context]:
+    @staticmethod
+    def sort_torrents(torrent_list: List[Context]) -> List[Context]:
         """
         对种子对行排序：torrent、site、upload、seeder
         """
@@ -200,11 +196,11 @@ class TorrentHelper(metaclass=Singleton):
             return []
 
         # 下载规则
-        priority_rule: List[str] = self.system_config.get(
+        priority_rule: List[str] = SystemConfigOper().get(
             SystemConfigKey.TorrentsPriority) or ["torrent", "upload", "seeder"]
         # 站点上传量
         site_uploads = {
-            site.name: site.upload for site in self.site_oper.get_userdata_latest()
+            site.name: site.upload for site in SiteOper().get_userdata_latest()
         }
 
         def get_sort_str(_context):
@@ -444,6 +440,27 @@ class TorrentHelper(metaclass=Singleton):
             if not re.search(r"%s" % effect, torrent_info.title, re.I):
                 logger.info(f"{torrent_info.title} 不匹配特效规则 {effect}")
                 return False
+
+        # 大小
+        size_range = filter_params.get("size")
+        if size_range:
+            if size_range.find("-") != -1:
+                # 区间
+                size_min, size_max = size_range.split("-")
+                size_min = float(size_min.strip()) * 1024 * 1024
+                size_max = float(size_max.strip()) * 1024 * 1024
+                if torrent_info.size < size_min or torrent_info.size > size_max:
+                    return False
+            elif size_range.startswith(">"):
+                # 大于
+                size_min = float(size_range[1:].strip()) * 1024 * 1024
+                if torrent_info.size < size_min:
+                    return False
+            elif size_range.startswith("<"):
+                # 小于
+                size_max = float(size_range[1:].strip()) * 1024 * 1024
+                if torrent_info.size > size_max:
+                    return False
 
         return True
 

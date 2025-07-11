@@ -11,10 +11,10 @@ class ExistMediaInfo(BaseModel):
     媒体服务器存在媒体信息
     """
     # 类型 电影、电视剧
-    type: Optional[MediaType]
+    type: Optional[MediaType] = None
     # 季
     seasons: Optional[Dict[int, list]] = Field(default_factory=dict)
-    # 媒体服务器类型：plex、jellyfin、emby
+    # 媒体服务器类型：plex、jellyfin、emby、trimemedia
     server_type: Optional[str] = None
     # 媒体服务器名称
     server: Optional[str] = None
@@ -160,6 +160,7 @@ class WebhookEventInfo(BaseModel):
     save_reason: Optional[str] = None
     item_isvirtual: Optional[bool] = None
     media_type: Optional[str] = None
+    json_object: Optional[dict] = Field(default_factory=dict)
 
 
 class MediaServerPlayItem(BaseModel):

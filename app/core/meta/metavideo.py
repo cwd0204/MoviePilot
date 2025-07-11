@@ -10,6 +10,7 @@ from app.core.meta.releasegroup import ReleaseGroupsMatcher
 from app.schemas.types import MediaType
 from app.utils.string import StringUtils
 from app.utils.tokens import Tokens
+from app.core.meta.streamingplatform import StreamingPlatforms
 
 
 class MetaVideo(MetaBase):
@@ -31,7 +32,7 @@ class MetaVideo(MetaBase):
     _part_re = r"(^PART[0-9ABI]{0,2}$|^CD[0-9]{0,2}$|^DVD[0-9]{0,2}$|^DISK[0-9]{0,2}$|^DISC[0-9]{0,2}$)"
     _roman_numerals = r"^(?=[MDCLXVI])M*(C[MD]|D?C{0,3})(X[CL]|L?X{0,3})(I[XV]|V?I{0,3})$"
     _source_re = r"^BLURAY$|^HDTV$|^UHDTV$|^HDDVD$|^WEBRIP$|^DVDRIP$|^BDRIP$|^BLU$|^WEB$|^BD$|^HDRip$|^REMUX$|^UHD$"
-    _effect_re = r"^SDR$|^HDR\d*$|^DOLBY$|^DOVI$|^DV$|^3D$|^REPACK$"
+    _effect_re = r"^SDR$|^HDR\d*$|^DOLBY$|^DOVI$|^DV$|^3D$|^REPACK$|^HLG$|^HDR10(\+|Plus)$|^EDR$|^HQ$"
     _resources_type_re = r"%s|%s" % (_source_re, _effect_re)
     _name_no_begin_re = r"^[\[【].+?[\]】]"
     _name_no_chinese_re = r".*版|.*字幕"
@@ -50,8 +51,8 @@ class MetaVideo(MetaBase):
                         r"|CD[\s.]*[1-9]|DVD[\s.]*[1-9]|DISK[\s.]*[1-9]|DISC[\s.]*[1-9]|\s+GB"
     _resources_pix_re = r"^[SBUHD]*(\d{3,4}[PI]+)|\d{3,4}X(\d{3,4})"
     _resources_pix_re2 = r"(^[248]+K)"
-    _video_encode_re = r"^[HX]26[45]$|^AVC$|^HEVC$|^VC\d?$|^MPEG\d?$|^Xvid$|^DivX$|^HDR\d*$"
-    _audio_encode_re = r"^DTS\d?$|^DTSHD$|^DTSHDMA$|^Atmos$|^TrueHD\d?$|^AC3$|^\dAudios?$|^DDP\d?$|^DD\d?$|^LPCM\d?$|^AAC\d?$|^FLAC\d?$|^HD\d?$|^MA\d?$"
+    _video_encode_re = r"^(H26[45])$|^(x26[45])$|^AVC$|^HEVC$|^VC\d?$|^MPEG\d?$|^Xvid$|^DivX$|^AV1$|^HDR\d*$|^AVS(\+|[23])$"
+    _audio_encode_re = r"^DTS\d?$|^DTSHD$|^DTSHDMA$|^Atmos$|^TrueHD\d?$|^AC3$|^\dAudios?$|^DDP\d?$|^DD\+\d?$|^DD\d?$|^LPCM\d?$|^AAC\d?$|^FLAC\d?$|^HD\d?$|^MA\d?$|^HR\d?$|^Opus\d?$|^Vorbis\d?$|^AV[3S]A$"
 
     def __init__(self, title: str, subtitle: str = None, isfile: bool = False):
         """
@@ -66,6 +67,7 @@ class MetaVideo(MetaBase):
         original_title = title
         self._source = ""
         self._effect = []
+        self._index = 0
         # 判断是否纯数字命名
         if isfile \
                 and title.isdigit() \
@@ -93,9 +95,12 @@ class MetaVideo(MetaBase):
         # 拆分tokens
         tokens = Tokens(title)
         self.tokens = tokens
+        # 实例化StreamingPlatforms对象
+        streaming_platforms = StreamingPlatforms()
         # 解析名称、年份、季、集、资源类型、分辨率等
         token = tokens.get_next()
         while token:
+            self._index += 1  # 更新当前处理的token索引
             # Part
             self.__init_part(token)
             # 标题
@@ -116,6 +121,9 @@ class MetaVideo(MetaBase):
             # 资源类型
             if self._continue_flag:
                 self.__init_resource_type(token)
+            # 流媒体平台
+            if self._continue_flag:
+                self.__init_web_source(token, streaming_platforms)
             # 视频编码
             if self._continue_flag:
                 self.__init_video_encode(token)
@@ -172,7 +180,7 @@ class MetaVideo(MetaBase):
         return None
 
     @staticmethod
-    def __is_pinyin(name_str: str) -> bool:
+    def __is_pinyin(name_str: Optional[str]) -> bool:
         """
         判断是否拼音
         """
@@ -183,7 +191,7 @@ class MetaVideo(MetaBase):
                 return False
         return True
 
-    def __fix_name(self, name: str):
+    def __fix_name(self, name: Optional[str]):
         """
         去掉名字中不需要的干扰字符
         """
@@ -207,7 +215,7 @@ class MetaVideo(MetaBase):
                 name = None
         return name
 
-    def __init_name(self, token: str):
+    def __init_name(self, token: Optional[str]):
         """
         识别名称
         """
@@ -574,6 +582,57 @@ class MetaVideo(MetaBase):
                 self._effect.append(effect)
             self._last_token = effect.upper()
 
+    def __init_web_source(self, token: str, streaming_platforms: StreamingPlatforms):
+        """
+        识别流媒体平台
+        """
+        if not self.name:
+            return
+
+        platform_name = None
+        query_range = 1
+
+        prev_token = None
+        prev_idx = self._index - 2
+        if 0 <= prev_idx < len(self.tokens.tokens):
+            prev_token = self.tokens.tokens[prev_idx]
+
+        next_token = self.tokens.peek()
+
+        if streaming_platforms.is_streaming_platform(token):
+            platform_name = streaming_platforms.get_streaming_platform_name(token)
+        else:
+            for adjacent_token, is_next in [(prev_token, False), (next_token, True)]:
+                if not adjacent_token or platform_name:
+                    continue
+
+                for separator in [" ", "-"]:
+                    if is_next:
+                        combined_token = f"{token}{separator}{adjacent_token}"
+                    else:
+                        combined_token = f"{adjacent_token}{separator}{token}"
+
+                    if streaming_platforms.is_streaming_platform(combined_token):
+                        platform_name = streaming_platforms.get_streaming_platform_name(combined_token)
+                        query_range = 2
+                        if is_next:
+                            self.tokens.get_next()
+                        break
+
+        if not platform_name:
+            return
+
+        web_tokens = ["WEB", "DL", "WEBDL", "WEBRIP"]
+        match_start_idx = self._index - query_range
+        match_end_idx = self._index - 1
+        start_index = max(0, match_start_idx - query_range)
+        end_index = min(len(self.tokens.tokens), match_end_idx + 1 + query_range)
+        tokens_to_check = self.tokens.tokens[start_index:end_index]
+
+        if any(tok and tok.upper() in web_tokens for tok in tokens_to_check):
+            self.web_source = platform_name
+            self._continue_flag = False
+
     def __init_video_encode(self, token: str):
         """
         识别视频编码
@@ -592,7 +651,12 @@ class MetaVideo(MetaBase):
             self._stop_name_flag = True
             self._last_token_type = "videoencode"
             if not self.video_encode:
-                self.video_encode = re_res.group(1).upper()
+                if re_res.group(2):
+                    self.video_encode = re_res.group(2).upper()
+                elif re_res.group(3):
+                    self.video_encode = re_res.group(3).lower()
+                else:
+                    self.video_encode = re_res.group(1).upper()
                 self._last_token = self.video_encode
             elif self.video_encode == "10bit":
                 self.video_encode = f"{re_res.group(1).upper()} 10bit"

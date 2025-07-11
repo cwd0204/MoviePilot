@@ -139,7 +139,7 @@ meta_cases = [{
         "episode": "E06",
         "restype": "WEB-DL",
         "pix": "1080p",
-        "video_codec": "X264",
+        "video_codec": "x264",
         "audio_codec": "AAC"
     }
 }, {
@@ -153,9 +153,9 @@ meta_cases = [{
         "part": "",
         "season": "S01",
         "episode": "E02",
-        "restype": "WEB-DL",
+        "restype": "B-Global WEB-DL",
         "pix": "1080p",
-        "video_codec": "X264",
+        "video_codec": "x264",
         "audio_codec": "AAC"
     }
 }, {
@@ -235,7 +235,7 @@ meta_cases = [{
         "episode": "",
         "restype": "BluRay",
         "pix": "1080p",
-        "video_codec": "X264",
+        "video_codec": "x264",
         "audio_codec": "Atmos TrueHD 7.1"
     }
 }, {
@@ -363,7 +363,7 @@ meta_cases = [{
         "episode": "E01",
         "restype": "UHD BluRay",
         "pix": "1080p",
-        "video_codec": "X264",
+        "video_codec": "x264",
         "audio_codec": ""
     }
 }, {
@@ -523,7 +523,7 @@ meta_cases = [{
         "episode": "E02",
         "restype": "BDRIP",
         "pix": "1080p",
-        "video_codec": "X265",
+        "video_codec": "x265",
         "audio_codec": "FLAC"
     }
 }, {
@@ -569,9 +569,9 @@ meta_cases = [{
         "part": "",
         "season": "S02",
         "episode": "E05",
-        "restype": "WEB-DL",
+        "restype": "Crunchyroll WEB-DL",
         "pix": "1080p",
-        "video_codec": "X264",
+        "video_codec": "x264",
         "audio_codec": "AAC"
     }
 }, {
@@ -649,7 +649,7 @@ meta_cases = [{
         "part": "",
         "season": "",
         "episode": "",
-        "restype": "WEBRip",
+        "restype": "Netflix WEBRip",
         "pix": "1080p",
         "video_codec": "H264",
         "audio_codec": "DDP 5.1"
@@ -667,8 +667,8 @@ meta_cases = [{
         "episode": "",
         "restype": "UHD BluRay DoVi",
         "pix": "1080p",
-        "video_codec": "X265",
-        "audio_codec": "DD 7.1"
+        "video_codec": "x265",
+        "audio_codec": "DD+ 7.1"
     }
 }, {
     "title": "Childhood.In.A.Capsule.S01E16.2022.1080p.KKTV.WEB-DL.X264.AAC-ADWeb.mkv",
@@ -681,9 +681,9 @@ meta_cases = [{
         "part": "",
         "season": "S01",
         "episode": "E16",
-        "restype": "WEB-DL",
+        "restype": "KKTV WEB-DL",
         "pix": "1080p",
-        "video_codec": "X264",
+        "video_codec": "x264",
         "audio_codec": "AAC"
     }
 }, {
@@ -763,7 +763,7 @@ meta_cases = [{
         "episode": "",
         "restype": "BluRay",
         "pix": "1080p",
-        "video_codec": "X265 10bit",
+        "video_codec": "x265 10bit",
         "audio_codec": "DTS-HD MA 5.1"
     }
 }, {
@@ -779,7 +779,7 @@ meta_cases = [{
         "episode": "",
         "restype": "WEB-DL",
         "pix": "1080p",
-        "video_codec": "X265",
+        "video_codec": "x265",
         "audio_codec": ""
     }
 }, {
@@ -827,7 +827,7 @@ meta_cases = [{
         "episode": "",
         "restype": "BluRay",
         "pix": "4k",
-        "video_codec": "X264",
+        "video_codec": "x264",
         "audio_codec": "DTS"
     }
 }, {
@@ -859,7 +859,7 @@ meta_cases = [{
         "episode": "E01",
         "restype": "WEB-DL",
         "pix": "1080p",
-        "video_codec": "X265",
+        "video_codec": "x265",
         "audio_codec": ""
     }
 }, {
@@ -921,9 +921,9 @@ meta_cases = [{
         "part": "",
         "season": "S06",
         "episode": "E06",
-        "restype": "WEBRip",
+        "restype": "Max WEBRip",
         "pix": "1080p",
-        "video_codec": "X264",
+        "video_codec": "x264",
         "audio_codec": "DD 5.1"
     }
 }, {
@@ -937,9 +937,9 @@ meta_cases = [{
         "part": "",
         "season": "S06",
         "episode": "E05",
-        "restype": "WEBRip",
+        "restype": "Max WEBRip",
         "pix": "1080p",
-        "video_codec": "X264",
+        "video_codec": "x264",
         "audio_codec": "DD 5.1"
     }
 }, {
@@ -968,8 +968,8 @@ meta_cases = [{
         "year": "2023",
         "part": "",
         "season": "S02",
-        "episode": "E01-E08",
-        "restype": "WEB-DL",
+        "episode": "",
+        "restype": "Netflix WEB-DL",
         "pix": "2160p",
         "video_codec": "H265",
         "audio_codec": "DDP 5.1 Atmos"
@@ -1016,7 +1016,7 @@ meta_cases = [{
         "year": "2019",
         "part": "",
         "season": "S01",
-        "episode": "E01-E36",
+        "episode": "",
         "restype": "WEB-DL",
         "pix": "2160p",
         "video_codec": "H265",
@@ -1036,5 +1036,85 @@ meta_cases = [{
         "pix": "",
         "video_codec": "",
         "audio_codec": ""
+    }
+}, {
+    "path": "/movies/The Vampire Diaries (2009) [tmdbid=18165]/The.Vampire.Diaries.S01E01.1080p.mkv",
+    "target": {
+        "type": "电视剧",
+        "cn_name": "",
+        "en_name": "The Vampire Diaries",
+        "year": "2009",
+        "part": "",
+        "season": "S01",
+        "episode": "E01",
+        "restype": "",
+        "pix": "1080p",
+        "video_codec": "",
+        "audio_codec": "",
+        "tmdbid": 18165
+    }
+}, {
+    "path": "/movies/Inception (2010) [tmdbid-27205]/Inception.2010.1080p.mkv",
+    "target": {
+        "type": "未知",
+        "cn_name": "",
+        "en_name": "Inception",
+        "year": "2010",
+        "part": "",
+        "season": "",
+        "episode": "",
+        "restype": "",
+        "pix": "1080p",
+        "video_codec": "",
+        "audio_codec": "",
+        "tmdbid": 27205
+    }
+}, {
+    "path": "/movies/Breaking Bad (2008) [tmdb=1396]/Season 1/Breaking.Bad.S01E01.1080p.mkv",
+    "target": {
+        "type": "电视剧",
+        "cn_name": "",
+        "en_name": "Breaking Bad",
+        "year": "2008",
+        "part": "",
+        "season": "S01",
+        "episode": "E01",
+        "restype": "",
+        "pix": "1080p",
+        "video_codec": "",
+        "audio_codec": "",
+        "tmdbid": 1396
+    }
+}, {
+    "path": "/tv/Game of Thrones (2011) {tmdb=1399}/Season 1/Game.of.Thrones.S01E01.1080p.mkv",
+    "target": {
+        "type": "电视剧",
+        "cn_name": "",
+        "en_name": "Game Of Thrones",
+        "year": "2011",
+        "part": "",
+        "season": "S01",
+        "episode": "E01",
+        "restype": "",
+        "pix": "1080p",
+        "video_codec": "",
+        "audio_codec": "",
+        "tmdbid": 1399
+    }
+}, {
+    "path": "/movies/Avatar (2009) {tmdb-19995}/Avatar.2009.1080p.mkv",
+    "target": {
+        "type": "未知",
+        "cn_name": "",
+        "en_name": "Avatar",
+        "year": "2009",
+        "part": "",
+        "season": "",
+        "episode": "",
+        "restype": "",
+        "pix": "1080p",
+        "video_codec": "",
+        "audio_codec": "",
+        "tmdbid": 19995
     }
 }]

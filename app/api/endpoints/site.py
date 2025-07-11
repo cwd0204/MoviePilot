@@ -1,12 +1,15 @@
-from typing import List, Any, Dict
+from typing import List, Any, Dict, Optional
 
+from app.helper.sites import SitesHelper
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 from starlette.background import BackgroundTasks
 
 from app import schemas
+from app.api.endpoints.plugin import register_plugin_api
 from app.chain.site import SiteChain
 from app.chain.torrents import TorrentsChain
+from app.command import Command
 from app.core.event import EventManager
 from app.core.plugin import PluginManager
 from app.core.security import verify_token
@@ -16,9 +19,9 @@ from app.db.models.site import Site
 from app.db.models.siteicon import SiteIcon
 from app.db.models.sitestatistic import SiteStatistic
 from app.db.models.siteuserdata import SiteUserData
+from app.db.site_oper import SiteOper
 from app.db.systemconfig_oper import SystemConfigOper
 from app.db.user_oper import get_current_active_superuser
-from app.helper.sites import SitesHelper
 from app.scheduler import Scheduler
 from app.schemas.types import SystemConfigKey, EventType
 from app.utils.string import StringUtils
@@ -145,7 +148,7 @@ def update_cookie(
         site_id: int,
         username: str,
         password: str,
-        code: str = None,
+        code: Optional[str] = None,
         db: Session = Depends(get_db),
         _: schemas.TokenPayload = Depends(get_current_active_superuser)) -> Any:
     """
@@ -203,7 +206,7 @@ def read_userdata_latest(
 @router.get("/userdata/{site_id}", summary="查询某站点用户数据", response_model=schemas.Response)
 def read_userdata(
         site_id: int,
-        workdate: str = None,
+        workdate: Optional[str] = None,
         db: Session = Depends(get_db),
         _: schemas.TokenPayload = Depends(get_current_active_superuser)) -> Any:
     """
@@ -281,14 +284,19 @@ def site_category(site_id: int,
     category: Dict[str, List[dict]] = indexer.get('category') or []
     if not category:
         return []
-    return list({category.get('movie') + category.get('tv')})
+    result = []
+    for cats in category.values():
+        for cat in cats:
+            if cat not in result:
+                result.append(cat)
+    return result
 
 
 @router.get("/resource/{site_id}", summary="站点资源", response_model=List[schemas.TorrentInfo])
 def site_resource(site_id: int,
-                  keyword: str = None,
-                  cat: str = None,
-                  page: int = 0,
+                  keyword: Optional[str] = None,
+                  cat: Optional[str] = None,
+                  page: Optional[int] = 0,
                   db: Session = Depends(get_db),
                   _: schemas.TokenPayload = Depends(get_current_active_superuser)) -> Any:
     """
@@ -325,8 +333,8 @@ def read_site_by_domain(
     return site
 
 
-@router.get("/statistic/{site_url}", summary="站点统计信息", response_model=schemas.SiteStatistic)
-def read_site_by_domain(
+@router.get("/statistic/{site_url}", summary="特定站点统计信息", response_model=schemas.SiteStatistic)
+def read_statistic_by_domain(
         site_url: str,
         db: Session = Depends(get_db),
         _: schemas.TokenPayload = Depends(verify_token)
@@ -339,6 +347,17 @@ def read_site_by_domain(
     if sitestatistic:
         return sitestatistic
     return schemas.SiteStatistic(domain=domain)
+
+
+@router.get("/statistic", summary="所有站点统计信息", response_model=List[schemas.SiteStatistic])
+def read_statistics(
+        db: Session = Depends(get_db),
+        _: schemas.TokenPayload = Depends(verify_token)
+) -> Any:
+    """
+    获取所有站点统计信息
+    """
+    return SiteStatistic.list(db)
 
 
 @router.get("/rss", summary="所有订阅站点", response_model=List[schemas.Site])
@@ -380,9 +399,27 @@ def auth_site(
         return schemas.Response(success=False, message="请输入认证站点和认证参数")
     status, msg = SitesHelper().check_user(auth_info.site, auth_info.params)
     SystemConfigOper().set(SystemConfigKey.UserSiteAuthParams, auth_info.dict())
+    # 认证成功后，重新初始化插件
     PluginManager().init_config()
     Scheduler().init_plugin_jobs()
+    Command().init_commands()
+    register_plugin_api()
     return schemas.Response(success=status, message=msg)
+
+
+@router.get("/mapping", summary="获取站点域名到名称的映射", response_model=schemas.Response)
+def site_mapping(_: User = Depends(get_current_active_superuser)):
+    """
+    获取站点域名到名称的映射关系
+    """
+    try:
+        sites = SiteOper().list()
+        mapping = {}
+        for site in sites:
+            mapping[site.domain] = site.name
+        return schemas.Response(success=True, data=mapping)
+    except Exception as e:
+        return schemas.Response(success=False, message=f"获取映射失败：{str(e)}")
 
 
 @router.get("/{site_id}", summary="站点详情", response_model=schemas.Site)

@@ -5,11 +5,13 @@ from app.core.config import settings
 from app.core.context import TorrentInfo
 from app.db.site_oper import SiteOper
 from app.helper.module import ModuleHelper
-from app.helper.sites import SitesHelper, SiteSpider
+from app.helper.sites import SitesHelper
 from app.log import logger
 from app.modules import _ModuleBase
 from app.modules.indexer.parser import SiteParserBase
+from app.modules.indexer.spider import SiteSpider
 from app.modules.indexer.spider.haidan import HaiDanSpider
+from app.modules.indexer.spider.hddolby import HddolbySpider
 from app.modules.indexer.spider.mtorrent import MTorrentSpider
 from app.modules.indexer.spider.tnode import TNodeSpider
 from app.modules.indexer.spider.torrentleech import TorrentLeech
@@ -76,8 +78,8 @@ class IndexerModule(_ModuleBase):
     def search_torrents(self, site: dict,
                         keywords: List[str] = None,
                         mtype: MediaType = None,
-                        cat: str = None,
-                        page: int = 0) -> List[TorrentInfo]:
+                        cat: Optional[str] = None,
+                        page: Optional[int] = 0) -> List[TorrentInfo]:
         """
         搜索一个站点
         :param site:  站点
@@ -121,6 +123,12 @@ class IndexerModule(_ModuleBase):
                 logger.warn(f"{site.get('name')} 不支持中文搜索")
                 continue
 
+            # 站点流控
+            state, msg = SitesHelper().check(StringUtils.get_url_domain(site.get("domain")))
+            if state:
+                logger.warn(msg)
+                continue
+
             # 去除搜索关键字中的特殊字符
             if search_word:
                 search_word = StringUtils.clear(search_word, replace_word=" ", allow_space=True)
@@ -152,6 +160,12 @@ class IndexerModule(_ModuleBase):
                     error_flag, result = HaiDanSpider(site).search(
                         keyword=search_word,
                         mtype=mtype
+                    )
+                elif site.get('parser') == "HDDolby":
+                    error_flag, result = HddolbySpider(site).search(
+                        keyword=search_word,
+                        mtype=mtype,
+                        page=page
                     )
                 else:
                     error_flag, result = self.__spider_search(
@@ -205,10 +219,10 @@ class IndexerModule(_ModuleBase):
 
     @staticmethod
     def __spider_search(indexer: dict,
-                        search_word: str = None,
+                        search_word: Optional[str] = None,
                         mtype: MediaType = None,
-                        cat: str = None,
-                        page: int = 0) -> Tuple[bool, List[dict]]:
+                        cat: Optional[str] = None,
+                        page: Optional[int] = 0) -> Tuple[bool, List[dict]]:
         """
         根据关键字搜索单个站点
         :param: indexer: 站点配置
@@ -225,10 +239,14 @@ class IndexerModule(_ModuleBase):
                              cat=cat,
                              page=page)
 
-        return _spider.is_error, _spider.get_torrents()
+        try:
+            return _spider.is_error, _spider.get_torrents()
+        finally:
+            # 显式清理SiteSpider对象
+            del _spider
 
     def refresh_torrents(self, site: dict,
-                         keyword: str = None, cat: str = None, page: int = 0) -> Optional[List[TorrentInfo]]:
+                         keyword: Optional[str] = None, cat: Optional[str] = None, page: Optional[int] = 0) -> Optional[List[TorrentInfo]]:
         """
         获取站点最新一页的种子，多个站点需要多线程处理
         :param site:  站点
@@ -269,26 +287,29 @@ class IndexerModule(_ModuleBase):
             return None
 
         # 获取用户数据
-        logger.info(f"站点 {site.get('name')} 开始以 {site.get('schema')} 模型解析数据...")
-        site_obj.parse()
-        logger.debug(f"站点 {site.get('name')} 数据解析完成")
-        return SiteUserData(
-            domain=StringUtils.get_url_domain(site.get("url")),
-            userid=site_obj.userid,
-            username=site_obj.username,
-            user_level=site_obj.user_level,
-            join_at=site_obj.join_at,
-            upload=site_obj.upload,
-            download=site_obj.download,
-            ratio=site_obj.ratio,
-            bonus=site_obj.bonus,
-            seeding=site_obj.seeding,
-            seeding_size=site_obj.seeding_size,
-            seeding_info=site_obj.seeding_info or [],
-            leeching=site_obj.leeching,
-            leeching_size=site_obj.leeching_size,
-            message_unread=site_obj.message_unread,
-            message_unread_contents=site_obj.message_unread_contents or [],
-            updated_day=datetime.now().strftime('%Y-%m-%d'),
-            err_msg=site_obj.err_msg
-        )
+        try:
+            logger.info(f"站点 {site.get('name')} 开始以 {site.get('schema')} 模型解析数据...")
+            site_obj.parse()
+            logger.debug(f"站点 {site.get('name')} 数据解析完成")
+            return SiteUserData(
+                domain=StringUtils.get_url_domain(site.get("url")),
+                userid=site_obj.userid,
+                username=site_obj.username,
+                user_level=site_obj.user_level,
+                join_at=site_obj.join_at,
+                upload=site_obj.upload,
+                download=site_obj.download,
+                ratio=site_obj.ratio,
+                bonus=site_obj.bonus,
+                seeding=site_obj.seeding,
+                seeding_size=site_obj.seeding_size,
+                seeding_info=site_obj.seeding_info.copy() if site_obj.seeding_info else [],
+                leeching=site_obj.leeching,
+                leeching_size=site_obj.leeching_size,
+                message_unread=site_obj.message_unread,
+                message_unread_contents=site_obj.message_unread_contents.copy() if site_obj.message_unread_contents else [],
+                updated_day=datetime.now().strftime('%Y-%m-%d'),
+                err_msg=site_obj.err_msg
+            )
+        finally:
+            site_obj.clear()

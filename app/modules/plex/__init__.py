@@ -2,12 +2,12 @@ from typing import Optional, Tuple, Union, Any, List, Generator
 
 from app import schemas
 from app.core.context import MediaInfo
-from app.core.event import eventmanager
+from app.core.event import eventmanager, Event
 from app.log import logger
 from app.modules import _ModuleBase, _MediaServerBase
 from app.modules.plex.plex import Plex
 from app.schemas import AuthCredentials, AuthInterceptCredentials
-from app.schemas.types import MediaType, ModuleType, ChainEventType, MediaServerType
+from app.schemas.types import MediaType, ModuleType, ChainEventType, MediaServerType, SystemConfigKey, EventType
 
 
 class PlexModule(_ModuleBase, _MediaServerBase[Plex]):
@@ -18,6 +18,20 @@ class PlexModule(_ModuleBase, _MediaServerBase[Plex]):
         """
         super().init_service(service_name=Plex.__name__.lower(),
                              service_type=lambda conf: Plex(**conf.config, sync_libraries=conf.sync_libraries))
+
+    @eventmanager.register(EventType.ConfigChanged)
+    def handle_config_changed(self, event: Event):
+        """
+        处理配置变更事件
+        :param event: 事件对象
+        """
+        if not event:
+            return
+        event_data: schemas.ConfigChangeEventData = event.event_data
+        if event_data.key not in [SystemConfigKey.MediaServers.value]:
+            return
+        logger.info("配置变更，重新初始化Plex模块...")
+        self.init_module()
 
     @staticmethod
     def get_name() -> str:
@@ -45,7 +59,12 @@ class PlexModule(_ModuleBase, _MediaServerBase[Plex]):
         return 3
 
     def stop(self):
-        pass
+        """
+        停止模块服务
+        """
+        for server in self.get_instances().values():
+            if server:
+                server.close()
 
     def test(self) -> Optional[Tuple[bool, str]]:
         """
@@ -139,8 +158,8 @@ class PlexModule(_ModuleBase, _MediaServerBase[Plex]):
                     return result
         return None
 
-    def media_exists(self, mediainfo: MediaInfo, itemid: str = None,
-                     server: str = None) -> Optional[schemas.ExistMediaInfo]:
+    def media_exists(self, mediainfo: MediaInfo, itemid: Optional[str] = None,
+                     server: Optional[str] = None) -> Optional[schemas.ExistMediaInfo]:
         """
         判断媒体文件是否存在
         :param mediainfo:  识别的媒体信息
@@ -152,12 +171,12 @@ class PlexModule(_ModuleBase, _MediaServerBase[Plex]):
             servers = [(server, self.get_instance(server))]
         else:
             servers = self.get_instances().items()
-        for name, server in servers:
-            if not server:
+        for name, s in servers:
+            if not s:
                 continue
             if mediainfo.type == MediaType.MOVIE:
                 if itemid:
-                    movie = server.get_iteminfo(itemid)
+                    movie = s.get_iteminfo(itemid)
                     if movie:
                         logger.info(f"媒体库 {name} 中找到了 {movie}")
                         return schemas.ExistMediaInfo(
@@ -166,10 +185,10 @@ class PlexModule(_ModuleBase, _MediaServerBase[Plex]):
                             server=name,
                             itemid=movie.item_id
                         )
-                movies = server.get_movies(title=mediainfo.title,
-                                           original_title=mediainfo.original_title,
-                                           year=mediainfo.year,
-                                           tmdb_id=mediainfo.tmdb_id)
+                movies = s.get_movies(title=mediainfo.title,
+                                      original_title=mediainfo.original_title,
+                                      year=mediainfo.year,
+                                      tmdb_id=mediainfo.tmdb_id)
                 if not movies:
                     logger.info(f"{mediainfo.title_year} 没有在媒体库 {name} 中")
                     continue
@@ -182,11 +201,11 @@ class PlexModule(_ModuleBase, _MediaServerBase[Plex]):
                         itemid=movies[0].item_id
                     )
             else:
-                item_id, tvs = server.get_tv_episodes(title=mediainfo.title,
-                                                      original_title=mediainfo.original_title,
-                                                      year=mediainfo.year,
-                                                      tmdb_id=mediainfo.tmdb_id,
-                                                      item_id=itemid)
+                item_id, tvs = s.get_tv_episodes(title=mediainfo.title,
+                                                 original_title=mediainfo.original_title,
+                                                 year=mediainfo.year,
+                                                 tmdb_id=mediainfo.tmdb_id,
+                                                 item_id=itemid)
                 if not tvs:
                     logger.info(f"{mediainfo.title_year} 没有在媒体库 {name} 中")
                     continue
@@ -201,7 +220,7 @@ class PlexModule(_ModuleBase, _MediaServerBase[Plex]):
                     )
         return None
 
-    def media_statistic(self, server: str = None) -> Optional[List[schemas.Statistic]]:
+    def media_statistic(self, server: Optional[str] = None) -> Optional[List[schemas.Statistic]]:
         """
         媒体数量统计
         """
@@ -213,15 +232,15 @@ class PlexModule(_ModuleBase, _MediaServerBase[Plex]):
         else:
             servers = self.get_instances().values()
         media_statistics = []
-        for server in servers:
-            media_statistic = server.get_medias_count()
+        for s in servers:
+            media_statistic = s.get_medias_count()
             if not media_statistic:
                 continue
             media_statistic.user_count = 1
             media_statistics.append(media_statistic)
         return media_statistics
 
-    def mediaserver_librarys(self, server: str = None, hidden: bool = False,
+    def mediaserver_librarys(self, server: Optional[str] = None, hidden: Optional[bool] = False,
                              **kwargs) -> Optional[List[schemas.MediaServerLibrary]]:
         """
         媒体库列表
@@ -231,7 +250,7 @@ class PlexModule(_ModuleBase, _MediaServerBase[Plex]):
             return server_obj.get_librarys(hidden)
         return None
 
-    def mediaserver_items(self, server: str, library_id: Union[str, int], start_index: int = 0,
+    def mediaserver_items(self, server: str, library_id: Union[str, int], start_index: Optional[int] = 0,
                           limit: Optional[int] = -1) -> Optional[Generator]:
         """
         获取媒体服务器项目列表，支持分页和不分页逻辑，默认不分页获取所有数据
@@ -273,7 +292,8 @@ class PlexModule(_ModuleBase, _MediaServerBase[Plex]):
             episodes=episodes
         ) for season, episodes in seasoninfo.items()]
 
-    def mediaserver_playing(self, server: str, count: int = 20, **kwargs) -> List[schemas.MediaServerPlayItem]:
+    def mediaserver_playing(self, server: str, count: Optional[int] = 20,
+                            **kwargs) -> List[schemas.MediaServerPlayItem]:
         """
         获取媒体服务器正在播放信息
         """
@@ -282,7 +302,7 @@ class PlexModule(_ModuleBase, _MediaServerBase[Plex]):
             return []
         return server_obj.get_resume(num=count)
 
-    def mediaserver_latest(self, server: str = None, count: int = 20,
+    def mediaserver_latest(self, server: Optional[str] = None, count: Optional[int] = 20,
                            **kwargs) -> List[schemas.MediaServerPlayItem]:
         """
         获取媒体服务器最新入库条目
@@ -293,9 +313,9 @@ class PlexModule(_ModuleBase, _MediaServerBase[Plex]):
         return server_obj.get_latest(num=count)
 
     def mediaserver_latest_images(self,
-                                  server: str = None,
-                                  count: int = 20,
-                                  username: str = None,
+                                  server: Optional[str] = None,
+                                  count: Optional[int] = 20,
+                                  username: Optional[str] = None,
                                   **kwargs
                                   ) -> List[str]:
         """

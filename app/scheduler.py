@@ -1,7 +1,7 @@
 import threading
 import traceback
 from datetime import datetime, timedelta
-from typing import List
+from typing import List, Optional
 
 import pytz
 from apscheduler.executors.pool import ThreadPoolExecutor
@@ -15,19 +15,21 @@ from app.chain.mediaserver import MediaServerChain
 from app.chain.recommend import RecommendChain
 from app.chain.site import SiteChain
 from app.chain.subscribe import SubscribeChain
-from app.chain.tmdb import TmdbChain
 from app.chain.transfer import TransferChain
 from app.chain.workflow import WorkflowChain
 from app.core.config import settings
-from app.core.event import EventManager
+from app.core.event import EventManager, eventmanager, Event
 from app.core.plugin import PluginManager
 from app.db.systemconfig_oper import SystemConfigOper
 from app.helper.sites import SitesHelper
+from app.helper.wallpaper import WallpaperHelper
 from app.log import logger
-from app.schemas import Notification, NotificationType, Workflow
+from app.schemas import Notification, NotificationType, Workflow, ConfigChangeEventData
 from app.schemas.types import EventType, SystemConfigKey
 from app.utils.singleton import Singleton
 from app.utils.timer import TimerUtils
+
+lock = threading.Lock()
 
 
 class SchedulerChain(ChainBase):
@@ -38,103 +40,41 @@ class Scheduler(metaclass=Singleton):
     """
     定时任务管理
     """
-    # 定时服务
-    _scheduler = None
-    # 退出事件
-    _event = threading.Event()
-    # 锁
-    _lock = threading.RLock()
-    # 各服务的运行状态
-    _jobs = {}
-    # 用户认证失败次数
-    _auth_count = 0
 
     def __init__(self):
+        # 定时服务
+        self._scheduler = None
+        # 退出事件
+        self._event = threading.Event()
+        # 锁
+        self._lock = threading.RLock()
+        # 各服务的运行状态
+        self._jobs = {}
+        # 用户认证失败次数
+        self._auth_count = 0
+        # 用户认证失败消息发送
+        self._auth_message = False
+        self.init()
+
+    @eventmanager.register(EventType.ConfigChanged)
+    def handle_config_changed(self, event: Event):
+        """
+        处理配置变更事件
+        :param event: 事件对象
+        """
+        if not event:
+            return
+        event_data: ConfigChangeEventData = event.event_data
+        if event_data.key not in ['DEV', 'COOKIECLOUD_INTERVAL', 'MEDIASERVER_SYNC_INTERVAL', 'SUBSCRIBE_SEARCH',
+                                  'SUBSCRIBE_MODE', 'SUBSCRIBE_RSS_INTERVAL', 'SITEDATA_REFRESH_INTERVAL']:
+            return
+        logger.info(f"配置项 {event_data.key} 变更，重新初始化定时服务...")
         self.init()
 
     def init(self):
         """
         初始化定时服务
         """
-        # 各服务的运行状态
-        self._jobs = {
-            "cookiecloud": {
-                "name": "同步CookieCloud站点",
-                "func": SiteChain().sync_cookies,
-                "running": False,
-            },
-            "mediaserver_sync": {
-                "name": "同步媒体服务器",
-                "func": MediaServerChain().sync,
-                "running": False,
-            },
-            "subscribe_tmdb": {
-                "name": "订阅元数据更新",
-                "func": SubscribeChain().check,
-                "running": False,
-            },
-            "subscribe_search": {
-                "name": "订阅搜索补全",
-                "func": SubscribeChain().search,
-                "running": False,
-                "kwargs": {
-                    "state": "R"
-                }
-            },
-            "new_subscribe_search": {
-                "name": "新增订阅搜索",
-                "func": SubscribeChain().search,
-                "running": False,
-                "kwargs": {
-                    "state": "N"
-                }
-            },
-            "subscribe_refresh": {
-                "name": "订阅刷新",
-                "func": SubscribeChain().refresh,
-                "running": False,
-            },
-            "subscribe_follow": {
-                "name": "关注的订阅分享",
-                "func": SubscribeChain().follow,
-                "running": False,
-            },
-            "transfer": {
-                "name": "下载文件整理",
-                "func": TransferChain().process,
-                "running": False,
-            },
-            "clear_cache": {
-                "name": "缓存清理",
-                "func": self.clear_cache,
-                "running": False,
-            },
-            "user_auth": {
-                "name": "用户认证检查",
-                "func": self.user_auth,
-                "running": False,
-            },
-            "scheduler_job": {
-                "name": "公共定时服务",
-                "func": SchedulerChain().scheduler_job,
-                "running": False,
-            },
-            "random_wallpager": {
-                "name": "壁纸缓存",
-                "func": TmdbChain().get_trending_wallpapers,
-                "running": False,
-            },
-            "sitedata_refresh": {
-                "name": "站点数据刷新",
-                "func": SiteChain().refresh_userdatas,
-                "running": False,
-            },
-            "recommend_refresh": {
-                "name": "推荐缓存",
-                "func": RecommendChain().refresh_recommend,
-                "running": False,
-            }
-        }
 
         # 停止定时服务
         self.stop()
@@ -143,221 +83,302 @@ class Scheduler(metaclass=Singleton):
         if settings.DEV:
             return
 
-        # 创建定时服务
-        self._scheduler = BackgroundScheduler(timezone=settings.TZ,
-                                              executors={
-                                                  'default': ThreadPoolExecutor(100)
-                                              })
-
-        # CookieCloud定时同步
-        if settings.COOKIECLOUD_INTERVAL \
-                and str(settings.COOKIECLOUD_INTERVAL).isdigit():
-            self._scheduler.add_job(
-                self.start,
-                "interval",
-                id="cookiecloud",
-                name="同步CookieCloud站点",
-                minutes=int(settings.COOKIECLOUD_INTERVAL),
-                next_run_time=datetime.now(pytz.timezone(settings.TZ)) + timedelta(minutes=1),
-                kwargs={
-                    'job_id': 'cookiecloud'
+        with lock:
+            # 各服务的运行状态
+            self._jobs = {
+                "cookiecloud": {
+                    "name": "同步CookieCloud站点",
+                    "func": SiteChain().sync_cookies,
+                    "running": False,
+                },
+                "mediaserver_sync": {
+                    "name": "同步媒体服务器",
+                    "func": MediaServerChain().sync,
+                    "running": False,
+                },
+                "subscribe_tmdb": {
+                    "name": "订阅元数据更新",
+                    "func": SubscribeChain().check,
+                    "running": False,
+                },
+                "subscribe_search": {
+                    "name": "订阅搜索补全",
+                    "func": SubscribeChain().search,
+                    "running": False,
+                    "kwargs": {
+                        "state": "R"
+                    }
+                },
+                "new_subscribe_search": {
+                    "name": "新增订阅搜索",
+                    "func": SubscribeChain().search,
+                    "running": False,
+                    "kwargs": {
+                        "state": "N"
+                    }
+                },
+                "subscribe_refresh": {
+                    "name": "订阅刷新",
+                    "func": SubscribeChain().refresh,
+                    "running": False,
+                },
+                "subscribe_follow": {
+                    "name": "关注的订阅分享",
+                    "func": SubscribeChain().follow,
+                    "running": False,
+                },
+                "transfer": {
+                    "name": "下载文件整理",
+                    "func": TransferChain().process,
+                    "running": False,
+                },
+                "clear_cache": {
+                    "name": "缓存清理",
+                    "func": self.clear_cache,
+                    "running": False,
+                },
+                "user_auth": {
+                    "name": "用户认证检查",
+                    "func": self.user_auth,
+                    "running": False,
+                },
+                "scheduler_job": {
+                    "name": "公共定时服务",
+                    "func": SchedulerChain().scheduler_job,
+                    "running": False,
+                },
+                "random_wallpager": {
+                    "name": "壁纸缓存",
+                    "func": WallpaperHelper().get_wallpapers,
+                    "running": False,
+                },
+                "sitedata_refresh": {
+                    "name": "站点数据刷新",
+                    "func": SiteChain().refresh_userdatas,
+                    "running": False,
+                },
+                "recommend_refresh": {
+                    "name": "推荐缓存",
+                    "func": RecommendChain().refresh_recommend,
+                    "running": False,
                 }
-            )
-
-        # 媒体服务器同步
-        if settings.MEDIASERVER_SYNC_INTERVAL \
-                and str(settings.MEDIASERVER_SYNC_INTERVAL).isdigit():
-            self._scheduler.add_job(
-                self.start,
-                "interval",
-                id="mediaserver_sync",
-                name="同步媒体服务器",
-                hours=int(settings.MEDIASERVER_SYNC_INTERVAL),
-                next_run_time=datetime.now(pytz.timezone(settings.TZ)) + timedelta(minutes=5),
-                kwargs={
-                    'job_id': 'mediaserver_sync'
-                }
-            )
-
-        # 新增订阅时搜索（5分钟检查一次）
-        self._scheduler.add_job(
-            self.start,
-            "interval",
-            id="new_subscribe_search",
-            name="新增订阅搜索",
-            minutes=5,
-            kwargs={
-                'job_id': 'new_subscribe_search'
             }
-        )
 
-        # 检查更新订阅TMDB数据（每隔6小时）
-        self._scheduler.add_job(
-            self.start,
-            "interval",
-            id="subscribe_tmdb",
-            name="订阅元数据更新",
-            hours=6,
-            kwargs={
-                'job_id': 'subscribe_tmdb'
-            }
-        )
+            # 创建定时服务
+            self._scheduler = BackgroundScheduler(timezone=settings.TZ,
+                                                  executors={
+                                                      'default': ThreadPoolExecutor(settings.CONF.scheduler)
+                                                  })
 
-        # 订阅状态每隔24小时搜索一次
-        if settings.SUBSCRIBE_SEARCH:
-            self._scheduler.add_job(
-                self.start,
-                "interval",
-                id="subscribe_search",
-                name="订阅搜索补全",
-                hours=24,
-                kwargs={
-                    'job_id': 'subscribe_search'
-                }
-            )
-
-        if settings.SUBSCRIBE_MODE == "spider":
-            # 站点首页种子定时刷新模式
-            triggers = TimerUtils.random_scheduler(num_executions=32)
-            for trigger in triggers:
+            # CookieCloud定时同步
+            if settings.COOKIECLOUD_INTERVAL \
+                    and str(settings.COOKIECLOUD_INTERVAL).isdigit():
                 self._scheduler.add_job(
                     self.start,
-                    "cron",
-                    id=f"subscribe_refresh|{trigger.hour}:{trigger.minute}",
-                    name="订阅刷新",
-                    hour=trigger.hour,
-                    minute=trigger.minute,
+                    "interval",
+                    id="cookiecloud",
+                    name="同步CookieCloud站点",
+                    minutes=int(settings.COOKIECLOUD_INTERVAL),
+                    next_run_time=datetime.now(pytz.timezone(settings.TZ)) + timedelta(minutes=1),
+                    kwargs={
+                        'job_id': 'cookiecloud'
+                    }
+                )
+
+            # 媒体服务器同步
+            if settings.MEDIASERVER_SYNC_INTERVAL \
+                    and str(settings.MEDIASERVER_SYNC_INTERVAL).isdigit():
+                self._scheduler.add_job(
+                    self.start,
+                    "interval",
+                    id="mediaserver_sync",
+                    name="同步媒体服务器",
+                    hours=int(settings.MEDIASERVER_SYNC_INTERVAL),
+                    next_run_time=datetime.now(pytz.timezone(settings.TZ)) + timedelta(minutes=5),
+                    kwargs={
+                        'job_id': 'mediaserver_sync'
+                    }
+                )
+
+            # 新增订阅时搜索（5分钟检查一次）
+            self._scheduler.add_job(
+                self.start,
+                "interval",
+                id="new_subscribe_search",
+                name="新增订阅搜索",
+                minutes=5,
+                kwargs={
+                    'job_id': 'new_subscribe_search'
+                }
+            )
+
+            # 检查更新订阅TMDB数据（每隔6小时）
+            self._scheduler.add_job(
+                self.start,
+                "interval",
+                id="subscribe_tmdb",
+                name="订阅元数据更新",
+                hours=6,
+                kwargs={
+                    'job_id': 'subscribe_tmdb'
+                }
+            )
+
+            # 订阅状态每隔24小时搜索一次
+            if settings.SUBSCRIBE_SEARCH:
+                self._scheduler.add_job(
+                    self.start,
+                    "interval",
+                    id="subscribe_search",
+                    name="订阅搜索补全",
+                    hours=24,
+                    kwargs={
+                        'job_id': 'subscribe_search'
+                    }
+                )
+
+            if settings.SUBSCRIBE_MODE == "spider":
+                # 站点首页种子定时刷新模式
+                triggers = TimerUtils.random_scheduler(num_executions=32)
+                for trigger in triggers:
+                    self._scheduler.add_job(
+                        self.start,
+                        "cron",
+                        id=f"subscribe_refresh|{trigger.hour}:{trigger.minute}",
+                        name="订阅刷新",
+                        hour=trigger.hour,
+                        minute=trigger.minute,
+                        kwargs={
+                            'job_id': 'subscribe_refresh'
+                        })
+            else:
+                # RSS订阅模式
+                if not settings.SUBSCRIBE_RSS_INTERVAL \
+                        or not str(settings.SUBSCRIBE_RSS_INTERVAL).isdigit():
+                    settings.SUBSCRIBE_RSS_INTERVAL = 30
+                elif int(settings.SUBSCRIBE_RSS_INTERVAL) < 5:
+                    settings.SUBSCRIBE_RSS_INTERVAL = 5
+                self._scheduler.add_job(
+                    self.start,
+                    "interval",
+                    id="subscribe_refresh",
+                    name="RSS订阅刷新",
+                    minutes=int(settings.SUBSCRIBE_RSS_INTERVAL),
                     kwargs={
                         'job_id': 'subscribe_refresh'
-                    })
-        else:
-            # RSS订阅模式
-            if not settings.SUBSCRIBE_RSS_INTERVAL \
-                    or not str(settings.SUBSCRIBE_RSS_INTERVAL).isdigit():
-                settings.SUBSCRIBE_RSS_INTERVAL = 30
-            elif int(settings.SUBSCRIBE_RSS_INTERVAL) < 5:
-                settings.SUBSCRIBE_RSS_INTERVAL = 5
+                    }
+                )
+
+            # 关注订阅分享（每1小时）
             self._scheduler.add_job(
                 self.start,
                 "interval",
-                id="subscribe_refresh",
-                name="RSS订阅刷新",
-                minutes=int(settings.SUBSCRIBE_RSS_INTERVAL),
+                id="subscribe_follow",
+                name="关注的订阅分享",
+                hours=1,
                 kwargs={
-                    'job_id': 'subscribe_refresh'
+                    'job_id': 'subscribe_follow'
                 }
             )
 
-        # 关注订阅分享（每1小时）
-        self._scheduler.add_job(
-            self.start,
-            "interval",
-            id="subscribe_follow",
-            name="关注的订阅分享",
-            hours=1,
-            kwargs={
-                'job_id': 'subscribe_follow'
-            }
-        )
-
-        # 下载器文件转移（每5分钟）
-        self._scheduler.add_job(
-            self.start,
-            "interval",
-            id="transfer",
-            name="下载文件整理",
-            minutes=5,
-            kwargs={
-                'job_id': 'transfer'
-            }
-        )
-
-        # 后台刷新TMDB壁纸
-        self._scheduler.add_job(
-            self.start,
-            "interval",
-            id="random_wallpager",
-            name="壁纸缓存",
-            minutes=30,
-            next_run_time=datetime.now(pytz.timezone(settings.TZ)) + timedelta(seconds=3),
-            kwargs={
-                'job_id': 'random_wallpager'
-            }
-        )
-
-        # 公共定时服务
-        self._scheduler.add_job(
-            self.start,
-            "interval",
-            id="scheduler_job",
-            name="公共定时服务",
-            minutes=10,
-            kwargs={
-                'job_id': 'scheduler_job'
-            }
-        )
-
-        # 缓存清理服务，每隔24小时
-        self._scheduler.add_job(
-            self.start,
-            "interval",
-            id="clear_cache",
-            name="缓存清理",
-            hours=settings.CACHE_CONF["meta"] / 3600,
-            kwargs={
-                'job_id': 'clear_cache'
-            }
-        )
-
-        # 定时检查用户认证，每隔10分钟
-        self._scheduler.add_job(
-            self.start,
-            "interval",
-            id="user_auth",
-            name="用户认证检查",
-            minutes=10,
-            kwargs={
-                'job_id': 'user_auth'
-            }
-        )
-
-        # 站点数据刷新
-        if settings.SITEDATA_REFRESH_INTERVAL:
+            # 下载器文件转移（每5分钟）
             self._scheduler.add_job(
                 self.start,
                 "interval",
-                id="sitedata_refresh",
-                name="站点数据刷新",
-                minutes=settings.SITEDATA_REFRESH_INTERVAL * 60,
+                id="transfer",
+                name="下载文件整理",
+                minutes=5,
                 kwargs={
-                    'job_id': 'sitedata_refresh'
+                    'job_id': 'transfer'
                 }
             )
 
-        # 推荐缓存
-        self._scheduler.add_job(
-            self.start,
-            "interval",
-            id="recommend_refresh",
-            name="推荐缓存",
-            hours=24,
-            next_run_time=datetime.now(pytz.timezone(settings.TZ)) + timedelta(seconds=3),
-            kwargs={
-                'job_id': 'recommend_refresh'
-            }
-        )
+            # 后台刷新TMDB壁纸
+            self._scheduler.add_job(
+                self.start,
+                "interval",
+                id="random_wallpager",
+                name="壁纸缓存",
+                minutes=30,
+                next_run_time=datetime.now(pytz.timezone(settings.TZ)) + timedelta(seconds=3),
+                kwargs={
+                    'job_id': 'random_wallpager'
+                }
+            )
 
-        # 初始化工作流服务
-        self.init_workflow_jobs()
-        
-        # 初始化插件服务
-        self.init_plugin_jobs()
+            # 公共定时服务
+            self._scheduler.add_job(
+                self.start,
+                "interval",
+                id="scheduler_job",
+                name="公共定时服务",
+                minutes=10,
+                kwargs={
+                    'job_id': 'scheduler_job'
+                }
+            )
 
-        # 打印服务
-        logger.debug(self._scheduler.print_jobs())
+            # 缓存清理服务，每隔24小时
+            self._scheduler.add_job(
+                self.start,
+                "interval",
+                id="clear_cache",
+                name="缓存清理",
+                hours=settings.CONF.meta / 3600,
+                kwargs={
+                    'job_id': 'clear_cache'
+                }
+            )
 
-        # 启动定时服务
-        self._scheduler.start()
+            # 定时检查用户认证，每隔10分钟
+            self._scheduler.add_job(
+                self.start,
+                "interval",
+                id="user_auth",
+                name="用户认证检查",
+                minutes=10,
+                kwargs={
+                    'job_id': 'user_auth'
+                }
+            )
+
+            # 站点数据刷新
+            if settings.SITEDATA_REFRESH_INTERVAL:
+                self._scheduler.add_job(
+                    self.start,
+                    "interval",
+                    id="sitedata_refresh",
+                    name="站点数据刷新",
+                    minutes=settings.SITEDATA_REFRESH_INTERVAL * 60,
+                    kwargs={
+                        'job_id': 'sitedata_refresh'
+                    }
+                )
+
+            # 推荐缓存
+            self._scheduler.add_job(
+                self.start,
+                "interval",
+                id="recommend_refresh",
+                name="推荐缓存",
+                hours=24,
+                next_run_time=datetime.now(pytz.timezone(settings.TZ)) + timedelta(seconds=3),
+                kwargs={
+                    'job_id': 'recommend_refresh'
+                }
+            )
+
+            # 初始化工作流服务
+            self.init_workflow_jobs()
+
+            # 初始化插件服务
+            self.init_plugin_jobs()
+
+            # 打印服务
+            self._scheduler.print_jobs()
+
+            # 启动定时服务
+            self._scheduler.start()
 
     def start(self, job_id: str, *args, **kwargs):
         """
@@ -422,7 +443,7 @@ class Scheduler(metaclass=Singleton):
             return
         with self._lock:
             job_id = f"workflow-{workflow.id}"
-            service = self._jobs.pop(job_id, None)
+            service = self._jobs.pop(job_id, {})
             if not service:
                 return
             try:
@@ -444,7 +465,7 @@ class Scheduler(metaclass=Singleton):
                                                    message=str(e),
                                                    role="system")
 
-    def remove_plugin_job(self, pid: str, job_id: str = None):
+    def remove_plugin_job(self, pid: str, job_id: Optional[str] = None):
         """
         移除定时服务，可以是单个服务（包括默认服务）或整个插件的所有服务
         :param pid: 插件 ID
@@ -494,6 +515,8 @@ class Scheduler(metaclass=Singleton):
         """
         更新工作流定时服务
         """
+        if not self._scheduler:
+            return
         # 移除该工作流的全部服务
         self.remove_workflow_job(workflow)
         # 添加工作流服务
@@ -503,6 +526,7 @@ class Scheduler(metaclass=Singleton):
                 self._jobs[job_id] = {
                     "func": WorkflowChain().process,
                     "name": workflow.name,
+                    "provider_name": "工作流",
                     "running": False,
                 }
                 self._scheduler.add_job(
@@ -510,7 +534,7 @@ class Scheduler(metaclass=Singleton):
                     trigger=CronTrigger.from_crontab(workflow.timer),
                     id=job_id,
                     name=workflow.name,
-                    kwargs={"job_id": job_id, "workflow_id": job_id},
+                    kwargs={"job_id": job_id, "workflow_id": workflow.id},
                     replace_existing=True
                 )
                 logger.info(f"注册工作流服务：{workflow.name} - {workflow.timer}")
@@ -530,24 +554,25 @@ class Scheduler(metaclass=Singleton):
         self.remove_plugin_job(pid)
         # 获取插件服务列表
         with self._lock:
+            plugin_manager = PluginManager()
             try:
-                plugin_services = PluginManager().get_plugin_services(pid=pid)
+                plugin_services = plugin_manager.get_plugin_services(pid=pid)
             except Exception as e:
                 logger.error(f"运行插件 {pid} 服务失败：{str(e)} - {traceback.format_exc()}")
                 return
             # 获取插件名称
-            plugin_name = PluginManager().get_plugin_attr(pid, "plugin_name")
+            plugin_name = plugin_manager.get_plugin_attr(pid, "plugin_name")
             # 开始注册插件服务
             for service in plugin_services:
                 try:
-                    sid = f"{service['id']}"
+                    sid = f"{pid}_{service['id']}"
                     job_id = sid.split("|")[0]
                     self.remove_plugin_job(pid, job_id)
                     self._jobs[job_id] = {
                         "func": service["func"],
                         "name": service["name"],
                         "pid": pid,
-                        "plugin_name": plugin_name,
+                        "provider_name": plugin_name,
                         "kwargs": service.get("func_kwargs") or {},
                         "running": False,
                     }
@@ -578,29 +603,32 @@ class Scheduler(metaclass=Singleton):
             schedulers = []
             # 去重
             added = []
+            # 避免_scheduler.shutdown()处于阻塞状态导致的死锁
+            if not self._scheduler or not self._scheduler.running:
+                return []
             jobs = self._scheduler.get_jobs()
             # 按照下次运行时间排序
             jobs.sort(key=lambda x: x.next_run_time)
             # 将正在运行的任务提取出来 (保障一次性任务正常显示)
             for job_id, service in self._jobs.items():
                 name = service.get("name")
-                plugin_name = service.get("plugin_name")
-                if service.get("running") and name and plugin_name:
-                    if name not in added:
-                        added.append(name)
+                provider_name = service.get("provider_name")
+                if service.get("running") and name and provider_name:
+                    if job_id not in added:
+                        added.append(job_id)
                     schedulers.append(schemas.ScheduleInfo(
                         id=job_id,
                         name=name,
-                        provider=plugin_name,
+                        provider=provider_name,
                         status="正在运行",
                     ))
             # 获取其他待执行任务
             for job in jobs:
-                if job.name not in added:
-                    added.append(job.name)
+                job_id = job.id.split("|")[0]
+                if job_id not in added:
+                    added.append(job_id)
                 else:
                     continue
-                job_id = job.id.split("|")[0]
                 service = self._jobs.get(job_id)
                 if not service:
                     continue
@@ -611,7 +639,7 @@ class Scheduler(metaclass=Singleton):
                 schedulers.append(schemas.ScheduleInfo(
                     id=job_id,
                     name=job.name,
-                    provider=service.get("plugin_name", "[系统]"),
+                    provider=service.get("provider_name", "[系统]"),
                     status=status,
                     next_run=next_run
                 ))
@@ -621,17 +649,18 @@ class Scheduler(metaclass=Singleton):
         """
         关闭定时服务
         """
-        try:
-            if self._scheduler:
-                logger.info("正在停止定时任务...")
-                self._event.set()
-                self._scheduler.remove_all_jobs()
-                if self._scheduler.running:
-                    self._scheduler.shutdown()
-                self._scheduler = None
-                logger.info("定时任务停止完成")
-        except Exception as e:
-            logger.error(f"停止定时任务失败：：{str(e)} - {traceback.format_exc()}")
+        with lock:
+            try:
+                if self._scheduler:
+                    logger.info("正在停止定时任务...")
+                    self._event.set()
+                    self._scheduler.remove_all_jobs()
+                    if self._scheduler.running:
+                        self._scheduler.shutdown()
+                    self._scheduler = None
+                    logger.info("定时任务停止完成")
+            except Exception as e:
+                logger.error(f"停止定时任务失败：：{str(e)} - {traceback.format_exc()}")
 
     @staticmethod
     def clear_cache():
@@ -649,9 +678,11 @@ class Scheduler(metaclass=Singleton):
         # 最大重试次数
         __max_try__ = 30
         if self._auth_count > __max_try__:
-            SchedulerChain().messagehelper.put(title=f"用户认证失败",
-                                               message="用户认证失败次数过多，将不再尝试认证！",
-                                               role="system")
+            if not self._auth_message:
+                SchedulerChain().messagehelper.put(title=f"用户认证失败",
+                                                   message="用户认证失败次数过多，将不再尝试认证！",
+                                                   role="system")
+                self._auth_message = True
             return
         logger.info("用户未认证，正在尝试认证...")
         auth_conf = SystemConfigOper().get(SystemConfigKey.UserSiteAuthParams)
@@ -666,10 +697,11 @@ class Scheduler(metaclass=Singleton):
                 Notification(
                     mtype=NotificationType.Manual,
                     title="MoviePilot用户认证成功",
-                    text=f"使用站点：{msg}",
+                    text=f"使用站点：{msg}，如有插件使用异常，请重启MoviePilot。",
                     link=settings.MP_DOMAIN('#/site')
                 )
             )
+            # 认证通过后重新初始化插件
             PluginManager().init_config()
             self.init_plugin_jobs()
 

@@ -1,7 +1,7 @@
 import base64
 import json
 import re
-from typing import Tuple, List
+from typing import Tuple, List, Optional
 
 from app.core.config import settings
 from app.db.systemconfig_oper import SystemConfigOper
@@ -65,7 +65,7 @@ class MTorrentSpider:
             self._token = indexer.get('token')
             self._timeout = indexer.get('timeout') or 15
 
-    def search(self, keyword: str, mtype: MediaType = None, page: int = 0) -> Tuple[bool, List[dict]]:
+    def search(self, keyword: str, mtype: MediaType = None, page: Optional[int] = 0) -> Tuple[bool, List[dict]]:
         """
         搜索
         """
@@ -108,11 +108,17 @@ class MTorrentSpider:
                     category = MediaType.MOVIE.value
                 else:
                     category = MediaType.UNKNOWN.value
-                labels_value = self._labels.get(result.get('labels') or "0") or ""
-                if labels_value:
-                    labels = labels_value.split()
+                # 处理馒头新版标签
+                labels = []
+                labels_new = result.get( 'labelsNew' )
+                if labels_new:
+                    # 新版标签本身就是list
+                    labels = labels_new
                 else:
-                    labels = []
+                    # 旧版标签
+                    labels_value = self._labels.get(result.get('labels') or "0") or ""
+                    if labels_value:
+                        labels = labels_value.split()
                 torrent = {
                     'title': result.get('name'),
                     'description': result.get('smallDescr'),
@@ -191,7 +197,6 @@ class MTorrentSpider:
                 'id': torrent_id
             },
             'header': {
-                'Content-Type': 'application/json',
                 'User-Agent': f'{self._ua}',
                 'Accept': 'application/json, text/plain, */*',
                 'x-api-key': self._apikey

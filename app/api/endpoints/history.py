@@ -1,4 +1,4 @@
-from typing import List, Any
+from typing import List, Any, Optional
 
 import jieba
 from fastapi import APIRouter, Depends
@@ -6,7 +6,6 @@ from sqlalchemy.orm import Session
 
 from app import schemas
 from app.chain.storage import StorageChain
-from app.core.config import settings
 from app.core.event import eventmanager
 from app.core.security import verify_token
 from app.db import get_db
@@ -20,8 +19,8 @@ router = APIRouter()
 
 
 @router.get("/download", summary="查询下载历史记录", response_model=List[schemas.DownloadHistory])
-def download_history(page: int = 1,
-                     count: int = 30,
+def download_history(page: Optional[int] = 1,
+                     count: Optional[int] = 30,
                      db: Session = Depends(get_db),
                      _: schemas.TokenPayload = Depends(verify_token)) -> Any:
     """
@@ -42,10 +41,10 @@ def delete_download_history(history_in: schemas.DownloadHistory,
 
 
 @router.get("/transfer", summary="查询整理记录", response_model=schemas.Response)
-def transfer_history(title: str = None,
-                     page: int = 1,
-                     count: int = 30,
-                     status: bool = None,
+def transfer_history(title: Optional[str] = None,
+                     page: Optional[int] = 1,
+                     count: Optional[int] = 30,
+                     status: Optional[bool] = None,
                      db: Session = Depends(get_db),
                      _: schemas.TokenPayload = Depends(verify_token)) -> Any:
     """
@@ -59,9 +58,8 @@ def transfer_history(title: str = None,
         status = True
 
     if title:
-        if settings.TOKENIZED_SEARCH:
-            words = jieba.cut(title, HMM=False)
-            title = "%".join(words)
+        words = jieba.cut(title, HMM=False)
+        title = "%".join(words)
         total = TransferHistory.count_by_title(db, title=title, status=status)
         result = TransferHistory.list_by_title(db, title=title, page=page,
                                                count=count, status=status)
@@ -78,8 +76,8 @@ def transfer_history(title: str = None,
 
 @router.delete("/transfer", summary="删除整理记录", response_model=schemas.Response)
 def delete_transfer_history(history_in: schemas.TransferHistory,
-                            deletesrc: bool = False,
-                            deletedest: bool = False,
+                            deletesrc: Optional[bool] = False,
+                            deletedest: Optional[bool] = False,
                             db: Session = Depends(get_db),
                             _: schemas.TokenPayload = Depends(get_current_active_superuser)) -> Any:
     """

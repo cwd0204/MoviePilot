@@ -1,5 +1,5 @@
 from pathlib import Path
-from typing import Any, List
+from typing import Any, List, Annotated, Optional
 
 from fastapi import APIRouter, Depends
 from sqlalchemy.orm import Session
@@ -8,11 +8,13 @@ from app import schemas
 from app.chain.media import MediaChain
 from app.chain.storage import StorageChain
 from app.chain.transfer import TransferChain
+from app.core.config import settings
 from app.core.metainfo import MetaInfoPath
 from app.core.security import verify_token, verify_apitoken
 from app.db import get_db
 from app.db.models.transferhistory import TransferHistory
 from app.db.user_oper import get_current_active_superuser
+from app.helper.directory import DirectoryHelper
 from app.schemas import MediaType, FileItem, ManualTransferItem
 
 router = APIRouter()
@@ -35,11 +37,23 @@ def query_name(path: str, filetype: str,
     if not new_path:
         return schemas.Response(success=False, message="未识别到新名称")
     if filetype == "dir":
-        parents = Path(new_path).parents
-        if len(parents) > 2:
-            new_name = parents[1].name
+        media_path = DirectoryHelper.get_media_root_path(
+            rename_format=(
+                settings.TV_RENAME_FORMAT
+                if mediainfo.type == MediaType.TV
+                else settings.MOVIE_RENAME_FORMAT
+            ),
+            rename_path=Path(new_path),
+        )
+        if media_path:
+            new_name = media_path.name
         else:
-            new_name = parents[0].name
+            # fallback
+            parents = Path(new_path).parents
+            if len(parents) > 2:
+                new_name = parents[1].name
+            else:
+                new_name = parents[0].name
     else:
         new_name = Path(new_path).name
     return schemas.Response(success=True, data={
@@ -69,7 +83,7 @@ def remove_queue(fileitem: schemas.FileItem, _: schemas.TokenPayload = Depends(v
 
 @router.post("/manual", summary="手动转移", response_model=schemas.Response)
 def manual_transfer(transer_item: ManualTransferItem,
-                    background: bool = False,
+                    background: Optional[bool] = False,
                     db: Session = Depends(get_db),
                     _: schemas.TokenPayload = Depends(get_current_active_superuser)) -> Any:
     """
@@ -146,6 +160,7 @@ def manual_transfer(transer_item: ManualTransferItem,
         doubanid=transer_item.doubanid,
         mtype=mtype,
         season=transer_item.season,
+        episode_group=transer_item.episode_group,
         transfer_type=transer_item.transfer_type,
         epformat=epformat,
         min_filesize=transer_item.min_filesize,
@@ -165,7 +180,7 @@ def manual_transfer(transer_item: ManualTransferItem,
 
 
 @router.get("/now", summary="立即执行下载器文件整理", response_model=schemas.Response)
-def now(_: str = Depends(verify_apitoken)) -> Any:
+def now(_: Annotated[str, Depends(verify_apitoken)]) -> Any:
     """
     立即执行下载器文件整理 API_TOKEN认证（?token=xxx）
     """

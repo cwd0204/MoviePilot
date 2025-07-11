@@ -1,23 +1,25 @@
 import shutil
 from pathlib import Path
+from typing import Union
 
 import ruamel.yaml
+from ruamel.yaml import CommentedMap
 
 from app.core.config import settings
 from app.log import logger
-from app.utils.singleton import Singleton
+from app.utils.singleton import WeakSingleton
 
 
-class CategoryHelper(metaclass=Singleton):
+class CategoryHelper(metaclass=WeakSingleton):
     """
     二级分类
     """
-    _categorys = {}
-    _movie_categorys = {}
-    _tv_categorys = {}
 
     def __init__(self):
         self._category_path: Path = settings.CONFIG_PATH / "category.yaml"
+        self._categorys = {}
+        self._movie_categorys = {}
+        self._tv_categorys = {}
         self.init()
 
     def init(self):
@@ -67,7 +69,7 @@ class CategoryHelper(metaclass=Singleton):
         """
         if not self._movie_categorys:
             return []
-        return self._movie_categorys.keys()
+        return list(self._movie_categorys.keys())
 
     @property
     def tv_categorys(self) -> list:
@@ -76,7 +78,7 @@ class CategoryHelper(metaclass=Singleton):
         """
         if not self._tv_categorys:
             return []
-        return self._tv_categorys.keys()
+        return list(self._tv_categorys.keys())
 
     def get_movie_category(self, tmdb_info) -> str:
         """
@@ -95,7 +97,7 @@ class CategoryHelper(metaclass=Singleton):
         return self.get_category(self._tv_categorys, tmdb_info)
 
     @staticmethod
-    def get_category(categorys: dict, tmdb_info: dict) -> str:
+    def get_category(categorys: Union[dict, CommentedMap], tmdb_info: dict) -> str:
         """
         根据 TMDB信息与分类配置文件进行比较，确定所属分类
         :param categorys: 分类配置
@@ -113,12 +115,19 @@ class CategoryHelper(metaclass=Singleton):
             for attr, value in item.items():
                 if not value:
                     continue
-                info_value = tmdb_info.get(attr)
+                if attr == "release_year":
+                    # 发行年份
+                    info_value = tmdb_info.get("release_date") or tmdb_info.get("first_air_date")
+                    if info_value:
+                        info_value = str(info_value)[:4]
+                else:
+                    info_value = tmdb_info.get(attr)
                 if not info_value:
                     match_flag = False
                     continue
                 elif attr == "production_countries":
-                    info_values = [str(val.get("iso_3166_1")).upper() for val in info_value]
+                    # 制片国家
+                    info_values = [str(val.get("iso_3166_1")).upper() for val in info_value] # type: ignore
                 else:
                     if isinstance(info_value, list):
                         info_values = [str(val).upper() for val in info_value]
@@ -126,7 +135,18 @@ class CategoryHelper(metaclass=Singleton):
                         info_values = [str(info_value).upper()]
 
                 if value.find(",") != -1:
+                    # , 分隔多个值
                     values = [str(val).upper() for val in value.split(",") if val]
+                elif value.find("-") != -1:
+                    # - 表示范围，仅限于数字
+                    value_begin = value.split("-")[0]
+                    value_end = value.split("-")[1]
+                    if value_begin.isdigit() and value_end.isdigit():
+                        # 数字范围
+                        values = [str(val) for val in range(int(value_begin), int(value_end) + 1)]
+                    else:
+                        # 字符串范围
+                        values = [str(value_begin), str(value_end)]
                 else:
                     values = [str(value).upper()]
 

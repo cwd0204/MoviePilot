@@ -1,22 +1,25 @@
 import asyncio
 import io
 import json
+import re
 import tempfile
 from collections import deque
 from datetime import datetime
 from pathlib import Path
-from typing import Optional, Union
+from typing import Optional, Union, Annotated
 
 import aiofiles
 import pillow_avif  # noqa 用于自动注册AVIF支持
 from PIL import Image
-from fastapi import APIRouter, Depends, HTTPException, Header, Request, Response
+from app.helper.sites import SitesHelper
+from fastapi import APIRouter, Body, Depends, HTTPException, Header, Request, Response
 from fastapi.responses import StreamingResponse
 
 from app import schemas
 from app.chain.search import SearchChain
 from app.chain.system import SystemChain
 from app.core.config import global_vars, settings
+from app.core.event import eventmanager
 from app.core.metainfo import MetaInfo
 from app.core.module import ModuleManager
 from app.core.security import verify_apitoken, verify_resource_token, verify_token
@@ -27,15 +30,15 @@ from app.helper.mediaserver import MediaServerHelper
 from app.helper.message import MessageHelper
 from app.helper.progress import ProgressHelper
 from app.helper.rule import RuleHelper
-from app.helper.sites import SitesHelper
+from app.helper.subscribe import SubscribeHelper
+from app.helper.system import SystemHelper
 from app.log import logger
-from app.monitor import Monitor
 from app.scheduler import Scheduler
-from app.schemas.types import SystemConfigKey
+from app.schemas import ConfigChangeEventData
+from app.schemas.types import SystemConfigKey, EventType
 from app.utils.crypto import HashUtils
 from app.utils.http import RequestUtils
 from app.utils.security import SecurityUtils
-from app.utils.system import SystemUtils
 from app.utils.url import UrlUtils
 from version import APP_VERSION
 
@@ -141,7 +144,8 @@ def fetch_image(
 def proxy_img(
         imgurl: str,
         proxy: bool = False,
-        if_none_match: Optional[str] = Header(None),
+        cache: bool = False,
+        if_none_match: Annotated[str | None, Header()] = None,
         _: schemas.TokenPayload = Depends(verify_resource_token)
 ) -> Response:
     """
@@ -151,14 +155,14 @@ def proxy_img(
     hosts = [config.config.get("host") for config in MediaServerHelper().get_configs().values() if
              config and config.config and config.config.get("host")]
     allowed_domains = set(settings.SECURITY_IMAGE_DOMAINS) | set(hosts)
-    return fetch_image(url=imgurl, proxy=proxy, use_disk_cache=False,
+    return fetch_image(url=imgurl, proxy=proxy, use_disk_cache=cache,
                        if_none_match=if_none_match, allowed_domains=allowed_domains)
 
 
 @router.get("/cache/image", summary="图片缓存")
 def cache_img(
         url: str,
-        if_none_match: Optional[str] = Header(None),
+        if_none_match: Annotated[str | None, Header()] = None,
         _: schemas.TokenPayload = Depends(verify_resource_token)
 ) -> Response:
     """
@@ -170,18 +174,24 @@ def cache_img(
 
 
 @router.get("/global", summary="查询非敏感系统设置", response_model=schemas.Response)
-def get_global_setting():
+def get_global_setting(token: str):
     """
-    查询非敏感系统设置（无需鉴权）
+    查询非敏感系统设置（默认鉴权）
     """
+    if token != "moviepilot":
+        raise HTTPException(status_code=403, detail="Forbidden")
+
     # FIXME: 新增敏感配置项时要在此处添加排除项
     info = settings.dict(
         exclude={"SECRET_KEY", "RESOURCE_SECRET_KEY", "API_TOKEN", "TMDB_API_KEY", "TVDB_API_KEY", "FANART_API_KEY",
                  "COOKIECLOUD_KEY", "COOKIECLOUD_PASSWORD", "GITHUB_TOKEN", "REPO_GITHUB_TOKEN"}
     )
-    # 追加用户唯一ID
+    # 追加用户唯一ID和订阅分享管理权限
+    share_admin = SubscribeHelper().is_admin_user()
     info.update({
-        "USER_UNIQUE_ID": SystemUtils.generate_user_unique_id()
+        "USER_UNIQUE_ID": SubscribeHelper().get_user_uuid(),
+        "SUBSCRIBE_SHARE_MANAGE": share_admin,
+        "WORKFLOW_SHARE_MANAGE": share_admin
     })
     return schemas.Response(success=True,
                             data=info)
@@ -214,17 +224,26 @@ def set_env_setting(env: dict,
     result = settings.update_settings(env=env)
     # 统计成功和失败的结果
     success_updates = {k: v for k, v in result.items() if v[0]}
-    failed_updates = {k: v for k, v in result.items() if not v[0]}
+    failed_updates = {k: v for k, v in result.items() if v[0] is False}
 
     if failed_updates:
         return schemas.Response(
             success=False,
-            message="部分配置项更新失败",
+            message=f"{', '.join([v[1] for v in failed_updates.values()])}",
             data={
                 "success_updates": success_updates,
                 "failed_updates": failed_updates
             }
         )
+
+    if success_updates:
+        for key in success_updates.keys():
+            # 发送配置变更事件
+            eventmanager.send_event(etype=EventType.ConfigChanged, data=ConfigChangeEventData(
+                key=key,
+                value=getattr(settings, key, None),
+                change_type="update"
+            ))
 
     return schemas.Response(
         success=True,
@@ -272,23 +291,46 @@ def get_setting(key: str,
 
 
 @router.post("/setting/{key}", summary="更新系统设置", response_model=schemas.Response)
-def set_setting(key: str, value: Union[list, dict, bool, int, str] = None,
-                _: User = Depends(get_current_active_superuser)):
+def set_setting(
+        key: str,
+        value: Annotated[Union[list, dict, bool, int, str] | None, Body()] = None,
+        _: User = Depends(get_current_active_superuser),
+):
     """
     更新系统设置（仅管理员）
     """
     if hasattr(settings, key):
         success, message = settings.update_setting(key=key, value=value)
+        if success:
+            # 发送配置变更事件
+            eventmanager.send_event(etype=EventType.ConfigChanged, data=ConfigChangeEventData(
+                key=key,
+                value=value,
+                change_type="update"
+            ))
+        elif success is None:
+            success = True
         return schemas.Response(success=success, message=message)
     elif key in {item.value for item in SystemConfigKey}:
-        SystemConfigOper().set(key, value)
+        if isinstance(value, list):
+            value = list(filter(None, value))
+            value = value if value else None
+        success = SystemConfigOper().set(key, value)
+        if success:
+            # 发送配置变更事件
+            eventmanager.send_event(etype=EventType.ConfigChanged, data=ConfigChangeEventData(
+                key=key,
+                value=value,
+                change_type="update"
+            ))
         return schemas.Response(success=True)
     else:
         return schemas.Response(success=False, message=f"配置项 '{key}' 不存在")
 
 
 @router.get("/message", summary="实时消息")
-async def get_message(request: Request, role: str = "system", _: schemas.TokenPayload = Depends(verify_resource_token)):
+async def get_message(request: Request, role: Optional[str] = "system",
+                      _: schemas.TokenPayload = Depends(verify_resource_token)):
     """
     实时获取系统消息，返回格式为SSE
     """
@@ -309,7 +351,7 @@ async def get_message(request: Request, role: str = "system", _: schemas.TokenPa
 
 
 @router.get("/logging", summary="实时日志")
-async def get_logging(request: Request, length: int = 50, logfile: str = "moviepilot.log",
+async def get_logging(request: Request, length: Optional[int] = 50, logfile: Optional[str] = "moviepilot.log",
                       _: schemas.TokenPayload = Depends(verify_resource_token)):
     """
     实时获取系统日志
@@ -381,7 +423,7 @@ def latest_version(_: schemas.TokenPayload = Depends(verify_token)):
 @router.get("/ruletest", summary="过滤规则测试", response_model=schemas.Response)
 def ruletest(title: str,
              rulegroup_name: str,
-             subtitle: str = None,
+             subtitle: Optional[str] = None,
              _: schemas.TokenPayload = Depends(verify_token)):
     """
     过滤规则测试，规则类型 1-订阅，2-洗版，3-搜索
@@ -411,30 +453,55 @@ def ruletest(title: str,
 
 
 @router.get("/nettest", summary="测试网络连通性")
-def nettest(url: str,
-            proxy: bool,
-            _: schemas.TokenPayload = Depends(verify_token)):
+def nettest(
+        url: str,
+        proxy: bool,
+        include: Optional[str] = None,
+        _: schemas.TokenPayload = Depends(verify_token),
+):
     """
     测试网络连通性
     """
     # 记录开始的毫秒数
     start_time = datetime.now()
+    headers = None
+    if "github" in url or "{GITHUB_PROXY}" in url:
+        # 这是github的连通性测试
+        url = url.replace(
+            "{GITHUB_PROXY}", UrlUtils.standardize_base_url(settings.GITHUB_PROXY or "")
+        )
+        headers = settings.GITHUB_HEADERS
     url = url.replace("{TMDBAPIKEY}", settings.TMDB_API_KEY)
-    result = RequestUtils(proxies=settings.PROXY if proxy else None,
-                          ua=settings.USER_AGENT).get_res(url)
+    url = url.replace(
+        "{PIP_PROXY}",
+        UrlUtils.standardize_base_url(settings.PIP_PROXY or "https://pypi.org/simple/"),
+    )
+    result = RequestUtils(
+        proxies=settings.PROXY if proxy else None,
+        headers=headers,
+        timeout=10,
+        ua=settings.USER_AGENT,
+    ).get_res(url)
     # 计时结束的毫秒数
     end_time = datetime.now()
+    time = round((end_time - start_time).total_seconds() * 1000)
     # 计算相关秒数
-    if result and result.status_code == 200:
-        return schemas.Response(success=True, data={
-            "time": round((end_time - start_time).microseconds / 1000)
-        })
-    elif result:
-        return schemas.Response(success=False, message=f"错误码：{result.status_code}", data={
-            "time": round((end_time - start_time).microseconds / 1000)
-        })
+    if result is None:
+        return schemas.Response(success=False, message="无法连接", data={"time": time})
+    elif result.status_code == 200:
+        if include and not re.search(r"%s" % include, result.text, re.IGNORECASE):
+            # 通常是被加速代理跳转到其它页面了
+            logger.error(f"{url} 的响应内容不匹配包含规则 {include}")
+            return schemas.Response(
+                success=False,
+                message=f"无效响应，不匹配 {include}",
+                data={"time": time},
+            )
+        return schemas.Response(success=True, data={"time": time})
     else:
-        return schemas.Response(success=False, message="网络连接失败！")
+        return schemas.Response(
+            success=False, message=f"错误码：{result.status_code}", data={"time": time}
+        )
 
 
 @router.get("/modulelist", summary="查询已加载的模块ID列表", response_model=schemas.Response)
@@ -465,24 +532,13 @@ def restart_system(_: User = Depends(get_current_active_superuser)):
     """
     重启系统（仅管理员）
     """
-    if not SystemUtils.can_restart():
+    if not SystemHelper.can_restart():
         return schemas.Response(success=False, message="当前运行环境不支持重启操作！")
     # 标识停止事件
     global_vars.stop_system()
     # 执行重启
-    ret, msg = SystemUtils.restart()
+    ret, msg = SystemHelper.restart()
     return schemas.Response(success=ret, message=msg)
-
-
-@router.get("/reload", summary="重新加载模块", response_model=schemas.Response)
-def reload_module(_: User = Depends(get_current_active_superuser)):
-    """
-    重新加载模块（仅管理员）
-    """
-    ModuleManager().reload()
-    Scheduler().init()
-    Monitor().init()
-    return schemas.Response(success=True)
 
 
 @router.get("/runscheduler", summary="运行服务", response_model=schemas.Response)
@@ -499,7 +555,7 @@ def run_scheduler(jobid: str,
 
 @router.get("/runscheduler2", summary="运行服务（API_TOKEN）", response_model=schemas.Response)
 def run_scheduler2(jobid: str,
-                   _: str = Depends(verify_apitoken)):
+                   _: Annotated[str, Depends(verify_apitoken)]):
     """
     执行命令（API_TOKEN认证）
     """

@@ -1,7 +1,7 @@
 from time import sleep
-from typing import Dict, Any, Tuple
+from typing import Dict, Any, Tuple, List
 
-from app.actions import BaseAction
+from app.core.config import global_vars
 from app.helper.module import ModuleHelper
 from app.log import logger
 from app.schemas import Action, ActionContext
@@ -13,10 +13,9 @@ class WorkFlowManager(metaclass=Singleton):
     工作流管理器
     """
 
-    # 所有动作定义
-    _actions: Dict[str, BaseAction] = {}
-
     def __init__(self):
+        # 所有动作定义
+        self._actions: Dict[str, Any] = {}
         self.init()
 
     def init(self):
@@ -44,7 +43,10 @@ class WorkFlowManager(metaclass=Singleton):
         )
         for action in actions:
             logger.debug(f"加载动作: {action.__name__}")
-            self._actions[action.__name__] = action
+            try:
+                self._actions[action.__name__] = action
+            except Exception as err:
+                logger.error(f"加载动作失败: {action.__name__} - {err}")
 
     def stop(self):
         """
@@ -52,26 +54,58 @@ class WorkFlowManager(metaclass=Singleton):
         """
         pass
 
-    def excute(self, action: Action, context: ActionContext = None) -> Tuple[bool, ActionContext]:
+    def excute(self, workflow_id: int, action: Action,
+               context: ActionContext = None) -> Tuple[bool, str, ActionContext]:
         """
         执行工作流动作
         """
         if not context:
             context = ActionContext()
-        if action.id in self._actions:
-            action_obj = self._actions[action.id]
+        if action.type in self._actions:
+            # 实例化之前，清理掉类对象的数据
+
+            # 实例化
+            action_obj = self._actions[action.type](action.id)
+            # 执行
             logger.info(f"执行动作: {action.id} - {action.name}")
-            result_context = action_obj.execute(action.params, context)
-            logger.info(f"{action.name} 执行结果: {action_obj.success}")
-            if action.loop and action.loop_interval:
+            try:
+                result_context = action_obj.execute(workflow_id, action.data, context)
+            except Exception as err:
+                logger.error(f"{action.name} 执行失败: {err}")
+                return False, f"{err}", context
+            loop = action.data.get("loop")
+            loop_interval = action.data.get("loop_interval")
+            if loop and loop_interval:
                 while not action_obj.done:
-                    logger.info(f"{action.name} 等待 {action.loop_interval} 秒后继续执行")
-                    sleep(action.loop_interval)
+                    if global_vars.is_workflow_stopped(workflow_id):
+                        break
+                    # 等待
+                    logger.info(f"{action.name} 等待 {loop_interval} 秒后继续执行 ...")
+                    sleep(loop_interval)
+                    # 执行
                     logger.info(f"继续执行动作: {action.id} - {action.name}")
-                    result_context = action_obj.execute(action.params, result_context)
-                    logger.info(f"{action.name} 执行结果: {action_obj.success}")
-            logger.info(f"{action.name} 执行完成")
-            return action_obj.success, result_context
+                    result_context = action_obj.execute(workflow_id, action.data, result_context)
+            if action_obj.success:
+                logger.info(f"{action.name} 执行成功")
+            else:
+                logger.error(f"{action.name} 执行失败！")
+            return action_obj.success, action_obj.message, result_context
         else:
-            logger.error(f"未找到动作: {action.id} - {action.name}")
-            return False, context
+            logger.error(f"未找到动作: {action.type} - {action.name}")
+            return False, " ", context
+
+    def list_actions(self) -> List[dict]:
+        """
+        获取所有动作
+        """
+        return [
+            {
+                "type": key,
+                "name": action.name,
+                "description": action.description,
+                "data": {
+                    "label": action.name,
+                    **action.data
+                }
+            } for key, action in self._actions.items()
+        ]

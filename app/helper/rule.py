@@ -11,14 +11,12 @@ class RuleHelper:
     规划帮助类
     """
 
-    def __init__(self):
-        self.systemconfig = SystemConfigOper()
-
-    def get_rule_groups(self) -> List[FilterRuleGroup]:
+    @staticmethod
+    def get_rule_groups() -> List[FilterRuleGroup]:
         """
         获取用户所有规则组
         """
-        rule_groups: List[dict] = self.systemconfig.get(SystemConfigKey.UserFilterRuleGroups)
+        rule_groups: List[dict] = SystemConfigOper().get(SystemConfigKey.UserFilterRuleGroups)
         if not rule_groups:
             return []
         return [FilterRuleGroup(**group) for group in rule_groups]
@@ -33,7 +31,7 @@ class RuleHelper:
                 return group
         return None
 
-    def get_rule_group_by_media(self, media: MediaInfo, group_names: list = None) -> List[FilterRuleGroup]:
+    def get_rule_group_by_media(self, media: MediaInfo = None, group_names: list = None) -> List[FilterRuleGroup]:
         """
         根据媒体信息获取规则组
         """
@@ -44,17 +42,18 @@ class RuleHelper:
         for group in rule_groups:
             if not group.media_type:
                 ret_groups.append(group)
-            elif not group.category and group.media_type == media.type.value:
+            elif media and not group.category and group.media_type == media.type.value:
                 ret_groups.append(group)
-            elif group.category == media.category:
+            elif media and group.category == media.category:
                 ret_groups.append(group)
         return ret_groups
 
-    def get_custom_rules(self) -> List[CustomRule]:
+    @staticmethod
+    def get_custom_rules() -> List[CustomRule]:
         """
         获取用户所有自定义规则
         """
-        rules: List[dict] = self.systemconfig.get(SystemConfigKey.CustomFilterRules)
+        rules: List[dict] = SystemConfigOper().get(SystemConfigKey.CustomFilterRules)
         if not rules:
             return []
         return [CustomRule(**rule) for rule in rules]

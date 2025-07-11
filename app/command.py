@@ -9,7 +9,6 @@ from app.chain.site import SiteChain
 from app.chain.subscribe import SubscribeChain
 from app.chain.system import SystemChain
 from app.chain.transfer import TransferChain
-from app.core.config import settings
 from app.core.event import Event as ManagerEvent, eventmanager, Event
 from app.core.plugin import PluginManager
 from app.helper.message import MessageHelper
@@ -162,10 +161,6 @@ class Command(metaclass=Singleton):
         """
         初始化菜单命令
         """
-        if settings.DEV:
-            logger.debug("Development mode active. Skipping command initialization.")
-            return
-
         # 使用线程池提交后台任务，避免引起阻塞
         ThreadHelper().submit(self.__init_commands_background, pid)
 
@@ -230,6 +225,9 @@ class Command(metaclass=Singleton):
             添加命令集合
             """
             for cmd, command in source.items():
+                if not command.get("show", True):
+                    continue
+
                 command_data = {
                     "type": command_type,
                     "description": command.get("description"),
@@ -266,6 +264,7 @@ class Command(metaclass=Singleton):
                     "func": self.send_plugin_event,
                     "description": command.get("desc"),
                     "category": command.get("category"),
+                    "show": command.get("show", True),
                     "data": {
                         "etype": command.get("event"),
                         "data": command.get("data")
@@ -273,8 +272,8 @@ class Command(metaclass=Singleton):
                 }
         return plugin_commands
 
-    def __run_command(self, command: Dict[str, any], data_str: str = "",
-                      channel: MessageChannel = None, source: str = None, userid: Union[str, int] = None):
+    def __run_command(self, command: Dict[str, any], data_str: Optional[str] = "",
+                      channel: MessageChannel = None, source: Optional[str] = None, userid: Union[str, int] = None):
         """
         运行定时服务
         """
@@ -339,8 +338,9 @@ class Command(metaclass=Singleton):
         """
         return self._commands.get(cmd, {})
 
-    def register(self, cmd: str, func: Any, data: dict = None,
-                 desc: str = None, category: str = None) -> None:
+    def register(self, cmd: str, func: Any, data: Optional[dict] = None,
+                 desc: Optional[str] = None, category: Optional[str] = None,
+                 show: bool = True) -> None:
         """
         注册单个命令
         """
@@ -349,11 +349,12 @@ class Command(metaclass=Singleton):
             "func": func,
             "description": desc,
             "category": category,
-            "data": data or {}
+            "data": data or {},
+            "show": show
         }
 
-    def execute(self, cmd: str, data_str: str = "",
-                channel: MessageChannel = None, source: str = None,
+    def execute(self, cmd: str, data_str: Optional[str] = "",
+                channel: MessageChannel = None, source: Optional[str] = None,
                 userid: Union[str, int] = None) -> None:
         """
         执行命令

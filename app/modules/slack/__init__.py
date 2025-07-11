@@ -3,11 +3,12 @@ import re
 from typing import Optional, Union, List, Tuple, Any
 
 from app.core.context import MediaInfo, Context
+from app.core.event import eventmanager, Event
 from app.log import logger
 from app.modules import _ModuleBase, _MessageBase
 from app.modules.slack.slack import Slack
-from app.schemas import MessageChannel, CommingMessage, Notification
-from app.schemas.types import ModuleType
+from app.schemas import MessageChannel, CommingMessage, Notification, ConfigChangeEventData
+from app.schemas.types import ModuleType, SystemConfigKey, EventType
 
 
 class SlackModule(_ModuleBase, _MessageBase[Slack]):
@@ -19,6 +20,20 @@ class SlackModule(_ModuleBase, _MessageBase[Slack]):
         super().init_service(service_name=Slack.__name__.lower(),
                              service_type=Slack)
         self._channel = MessageChannel.Slack
+
+    @eventmanager.register(EventType.ConfigChanged)
+    def handle_config_changed(self, event: Event):
+        """
+        处理配置变更事件
+        :param event: 事件对象
+        """
+        if not event:
+            return
+        event_data: ConfigChangeEventData = event.event_data
+        if event_data.key not in [SystemConfigKey.Notifications.value]:
+            return
+        logger.info("配置变更，重新加载Slack模块...")
+        self.init_module()
 
     @staticmethod
     def get_name() -> str:
@@ -67,8 +82,7 @@ class SlackModule(_ModuleBase, _MessageBase[Slack]):
     def init_setting(self) -> Tuple[str, Union[str, bool]]:
         pass
 
-    def message_parser(self, source: str, body: Any, form: Any,
-                       args: Any) -> Optional[CommingMessage]:
+    def message_parser(self, source: str, body: Any, form: Any, args: Any) -> Optional[CommingMessage]:
         """
         解析消息内容，返回字典，注意以下约定值：
         userid: 用户ID
@@ -205,8 +219,32 @@ class SlackModule(_ModuleBase, _MessageBase[Slack]):
                 username = msg_json.get("user")
             elif msg_json.get("type") == "block_actions":
                 userid = msg_json.get("user", {}).get("id")
-                text = msg_json.get("actions")[0].get("value")
+                callback_data = msg_json.get("actions")[0].get("value")
+                # 使用CALLBACK前缀标识按钮回调
+                text = f"CALLBACK:{callback_data}"
                 username = msg_json.get("user", {}).get("name")
+
+                # 获取原消息信息用于编辑
+                message_info = msg_json.get("message", {})
+                # Slack消息的时间戳作为消息ID
+                message_ts = message_info.get("ts")
+                channel_id = msg_json.get("channel", {}).get("id") or msg_json.get("container", {}).get("channel_id")
+
+                logger.info(f"收到来自 {client_config.name} 的Slack按钮回调："
+                            f"userid={userid}, username={username}, callback_data={callback_data}")
+
+                # 创建包含回调信息的CommingMessage
+                return CommingMessage(
+                    channel=MessageChannel.Slack,
+                    source=client_config.name,
+                    userid=userid,
+                    username=username,
+                    text=text,
+                    is_callback=True,
+                    callback_data=callback_data,
+                    message_id=message_ts,
+                    chat_id=channel_id
+                )
             elif msg_json.get("type") == "event_callback":
                 userid = msg_json.get('event', {}).get('user')
                 text = re.sub(r"<@[0-9A-Z]+>", "", msg_json.get("event", {}).get("text"), flags=re.IGNORECASE).strip()
@@ -245,7 +283,10 @@ class SlackModule(_ModuleBase, _MessageBase[Slack]):
             client: Slack = self.get_instance(conf.name)
             if client:
                 client.send_msg(title=message.title, text=message.text,
-                                image=message.image, userid=userid, link=message.link)
+                                image=message.image, userid=userid, link=message.link,
+                                buttons=message.buttons,
+                                original_message_id=message.original_message_id,
+                                original_chat_id=message.original_chat_id)
 
     def post_medias_message(self, message: Notification, medias: List[MediaInfo]) -> None:
         """
@@ -259,7 +300,10 @@ class SlackModule(_ModuleBase, _MessageBase[Slack]):
                 continue
             client: Slack = self.get_instance(conf.name)
             if client:
-                client.send_medias_msg(title=message.title, medias=medias, userid=message.userid)
+                client.send_medias_msg(title=message.title, medias=medias, userid=message.userid,
+                                       buttons=message.buttons,
+                                       original_message_id=message.original_message_id,
+                                       original_chat_id=message.original_chat_id)
 
     def post_torrents_message(self, message: Notification, torrents: List[Context]) -> None:
         """
@@ -274,4 +318,29 @@ class SlackModule(_ModuleBase, _MessageBase[Slack]):
             client: Slack = self.get_instance(conf.name)
             if client:
                 client.send_torrents_msg(title=message.title, torrents=torrents,
-                                         userid=message.userid)
+                                         userid=message.userid, buttons=message.buttons,
+                                         original_message_id=message.original_message_id,
+                                         original_chat_id=message.original_chat_id)
+
+    def delete_message(self, channel: MessageChannel, source: str,
+                       message_id: str, chat_id: Optional[str] = None) -> bool:
+        """
+        删除消息
+        :param channel: 消息渠道
+        :param source: 指定的消息源
+        :param message_id: 消息ID（Slack中为时间戳）
+        :param chat_id: 聊天ID（频道ID）
+        :return: 删除是否成功
+        """
+        success = False
+        for conf in self.get_configs().values():
+            if channel != self._channel:
+                break
+            if source != conf.name:
+                continue
+            client: Slack = self.get_instance(conf.name)
+            if client:
+                result = client.delete_msg(message_id=message_id, chat_id=chat_id)
+                if result:
+                    success = True
+        return success

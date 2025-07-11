@@ -11,13 +11,15 @@ from glob import glob
 from pathlib import Path
 from typing import List, Optional, Tuple, Union
 
-import docker
 import psutil
 
 from app import schemas
 
 
 class SystemUtils:
+    """
+    系统工具类，提供系统相关的操作和信息获取方法。
+    """
 
     @staticmethod
     def execute(cmd: str) -> str:
@@ -435,50 +437,31 @@ class SystemUtils:
     @staticmethod
     def memory_usage() -> List[int]:
         """
-        获取内存使用量和使用率
+        获取当前程序的内存使用量和使用率
         """
-        return [psutil.virtual_memory().used, int(psutil.virtual_memory().percent)]
+        current_process = psutil.Process()
+        process_memory = current_process.memory_info().rss
+        system_memory = psutil.virtual_memory().total
+        process_memory_percent = (process_memory / system_memory) * 100
+        return [process_memory, int(process_memory_percent)]
 
     @staticmethod
-    def can_restart() -> bool:
+    def network_usage() -> List[int]:
         """
-        判断是否可以内部重启
+        获取当前网络流量（上行和下行流量，单位：bytes/s）
         """
-        return Path("/var/run/docker.sock").exists()
-
-    @staticmethod
-    def restart() -> Tuple[bool, str]:
-        """
-        执行Docker重启操作
-        """
-        if not SystemUtils.is_docker():
-            return False, "非Docker环境，无法重启！"
-        try:
-            # 创建 Docker 客户端
-            client = docker.DockerClient(base_url='tcp://127.0.0.1:38379')
-            # 获取当前容器的 ID
-            container_id = None
-            with open('/proc/self/mountinfo', 'r') as f:
-                data = f.read()
-                index_resolv_conf = data.find("resolv.conf")
-                if index_resolv_conf != -1:
-                    index_second_slash = data.rfind("/", 0, index_resolv_conf)
-                    index_first_slash = data.rfind("/", 0, index_second_slash) + 1
-                    container_id = data[index_first_slash:index_second_slash]
-                    if len(container_id) < 20:
-                        index_resolv_conf = data.find("/sys/fs/cgroup/devices")
-                        if index_resolv_conf != -1:
-                            index_second_slash = data.rfind(" ", 0, index_resolv_conf)
-                            index_first_slash = data.rfind("/", 0, index_second_slash) + 1
-                            container_id = data[index_first_slash:index_second_slash]
-            if not container_id:
-                return False, "获取容器ID失败！"
-            # 重启当前容器
-            client.containers.get(container_id.strip()).restart()
-            return True, ""
-        except Exception as err:
-            print(str(err))
-            return False, f"重启时发生错误：{str(err)}"
+        import time
+        # 获取初始网络统计
+        net_io_1 = psutil.net_io_counters()
+        time.sleep(1)  # 等待1秒
+        # 获取1秒后的网络统计
+        net_io_2 = psutil.net_io_counters()
+        
+        # 计算1秒内的流量变化
+        upload_speed = net_io_2.bytes_sent - net_io_1.bytes_sent
+        download_speed = net_io_2.bytes_recv - net_io_1.bytes_recv
+        
+        return [upload_speed, download_speed]
 
     @staticmethod
     def is_hardlink(src: Path, dest: Path) -> bool:

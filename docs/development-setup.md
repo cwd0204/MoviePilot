@@ -6,7 +6,7 @@
 
 在开始之前，请确保您的系统已安装以下软件：
 
-- **Python 3.11 或更高版本**
+- **Python 3.12 或更高版本** (暂时兼容 3.11 ，推荐使用 3.12+)
 - **pip** (Python 包管理器)
 - **Git** (用于版本控制)
 
@@ -61,7 +61,7 @@ pip install pip-tools
    ```bash
    pip-compile --upgrade-package requests requirements.in
    ```
-   
+
 3. **全量更新依赖项**：
 
    如果你想更新 `requirements.in` 中的所有依赖包，运行以下命令生成或更新 `requirements.txt` 文件：

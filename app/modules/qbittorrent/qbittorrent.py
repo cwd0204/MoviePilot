@@ -12,20 +12,13 @@ from app.utils.string import StringUtils
 
 
 class Qbittorrent:
-    _host: str = None
-    _port: int = None
-    _username: str = None
-    _password: str = None
-    _category: bool = False
-    _sequentail: bool = False
-    _force_resume: bool = False
-
-    qbc: Client = None
-
-    def __init__(self, host: str = None, port: int = None,
-                 username: str = None, password: str = None,
-                 category: bool = False, sequentail: bool = False,
-                 force_resume: bool = False, first_last_piece=False,
+    """
+    qbittorrent下载器
+    """
+    def __init__(self, host: Optional[str] = None, port: int = None,
+                 username: Optional[str] = None, password: Optional[str] = None,
+                 category: Optional[bool] = False, sequentail: Optional[bool] = False,
+                 force_resume: Optional[bool] = False, first_last_piece=False,
                  **kwargs):
         """
         若不设置参数，则创建配置文件设置的下载器
@@ -43,8 +36,7 @@ class Qbittorrent:
         self._sequentail = sequentail
         self._force_resume = force_resume
         self._first_last_piece = first_last_piece
-        if self._host and self._port:
-            self.qbc = self.__login_qbittorrent()
+        self.qbc = self.__login_qbittorrent()
 
     def is_inactive(self) -> bool:
         """
@@ -65,6 +57,8 @@ class Qbittorrent:
         连接qbittorrent
         :return: qbittorrent对象
         """
+        if not self._host or not self._port:
+            return None
         try:
             # 登录
             logger.info(f"正在连接 qbittorrent：{self._host}:{self._port}")
@@ -104,10 +98,14 @@ class Qbittorrent:
                 results = []
                 if not isinstance(tags, list):
                     tags = [tags]
-                for torrent in torrents:
-                    torrent_tags = [str(tag).strip() for tag in torrent.get("tags").split(',')]
-                    if set(tags).issubset(set(torrent_tags)):
-                        results.append(torrent)
+                try:
+                    for torrent in torrents:
+                        torrent_tags = [str(tag).strip() for tag in torrent.get("tags").split(',')]
+                        if set(tags).issubset(set(torrent_tags)):
+                            results.append(torrent)
+                finally:
+                    torrents.clear()
+                    del torrents
                 return results, False
             return torrents or [], False
         except Exception as err:
@@ -236,11 +234,11 @@ class Qbittorrent:
 
     def add_torrent(self,
                     content: Union[str, bytes],
-                    is_paused: bool = False,
-                    download_dir: str = None,
+                    is_paused: Optional[bool] = False,
+                    download_dir: Optional[str] = None,
                     tag: Union[str, list] = None,
-                    category: str = None,
-                    cookie=None,
+                    category: Optional[str] = None,
+                    cookie: Optional[str] = None,
                     **kwargs
                     ) -> bool:
         """

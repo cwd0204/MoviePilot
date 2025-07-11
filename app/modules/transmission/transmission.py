@@ -1,4 +1,4 @@
-from typing import Optional, Union, Tuple, List, Literal
+from typing import Optional, Union, Tuple, List
 
 import transmission_rpc
 from transmission_rpc import Client, Torrent, File
@@ -9,14 +9,9 @@ from app.utils.url import UrlUtils
 
 
 class Transmission:
-    _protocol: Literal["http", "https"] = "http"
-    _host: str = None
-    _port: int = None
-    _username: str = None
-    _password: str = None
-
-    trc: Optional[Client] = None
-
+    """
+    Transmission下载器
+    """
     # 参考transmission web，仅查询需要的参数，加速种子搜索
     _trarg = ["id", "name", "status", "labels", "hashString", "totalSize", "percentDone", "addedDate", "trackerList",
               "trackerStats",
@@ -24,12 +19,13 @@ class Transmission:
               "peersGettingFromUs", "peersSendingToUs", "uploadRatio", "uploadedEver", "downloadedEver", "downloadDir",
               "error", "errorString", "doneDate", "queuePosition", "activityDate", "trackers"]
 
-    def __init__(self, host: str = None, port: int = None, username: str = None, password: str = None, **kwargs):
+    def __init__(self, host: Optional[str] = None, port: Optional[int] = None,
+                 username: Optional[str] = None, password: Optional[str] = None, **kwargs):
         """
         若不设置参数，则创建配置文件设置的下载器
         """
         if host and port:
-            self._protocol, self._host, self._port = kwargs.get("protocol", self._protocol), host, port
+            self._protocol, self._host, self._port = kwargs.get("protocol", "http"), host, port
         elif host:
             result = UrlUtils.parse_url_params(url=host)
             if result:
@@ -42,18 +38,19 @@ class Transmission:
             return
         self._username = username
         self._password = password
-        if self._host and self._port:
-            self.trc = self.__login_transmission()
+        self.trc = self.__login_transmission()
 
     def __login_transmission(self) -> Optional[Client]:
         """
         连接transmission
         :return: transmission对象
         """
+        if not self._host or not self._port:
+            return None
         try:
             # 登录
             logger.info(f"正在连接 transmission：{self._protocol}://{self._host}:{self._port}")
-            trt = transmission_rpc.Client(protocol=self._protocol,
+            trt = transmission_rpc.Client(protocol=self._protocol, # noqa
                                           host=self._host,
                                           port=self._port,
                                           username=self._username,
@@ -96,16 +93,20 @@ class Transmission:
         if tags and not isinstance(tags, list):
             tags = [tags]
         ret_torrents = []
-        for torrent in torrents:
-            # 状态过滤
-            if status and torrent.status not in status:
-                continue
-            # 种子标签
-            labels = [str(tag).strip()
-                      for tag in torrent.labels] if hasattr(torrent, "labels") else []
-            if tags and not set(tags).issubset(set(labels)):
-                continue
-            ret_torrents.append(torrent)
+        try:
+            for torrent in torrents:
+                # 状态过滤
+                if status and torrent.status not in status:
+                    continue
+                # 种子标签
+                labels = [str(tag).strip()
+                          for tag in torrent.labels] if hasattr(torrent, "labels") else []
+                if tags and not set(tags).issubset(set(labels)):
+                    continue
+                ret_torrents.append(torrent)
+        finally:
+            torrents.clear()
+            del torrents
         return ret_torrents, False
 
     def get_completed_torrents(self, ids: Union[str, list] = None,
@@ -162,8 +163,9 @@ class Transmission:
         if not self.trc:
             return []
         try:
-            torrent = self.trc.get_torrents(ids=ids, arguments=self._trarg)
-            if torrent:
+            torrents = self.trc.get_torrents(ids=ids, arguments=self._trarg)
+            if len(torrents):
+                torrent = torrents[0]
                 labels = [str(tag).strip()
                           for tag in torrent.labels] if hasattr(torrent, "labels") else []
                 return labels
@@ -173,8 +175,8 @@ class Transmission:
         return []
 
     def add_torrent(self, content: Union[str, bytes],
-                    is_paused: bool = False,
-                    download_dir: str = None,
+                    is_paused: Optional[bool] = False,
+                    download_dir: Optional[str] = None,
                     labels=None,
                     cookie=None) -> Optional[Torrent]:
         """

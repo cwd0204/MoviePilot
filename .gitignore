@@ -1,6 +1,9 @@
 .idea/
 *.c
+*.so
+*.pyd
 build/
+cython_cache/
 dist/
 nginx/
 test.py
@@ -21,4 +24,7 @@ config/cache/
 *.log
 .vscode
 venv
-app/.DS_Store
+
+# Pylint
+pylint-report.json
+.pylint.d/

@@ -1,9 +1,18 @@
 from pathlib import Path
-from typing import Optional, Dict, Any, List, Set
+from typing import Optional, Dict, Any, List, Set, Callable
 
 from pydantic import BaseModel, Field, root_validator
 
 from app.schemas import MessageChannel, FileItem
+
+
+class Event(BaseModel):
+    """
+    事件模型
+    """
+    event_type: str = Field(..., description="事件类型")
+    event_data: Optional[dict] = Field(default={}, description="事件数据")
+    priority: Optional[int] = Field(0, description="事件优先级")
 
 
 class BaseEventData(BaseModel):
@@ -11,6 +20,15 @@ class BaseEventData(BaseModel):
     事件数据的基类，所有具体事件数据类应继承自此类
     """
     pass
+
+
+class ConfigChangeEventData(BaseEventData):
+    """
+    ConfigChange 事件的数据模型
+    """
+    key: str = Field(..., description="配置项的键")
+    value: Optional[Any] = Field(default=None, description="配置项的新值")
+    change_type: str = Field(default="update", description="配置项的变更类型，如 'add', 'update', 'delete'")
 
 
 class ChainEventData(BaseEventData):
@@ -196,7 +214,7 @@ class ResourceDownloadEventData(ChainEventData):
     channel: Optional[MessageChannel] = Field(None, description="通知渠道")
     origin: Optional[str] = Field(None, description="来源")
     downloader: Optional[str] = Field(None, description="下载器")
-    options: Optional[dict] = Field(None, description="其他参数")
+    options: Optional[dict] = Field(default={}, description="其他参数")
 
     # 输出参数
     cancel: bool = Field(default=False, description="是否取消下载")
@@ -265,6 +283,7 @@ class RecommendMediaSource(BaseModel):
     """
     name: str = Field(..., description="数据源名称")
     api_path: str = Field(..., description="媒体数据源API地址")
+    type: str = Field(..., description="类型")
 
 
 class RecommendSourceEventData(ChainEventData):
@@ -296,4 +315,22 @@ class MediaRecognizeConvertEventData(ChainEventData):
     convert_type: str = Field(..., description="转换类型（themoviedb/douban）")
 
     # 输出参数
-    media_dict: dict = Field(default=dict, description="转换后的媒体信息（TheMovieDb/豆瓣）")
+    media_dict: dict = Field(default_factory=dict, description="转换后的媒体信息（TheMovieDb/豆瓣）")
+
+
+class StorageOperSelectionEventData(ChainEventData):
+    """
+    StorageOperSelect 事件的数据模型
+
+    Attributes:
+        # 输入参数
+        storage (str): 存储类型
+
+        # 输出参数
+        storage_oper (Callable): 存储操作对象
+    """
+    # 输入参数
+    storage: Optional[str] = Field(default=None, description="存储类型")
+
+    # 输出参数
+    storage_oper: Optional[Callable] = Field(default=None, description="存储操作对象")

@@ -21,6 +21,8 @@ class TransferTorrent(BaseModel):
     tags: Optional[str] = None
     size: Optional[int] = 0
     userid: Optional[str] = None
+    progress: Optional[float] = 0.0
+    state: Optional[str] = None
 
 
 class DownloadingTorrent(BaseModel):
@@ -33,8 +35,8 @@ class DownloadingTorrent(BaseModel):
     name: Optional[str] = None
     year: Optional[str] = None
     season_episode: Optional[str] = None
-    size: Optional[float] = 0
-    progress: Optional[float] = 0
+    size: Optional[float] = 0.0
+    progress: Optional[float] = 0.0
     state: Optional[str] = 'downloading'
     upspeed: Optional[str] = None
     dlspeed: Optional[str] = None
@@ -113,15 +115,23 @@ class TransferInfo(BaseModel):
     # 整理方式
     transfer_type: Optional[str] = None
     # 处理文件数
-    file_count: Optional[int] = 0
+    file_count: Optional[int] = Field(default=0)
     # 处理文件清单
     file_list: Optional[list] = Field(default_factory=list)
     # 目标文件清单
     file_list_new: Optional[list] = Field(default_factory=list)
     # 总文件大小
-    total_size: Optional[float] = 0
+    total_size: Optional[int] = Field(default=0)
     # 失败清单
     fail_list: Optional[list] = Field(default_factory=list)
+    # 处理字幕文件清单
+    subtitle_list: Optional[list] = Field(default_factory=list)
+    # 目标字幕文件清单
+    subtitle_list_new: Optional[list] = Field(default_factory=list)
+    # 处理音频文件清单
+    audio_list: Optional[list] = Field(default_factory=list)
+    # 目标音频文件清单
+    audio_list_new: Optional[list] = Field(default_factory=list)
     # 错误信息
     message: Optional[str] = None
     # 是否需要刮削
@@ -198,3 +208,5 @@ class ManualTransferItem(BaseModel):
     library_category_folder: Optional[bool] = None
     # 复用历史识别信息
     from_history: Optional[bool] = False
+    # 剧集组
+    episode_group: Optional[str] = None

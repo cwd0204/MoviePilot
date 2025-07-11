@@ -1,10 +1,11 @@
-from typing import Any, List
+from typing import Any, List, Annotated
 
 from fastapi import APIRouter, HTTPException, Depends
 from sqlalchemy.orm import Session
 
 from app import schemas
 from app.chain.media import MediaChain
+from app.chain.tvdb import TvdbChain
 from app.chain.subscribe import SubscribeChain
 from app.core.metainfo import MetaInfo
 from app.core.security import verify_apikey
@@ -18,7 +19,7 @@ arr_router = APIRouter(tags=['servarr'])
 
 
 @arr_router.get("/system/status", summary="系统状态")
-def arr_system_status(_: str = Depends(verify_apikey)) -> Any:
+def arr_system_status(_: Annotated[str, Depends(verify_apikey)]) -> Any:
     """
     模拟Radarr、Sonarr系统状态
     """
@@ -72,7 +73,7 @@ def arr_system_status(_: str = Depends(verify_apikey)) -> Any:
 
 
 @arr_router.get("/qualityProfile", summary="质量配置")
-def arr_qualityProfile(_: str = Depends(verify_apikey)) -> Any:
+def arr_qualityProfile(_: Annotated[str, Depends(verify_apikey)]) -> Any:
     """
     模拟Radarr、Sonarr质量配置
     """
@@ -113,7 +114,7 @@ def arr_qualityProfile(_: str = Depends(verify_apikey)) -> Any:
 
 
 @arr_router.get("/rootfolder", summary="根目录")
-def arr_rootfolder(_: str = Depends(verify_apikey)) -> Any:
+def arr_rootfolder(_: Annotated[str, Depends(verify_apikey)]) -> Any:
     """
     模拟Radarr、Sonarr根目录
     """
@@ -129,7 +130,7 @@ def arr_rootfolder(_: str = Depends(verify_apikey)) -> Any:
 
 
 @arr_router.get("/tag", summary="标签")
-def arr_tag(_: str = Depends(verify_apikey)) -> Any:
+def arr_tag(_: Annotated[str, Depends(verify_apikey)]) -> Any:
     """
     模拟Radarr、Sonarr标签
     """
@@ -142,7 +143,7 @@ def arr_tag(_: str = Depends(verify_apikey)) -> Any:
 
 
 @arr_router.get("/languageprofile", summary="语言")
-def arr_languageprofile(_: str = Depends(verify_apikey)) -> Any:
+def arr_languageprofile(_: Annotated[str, Depends(verify_apikey)]) -> Any:
     """
     模拟Radarr、Sonarr语言
     """
@@ -168,7 +169,7 @@ def arr_languageprofile(_: str = Depends(verify_apikey)) -> Any:
 
 
 @arr_router.get("/movie", summary="所有订阅电影", response_model=List[schemas.RadarrMovie])
-def arr_movies(_: str = Depends(verify_apikey), db: Session = Depends(get_db)) -> Any:
+def arr_movies(_: Annotated[str, Depends(verify_apikey)], db: Session = Depends(get_db)) -> Any:
     """
     查询Rardar电影
     """
@@ -259,7 +260,7 @@ def arr_movies(_: str = Depends(verify_apikey), db: Session = Depends(get_db)) -
 
 
 @arr_router.get("/movie/lookup", summary="查询电影", response_model=List[schemas.RadarrMovie])
-def arr_movie_lookup(term: str, db: Session = Depends(get_db), _: str = Depends(verify_apikey)) -> Any:
+def arr_movie_lookup(term: str, _: Annotated[str, Depends(verify_apikey)], db: Session = Depends(get_db)) -> Any:
     """
     查询Rardar电影 term: `tmdb:${id}`
     存在和不存在均不能返回错误
@@ -305,7 +306,7 @@ def arr_movie_lookup(term: str, db: Session = Depends(get_db), _: str = Depends(
 
 
 @arr_router.get("/movie/{mid}", summary="电影订阅详情", response_model=schemas.RadarrMovie)
-def arr_movie(mid: int, db: Session = Depends(get_db), _: str = Depends(verify_apikey)) -> Any:
+def arr_movie(mid: int, _: Annotated[str, Depends(verify_apikey)], db: Session = Depends(get_db)) -> Any:
     """
     查询Rardar电影订阅
     """
@@ -331,9 +332,9 @@ def arr_movie(mid: int, db: Session = Depends(get_db), _: str = Depends(verify_a
 
 
 @arr_router.post("/movie", summary="新增电影订阅")
-def arr_add_movie(movie: RadarrMovie,
-                  db: Session = Depends(get_db),
-                  _: str = Depends(verify_apikey)
+def arr_add_movie(_: Annotated[str, Depends(verify_apikey)],
+                  movie: RadarrMovie,
+                  db: Session = Depends(get_db)
                   ) -> Any:
     """
     新增Rardar电影订阅
@@ -362,7 +363,7 @@ def arr_add_movie(movie: RadarrMovie,
 
 
 @arr_router.delete("/movie/{mid}", summary="删除电影订阅", response_model=schemas.Response)
-def arr_remove_movie(mid: int, db: Session = Depends(get_db), _: str = Depends(verify_apikey)) -> Any:
+def arr_remove_movie(mid: int, _: Annotated[str, Depends(verify_apikey)], db: Session = Depends(get_db)) -> Any:
     """
     删除Rardar电影订阅
     """
@@ -378,7 +379,7 @@ def arr_remove_movie(mid: int, db: Session = Depends(get_db), _: str = Depends(v
 
 
 @arr_router.get("/series", summary="所有剧集", response_model=List[schemas.SonarrSeries])
-def arr_series(_: str = Depends(verify_apikey), db: Session = Depends(get_db)) -> Any:
+def arr_series(_: Annotated[str, Depends(verify_apikey)], db: Session = Depends(get_db)) -> Any:
     """
     查询Sonarr剧集
     """
@@ -514,96 +515,97 @@ def arr_series(_: str = Depends(verify_apikey), db: Session = Depends(get_db)) -
 
 
 @arr_router.get("/series/lookup", summary="查询剧集")
-def arr_series_lookup(term: str, db: Session = Depends(get_db), _: str = Depends(verify_apikey)) -> Any:
+def arr_series_lookup(term: str, _: Annotated[str, Depends(verify_apikey)], db: Session = Depends(get_db)) -> Any:
     """
     查询Sonarr剧集 term: `tvdb:${id}` title
     """
-    # 获取TVDBID
-    if not term.startswith("tvdb:"):
-        mediainfo = MediaChain().recognize_media(meta=MetaInfo(term),
-                                                 mtype=MediaType.TV)
-        if not mediainfo:
-            return [SonarrSeries()]
-        tvdbid = mediainfo.tvdb_id
-        if not tvdbid:
-            return [SonarrSeries()]
-    else:
-        mediainfo = None
-        tvdbid = int(term.replace("tvdb:", ""))
-
-    # 查询TVDB信息
-    tvdbinfo = MediaChain().tvdb_info(tvdbid=tvdbid)
-    if not tvdbinfo:
-        return [SonarrSeries()]
-
     # 季信息
     seas: List[int] = []
-    sea_num = tvdbinfo.get('season')
-    if sea_num:
-        seas = list(range(1, int(sea_num) + 1))
-
-    # 根据TVDB查询媒体信息
-    if not mediainfo:
-        mediainfo = MediaChain().recognize_media(meta=MetaInfo(tvdbinfo.get('seriesName')),
-                                                 mtype=MediaType.TV)
-
-    # 查询是否存在
-    exists = MediaChain().media_exists(mediainfo)
-    if exists:
-        hasfile = True
+    # tvdbid 列表
+    tvdbids: List[int] = []
+    # 获取TVDBID
+    if not term.startswith("tvdb:"):
+        title = term.replace("+", " ")
+        tvdbids = TvdbChain().get_tvdbid_by_name(title=title)
     else:
-        hasfile = False
+        tvdbid = int(term.replace("tvdb:", ""))
+        tvdbids.append(tvdbid)
 
-    # 查询订阅信息
-    seasons: List[dict] = []
-    subscribes = Subscribe.get_by_tmdbid(db, mediainfo.tmdb_id)
-    if subscribes:
-        # 已监控
-        monitored = True
-        # 已监控季
-        sub_seas = [sub.season for sub in subscribes]
-        for sea in seas:
-            if sea in sub_seas:
-                seasons.append({
-                    "seasonNumber": sea,
-                    "monitored": True,
-                })
-            else:
+    sonarr_series_list = []
+    for tvdbid in tvdbids:
+        # 查询TVDB信息
+        tvdbinfo = MediaChain().tvdb_info(tvdbid=tvdbid)
+        if not tvdbinfo:
+            continue
+
+        # 季信息(只取默认季类型，排除特别季)
+        sea_num = len([season for season in tvdbinfo.get('seasons') if
+                       season['type']['id'] == tvdbinfo.get('defaultSeasonType') and season['number'] > 0])
+        if sea_num:
+            seas = list(range(1, int(sea_num) + 1))
+
+        # 根据TVDB查询媒体信息
+        mediainfo = MediaChain().recognize_media(meta=MetaInfo(tvdbinfo.get('name')),
+                                                 mtype=MediaType.TV)
+        if not mediainfo:
+            continue
+        # 查询是否存在
+        exists = MediaChain().media_exists(mediainfo)
+        if exists:
+            hasfile = True
+        else:
+            hasfile = False
+
+        # 查询订阅信息
+        seasons: List[dict] = []
+        subscribes = Subscribe.get_by_tmdbid(db, mediainfo.tmdb_id)
+        if subscribes:
+            # 已监控
+            monitored = True
+            # 已监控季
+            sub_seas = [sub.season for sub in subscribes]
+            for sea in seas:
+                if sea in sub_seas:
+                    seasons.append({
+                        "seasonNumber": sea,
+                        "monitored": True,
+                    })
+                else:
+                    seasons.append({
+                        "seasonNumber": sea,
+                        "monitored": False,
+                    })
+            subid = subscribes[-1].id
+        else:
+            subid = None
+            monitored = False
+            for sea in seas:
                 seasons.append({
                     "seasonNumber": sea,
                     "monitored": False,
                 })
-        subid = subscribes[-1].id
-    else:
-        subid = None
-        monitored = False
-        for sea in seas:
-            seasons.append({
-                "seasonNumber": sea,
-                "monitored": False,
-            })
+        sonarr_series = SonarrSeries(
+            id=subid,
+            title=mediainfo.title,
+            seasonCount=len(seasons),
+            seasons=seasons,
+            remotePoster=mediainfo.get_poster_image(),
+            year=mediainfo.year,
+            tmdbId=mediainfo.tmdb_id,
+            tvdbId=tvdbid,
+            imdbId=mediainfo.imdb_id,
+            profileId=1,
+            languageProfileId=1,
+            monitored=monitored,
+            hasFile=hasfile,
+        )
+        sonarr_series_list.append(sonarr_series)
 
-    return [SonarrSeries(
-        id=subid,
-        title=mediainfo.title,
-        seasonCount=len(seasons),
-        seasons=seasons,
-        remotePoster=mediainfo.get_poster_image(),
-        year=mediainfo.year,
-        tmdbId=mediainfo.tmdb_id,
-        tvdbId=mediainfo.tvdb_id,
-        imdbId=mediainfo.imdb_id,
-        profileId=1,
-        languageProfileId=1,
-        qualityProfileId=1,
-        isAvailable=True,
-        monitored=monitored,
-        hasFile=hasfile
-    )]
+    return sonarr_series_list if sonarr_series_list else [SonarrSeries()]
 
 
 @arr_router.get("/series/{tid}", summary="剧集详情")
-def arr_serie(tid: int, db: Session = Depends(get_db), _: str = Depends(verify_apikey)) -> Any:
+def arr_serie(tid: int, _: Annotated[str, Depends(verify_apikey)], db: Session = Depends(get_db)) -> Any:
     """
     查询Sonarr剧集
     """
@@ -638,8 +640,8 @@ def arr_serie(tid: int, db: Session = Depends(get_db), _: str = Depends(verify_a
 
 @arr_router.post("/series", summary="新增剧集订阅")
 def arr_add_series(tv: schemas.SonarrSeries,
-                   db: Session = Depends(get_db),
-                   _: str = Depends(verify_apikey)) -> Any:
+                   _: Annotated[str, Depends(verify_apikey)],
+                   db: Session = Depends(get_db)) -> Any:
     """
     新增Sonarr剧集订阅
     """
@@ -689,7 +691,7 @@ def arr_update_series(tv: schemas.SonarrSeries) -> Any:
 
 
 @arr_router.delete("/series/{tid}", summary="删除剧集订阅")
-def arr_remove_series(tid: int, db: Session = Depends(get_db), _: str = Depends(verify_apikey)) -> Any:
+def arr_remove_series(tid: int, _: Annotated[str, Depends(verify_apikey)], db: Session = Depends(get_db)) -> Any:
     """
     删除Sonarr剧集订阅
     """
