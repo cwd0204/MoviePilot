@@ -1,18 +1,23 @@
 import copy
 import json
 import os
+import platform
+import re
 import secrets
 import sys
 import threading
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Type
+from urllib.parse import urlparse
 
 from dotenv import set_key
 from pydantic import BaseModel, BaseSettings, validator, Field
 
 from app.log import logger, log_settings, LogConfigModel
+from app.schemas import MediaType
 from app.utils.system import SystemUtils
 from app.utils.url import UrlUtils
+from version import APP_VERSION
 
 
 class SystemConfModel(BaseModel):
@@ -37,10 +42,6 @@ class SystemConfModel(BaseModel):
     scheduler: int = 0
     # 线程池大小
     threadpool: int = 0
-    # 数据库连接池大小
-    dbpool: int = 0
-    # 数据库连接池溢出数量
-    dbpooloverflow: int = 0
 
 
 class ConfigModel(BaseModel):
@@ -51,6 +52,7 @@ class ConfigModel(BaseModel):
     class Config:
         extra = "ignore"  # 忽略未定义的配置项
 
+    # ==================== 基础应用配置 ====================
     # 项目名称
     PROJECT_NAME: str = "MoviePilot"
     # 域名 格式；https://movie-pilot.org
@@ -59,6 +61,24 @@ class ConfigModel(BaseModel):
     API_V1_STR: str = "/api/v1"
     # 前端资源路径
     FRONTEND_PATH: str = "/public"
+    # 时区
+    TZ: str = "Asia/Shanghai"
+    # API监听地址
+    HOST: str = "0.0.0.0"
+    # API监听端口
+    PORT: int = 3001
+    # 前端监听端口
+    NGINX_PORT: int = 3000
+    # 配置文件目录
+    CONFIG_DIR: Optional[str] = None
+    # 是否调试模式
+    DEBUG: bool = False
+    # 是否开发模式
+    DEV: bool = False
+    # 高级设置模式
+    ADVANCED_MODE: bool = True
+
+    # ==================== 安全认证配置 ====================
     # 密钥
     SECRET_KEY: str = secrets.token_urlsafe(32)
     # RESOURCE密钥
@@ -69,20 +89,26 @@ class ConfigModel(BaseModel):
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 60 * 24 * 8
     # RESOURCE_TOKEN过期时间
     RESOURCE_ACCESS_TOKEN_EXPIRE_SECONDS: int = 60 * 30
-    # 时区
-    TZ: str = "Asia/Shanghai"
-    # API监听地址
-    HOST: str = "0.0.0.0"
-    # API监听端口
-    PORT: int = 3001
-    # 前端监听端口
-    NGINX_PORT: int = 3000
-    # 是否调试模式
-    DEBUG: bool = False
-    # 是否开发模式
-    DEV: bool = False
+    # 超级管理员初始用户名
+    SUPERUSER: str = "admin"
+    # 超级管理员初始密码
+    SUPERUSER_PASSWORD: str = None
+    # 辅助认证，允许通过外部服务进行认证、单点登录以及自动创建用户
+    AUXILIARY_AUTH_ENABLE: bool = False
+    # API密钥，需要更换
+    API_TOKEN: Optional[str] = None
+    # 用户认证站点
+    AUTH_SITE: str = ""
+
+    # ==================== 数据库配置 ====================
+    # 数据库类型，支持 sqlite 和 postgresql，默认使用 sqlite
+    DB_TYPE: str = "sqlite"
     # 是否在控制台输出 SQL 语句，默认关闭
     DB_ECHO: bool = False
+    # 数据库连接超时时间（秒），默认为 60 秒
+    DB_TIMEOUT: int = 60
+    # 是否启用 WAL 模式，仅适用于SQLite，默认开启
+    DB_WAL_ENABLE: bool = True
     # 数据库连接池类型，QueuePool, NullPool
     DB_POOL_TYPE: str = "QueuePool"
     # 是否在获取连接时进行预先 ping 操作
@@ -91,71 +117,44 @@ class ConfigModel(BaseModel):
     DB_POOL_RECYCLE: int = 300
     # 数据库连接池获取连接的超时时间（秒）
     DB_POOL_TIMEOUT: int = 30
-    # SQLite 的 busy_timeout 参数，默认为 60 秒
-    DB_TIMEOUT: int = 60
-    # SQLite 是否启用 WAL 模式，默认开启
-    DB_WAL_ENABLE: bool = True
+    # SQLite 连接池大小
+    DB_SQLITE_POOL_SIZE: int = 10
+    # SQLite 连接池溢出数量
+    DB_SQLITE_MAX_OVERFLOW: int = 50
+    # PostgreSQL 主机地址
+    DB_POSTGRESQL_HOST: str = "localhost"
+    # PostgreSQL 端口
+    DB_POSTGRESQL_PORT: int = 5432
+    # PostgreSQL 数据库名
+    DB_POSTGRESQL_DATABASE: str = "moviepilot"
+    # PostgreSQL 用户名
+    DB_POSTGRESQL_USERNAME: str = "moviepilot"
+    # PostgreSQL 密码
+    DB_POSTGRESQL_PASSWORD: str = "moviepilot"
+    # PostgreSQL 连接池大小
+    DB_POSTGRESQL_POOL_SIZE: int = 10
+    # PostgreSQL 连接池溢出数量
+    DB_POSTGRESQL_MAX_OVERFLOW: int = 50
+
+    # ==================== 缓存配置 ====================
     # 缓存类型，支持 cachetools 和 redis，默认使用 cachetools
     CACHE_BACKEND_TYPE: str = "cachetools"
     # 缓存连接字符串，仅外部缓存（如 Redis、Memcached）需要
-    CACHE_BACKEND_URL: Optional[str] = None
+    CACHE_BACKEND_URL: Optional[str] = "redis://localhost:6379"
     # Redis 缓存最大内存限制，未配置时，如开启大内存模式时为 "1024mb"，未开启时为 "256mb"
     CACHE_REDIS_MAXMEMORY: Optional[str] = None
-    # 配置文件目录
-    CONFIG_DIR: Optional[str] = None
-    # 超级管理员
-    SUPERUSER: str = "admin"
-    # 辅助认证，允许通过外部服务进行认证、单点登录以及自动创建用户
-    AUXILIARY_AUTH_ENABLE: bool = False
-    # API密钥，需要更换
-    API_TOKEN: Optional[str] = None
+    # 全局图片缓存，将媒体图片缓存到本地
+    GLOBAL_IMAGE_CACHE: bool = False
+    # 全局图片缓存保留天数
+    GLOBAL_IMAGE_CACHE_DAYS: int = 7
+    # 临时文件保留天数
+    TEMP_FILE_DAYS: int = 3
+    # 元数据识别缓存过期时间（小时），0为自动
+    META_CACHE_EXPIRE: int = 0
+
+    # ==================== 网络代理配置 ====================
     # 网络代理服务器地址
     PROXY_HOST: Optional[str] = None
-    # 登录页面电影海报,tmdb/bing/mediaserver
-    WALLPAPER: str = "tmdb"
-    # 自定义壁纸api地址
-    CUSTOMIZE_WALLPAPER_API_URL: Optional[str] = None
-    # 媒体搜索来源 themoviedb/douban/bangumi，多个用,分隔
-    SEARCH_SOURCE: str = "themoviedb,douban,bangumi"
-    # 媒体识别来源 themoviedb/douban
-    RECOGNIZE_SOURCE: str = "themoviedb"
-    # 刮削来源 themoviedb/douban
-    SCRAP_SOURCE: str = "themoviedb"
-    # 新增已入库媒体是否跟随TMDB信息变化
-    SCRAP_FOLLOW_TMDB: bool = True
-    # TMDB图片地址
-    TMDB_IMAGE_DOMAIN: str = "image.tmdb.org"
-    # TMDB API地址
-    TMDB_API_DOMAIN: str = "api.themoviedb.org"
-    # TMDB元数据语言
-    TMDB_LOCALE: str = "zh"
-    # 刮削使用TMDB原始语种图片
-    TMDB_SCRAP_ORIGINAL_IMAGE: bool = False
-    # TMDB API Key
-    TMDB_API_KEY: str = "db55323b8d3e4154498498a75642b381"
-    # TVDB API Key
-    TVDB_V4_API_KEY: str = "ed2aa66b-7899-4677-92a7-67bc9ce3d93a"
-    TVDB_V4_API_PIN: str = ""
-    # Fanart开关
-    FANART_ENABLE: bool = True
-    # Fanart语言
-    FANART_LANG: str = "zh,en"
-    # Fanart API Key
-    FANART_API_KEY: str = "d2d31f9ecabea050fc7d68aa3146015f"
-    # 115 AppId
-    U115_APP_ID: str = "100196807"
-    # Alipan AppId
-    ALIPAN_APP_ID: str = "ac1bf04dc9fd4d9aaabb65b4a668d403"
-    # 元数据识别缓存过期时间（小时）
-    META_CACHE_EXPIRE: int = 0
-    # 电视剧动漫的分类genre_ids
-    ANIME_GENREIDS: List[int] = Field(default=[16])
-    # 用户认证站点
-    AUTH_SITE: str = ""
-    # 重启自动升级
-    MOVIEPILOT_AUTO_UPDATE: str = 'release'
-    # 自动检查和更新站点资源包（站点索引、认证等）
-    AUTO_UPDATE_RESOURCE: bool = True
     # 是否启用DOH解析域名
     DOH_ENABLE: bool = False
     # 使用 DOH 解析的域名列表
@@ -169,6 +168,55 @@ class ConfigModel(BaseModel):
                         "api.telegram.org")
     # DOH 解析服务器列表
     DOH_RESOLVERS: str = "1.0.0.1,1.1.1.1,9.9.9.9,149.112.112.112"
+
+    # ==================== 媒体元数据配置 ====================
+    # 媒体搜索来源 themoviedb/douban/bangumi，多个用,分隔
+    SEARCH_SOURCE: str = "themoviedb"
+    # 媒体识别来源 themoviedb/douban
+    RECOGNIZE_SOURCE: str = "themoviedb"
+    # 刮削来源 themoviedb/douban
+    SCRAP_SOURCE: str = "themoviedb"
+    # 电视剧动漫的分类genre_ids
+    ANIME_GENREIDS: List[int] = Field(default=[16])
+
+    # ==================== TMDB配置 ====================
+    # TMDB图片地址
+    TMDB_IMAGE_DOMAIN: str = "image.tmdb.org"
+    # TMDB API地址
+    TMDB_API_DOMAIN: str = "api.themoviedb.org"
+    # TMDB元数据语言
+    TMDB_LOCALE: str = "zh"
+    # 刮削使用TMDB原始语种图片
+    TMDB_SCRAP_ORIGINAL_IMAGE: bool = False
+    # TMDB API Key
+    TMDB_API_KEY: str = "db55323b8d3e4154498498a75642b381"
+
+    # ==================== TVDB配置 ====================
+    # TVDB API Key
+    TVDB_V4_API_KEY: str = "ed2aa66b-7899-4677-92a7-67bc9ce3d93a"
+    TVDB_V4_API_PIN: str = ""
+
+    # ==================== Fanart配置 ====================
+    # Fanart开关
+    FANART_ENABLE: bool = True
+    # Fanart语言
+    FANART_LANG: str = "zh,en"
+    # Fanart API Key
+    FANART_API_KEY: str = "d2d31f9ecabea050fc7d68aa3146015f"
+
+    # ==================== 云盘配置 ====================
+    # 115 AppId
+    U115_APP_ID: str = "100196807"
+    # Alipan AppId
+    ALIPAN_APP_ID: str = "ac1bf04dc9fd4d9aaabb65b4a668d403"
+
+    # ==================== 系统升级配置 ====================
+    # 重启自动升级
+    MOVIEPILOT_AUTO_UPDATE: str = 'release'
+    # 自动检查和更新站点资源包（站点索引、认证等）
+    AUTO_UPDATE_RESOURCE: bool = True
+
+    # ==================== 媒体文件格式配置 ====================
     # 支持的后缀格式
     RMT_MEDIAEXT: list = Field(
         default_factory=lambda: ['.mp4', '.mkv', '.ts', '.iso',
@@ -191,10 +239,12 @@ class ConfigModel(BaseModel):
                                  '.aifc', '.aiff', '.alac', '.adif', '.adts',
                                  '.flac', '.midi', '.opus', '.sfalc']
     )
-    # 下载器临时文件后缀
-    DOWNLOAD_TMPEXT: list = Field(default_factory=lambda: ['.!qb', '.part'])
+
+    # ==================== 媒体服务器配置 ====================
     # 媒体服务器同步间隔（小时）
     MEDIASERVER_SYNC_INTERVAL: int = 6
+
+    # ==================== 订阅配置 ====================
     # 订阅模式
     SUBSCRIBE_MODE: str = "spider"
     # RSS订阅模式刷新时间间隔（分钟）
@@ -203,20 +253,42 @@ class ConfigModel(BaseModel):
     SUBSCRIBE_STATISTIC_SHARE: bool = True
     # 订阅搜索开关
     SUBSCRIBE_SEARCH: bool = False
+    # 订阅搜索时间间隔（小时）
+    SUBSCRIBE_SEARCH_INTERVAL: int = 24
     # 检查本地媒体库是否存在资源开关
-    LOCAL_EXISTS_SEARCH: bool = False
-    # 搜索多个名称
-    SEARCH_MULTIPLE_NAME: bool = False
+    LOCAL_EXISTS_SEARCH: bool = True
+
+    # ==================== 站点配置 ====================
     # 站点数据刷新间隔（小时）
     SITEDATA_REFRESH_INTERVAL: int = 6
     # 读取和发送站点消息
     SITE_MESSAGE: bool = True
+    # 不能缓存站点资源的站点域名，多个使用,分隔
+    NO_CACHE_SITE_KEY: str = "m-team"
+    # OCR服务器地址，用于识别站点验证码
+    OCR_HOST: str = "https://movie-pilot.org"
+    # 仿真类型：playwright 或 flaresolverr
+    BROWSER_EMULATION: str = "playwright"
+    # FlareSolverr 服务地址，例如 http://127.0.0.1:8191
+    FLARESOLVERR_URL: Optional[str] = None
+
+    # ==================== 搜索配置 ====================
+    # 搜索多个名称
+    SEARCH_MULTIPLE_NAME: bool = False
+    # 最大搜索名称数量
+    MAX_SEARCH_NAME_LIMIT: int = 2
+
+    # ==================== 下载配置 ====================
     # 种子标签
     TORRENT_TAG: str = "MOVIEPILOT"
     # 下载站点字幕
     DOWNLOAD_SUBTITLE: bool = True
     # 交互搜索自动下载用户ID，使用,分割
     AUTO_DOWNLOAD_USER: Optional[str] = None
+    # 下载器临时文件后缀
+    DOWNLOAD_TMPEXT: list = Field(default_factory=lambda: ['.!qb', '.part'])
+
+    # ==================== CookieCloud配置 ====================
     # CookieCloud是否启动本地服务
     COOKIECLOUD_ENABLE_LOCAL: Optional[bool] = False
     # CookieCloud服务器地址
@@ -229,8 +301,8 @@ class ConfigModel(BaseModel):
     COOKIECLOUD_INTERVAL: Optional[int] = 60 * 24
     # CookieCloud同步黑名单，多个域名,分割
     COOKIECLOUD_BLACKLIST: Optional[str] = None
-    # CookieCloud对应的浏览器UA
-    USER_AGENT: str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/113.0.0.0 Safari/537.36 Edg/113.0.1774.57"
+
+    # ==================== 整理配置 ====================
     # 电影重命名格式
     MOVIE_RENAME_FORMAT: str = "{{title}}{% if year %} ({{year}}){% endif %}" \
                                "/{{title}}{% if year %} ({{year}}){% endif %}{% if part %}-{{part}}{% endif %}{% if videoFormat %} - {{videoFormat}}{% endif %}" \
@@ -240,10 +312,24 @@ class ConfigModel(BaseModel):
                             "/Season {{season}}" \
                             "/{{title}} - {{season_episode}}{% if part %}-{{part}}{% endif %}{% if episode %} - 第 {{episode}} 集{% endif %}" \
                             "{{fileExt}}"
-    # OCR服务器地址
-    OCR_HOST: str = "https://movie-pilot.org"
+    # 重命名时支持的S0别名
+    RENAME_FORMAT_S0_NAMES: list = Field(default=["Specials", "SPs"])
+    # 为指定默认字幕添加.default后缀
+    DEFAULT_SUB: Optional[str] = "zh-cn"
+    # 新增已入库媒体是否跟随TMDB信息变化
+    SCRAP_FOLLOW_TMDB: bool = True
+
+    # ==================== 服务地址配置 ====================
     # 服务器地址，对应 https://github.com/jxxghp/MoviePilot-Server 项目
     MP_SERVER_HOST: str = "https://movie-pilot.org"
+
+    # ==================== 个性化 ====================
+    # 登录页面电影海报,tmdb/bing/mediaserver
+    WALLPAPER: str = "tmdb"
+    # 自定义壁纸api地址
+    CUSTOMIZE_WALLPAPER_API_URL: Optional[str] = None
+
+    # ==================== 插件配置 ====================
     # 插件市场仓库地址，多个地址使用,分隔，地址以/结尾
     PLUGIN_MARKET: str = ("https://github.com/jxxghp/MoviePilot-Plugins,"
                           "https://github.com/thsrite/MoviePilot-Plugins,"
@@ -264,6 +350,8 @@ class ConfigModel(BaseModel):
     PLUGIN_STATISTIC_SHARE: bool = True
     # 是否开启插件热加载
     PLUGIN_AUTO_RELOAD: bool = False
+
+    # ==================== Github & PIP ====================
     # Github token，提高请求api限流阈值 ghp_****
     GITHUB_TOKEN: Optional[str] = None
     # Github代理服务器，格式：https://mirror.ghproxy.com/
@@ -272,14 +360,18 @@ class ConfigModel(BaseModel):
     PIP_PROXY: Optional[str] = ''
     # 指定的仓库Github token，多个仓库使用,分隔，格式：{user1}/{repo1}:ghp_****,{user2}/{repo2}:github_pat_****
     REPO_GITHUB_TOKEN: Optional[str] = None
+
+    # ==================== 性能配置 ====================
     # 大内存模式
     BIG_MEMORY_MODE: bool = False
-    # 全局图片缓存，将媒体图片缓存到本地
-    GLOBAL_IMAGE_CACHE: bool = False
     # 是否启用编码探测的性能模式
     ENCODING_DETECTION_PERFORMANCE_MODE: bool = True
     # 编码探测的最低置信度阈值
     ENCODING_DETECTION_MIN_CONFIDENCE: float = 0.8
+    # 主动内存回收时间间隔（分钟），0为不启用
+    MEMORY_GC_INTERVAL: int = 30
+
+    # ==================== 安全配置 ====================
     # 允许的图片缓存域名
     SECURITY_IMAGE_DOMAINS: list = Field(default=[
         "image.tmdb.org",
@@ -299,14 +391,20 @@ class ConfigModel(BaseModel):
     ])
     # 允许的图片文件后缀格式
     SECURITY_IMAGE_SUFFIXES: list = Field(default=[".jpg", ".jpeg", ".png", ".webp", ".gif", ".svg", ".avif"])
-    # 重命名时支持的S0别名
-    RENAME_FORMAT_S0_NAMES: list = Field(default=["Specials", "SPs"])
-    # 为指定默认字幕添加.default后缀
-    DEFAULT_SUB: Optional[str] = "zh-cn"
-    # Docker Client API地址
-    DOCKER_CLIENT_API: Optional[str] = "tcp://127.0.0.1:38379"
+
+    # ==================== 工作流配置 ====================
     # 工作流数据共享
     WORKFLOW_STATISTIC_SHARE: bool = True
+
+    # ==================== 存储配置 ====================
+    # 对rclone进行快照对比时，是否检查文件夹的修改时间
+    RCLONE_SNAPSHOT_CHECK_FOLDER_MODTIME = True
+    # 对OpenList进行快照对比时，是否检查文件夹的修改时间
+    OPENLIST_SNAPSHOT_CHECK_FOLDER_MODTIME = True
+
+    # ==================== Docker配置 ====================
+    # Docker Client API地址
+    DOCKER_CLIENT_API: Optional[str] = "tcp://127.0.0.1:38379"
 
 
 class Settings(BaseSettings, ConfigModel, LogConfigModel):
@@ -507,6 +605,20 @@ class Settings(BaseSettings, ConfigModel, LogConfigModel):
         return "v2"
 
     @property
+    def USER_AGENT(self) -> str:
+        """
+        全局用户代理字符串
+        """
+        return f"{self.PROJECT_NAME}/{APP_VERSION[1:]} ({platform.system()} {platform.release()}; {SystemUtils.cpu_arch()})"
+
+    @property
+    def NORMAL_USER_AGENT(self) -> str:
+        """
+        默认浏览器用户代理字符串
+        """
+        return "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36"
+
+    @property
     def INNER_CONFIG_PATH(self):
         return self.ROOT_PATH / "config"
 
@@ -557,11 +669,9 @@ class Settings(BaseSettings, ConfigModel, LogConfigModel):
                 douban=512,
                 bangumi=512,
                 fanart=512,
-                meta=(self.META_CACHE_EXPIRE or 24) * 3600,
+                meta=(self.META_CACHE_EXPIRE or 72) * 3600,
                 scheduler=100,
-                threadpool=100,
-                dbpool=100,
-                dbpooloverflow=50
+                threadpool=100
             )
         return SystemConfModel(
             torrents=100,
@@ -570,11 +680,9 @@ class Settings(BaseSettings, ConfigModel, LogConfigModel):
             douban=256,
             bangumi=256,
             fanart=128,
-            meta=(self.META_CACHE_EXPIRE or 2) * 3600,
+            meta=(self.META_CACHE_EXPIRE or 24) * 3600,
             scheduler=50,
-            threadpool=50,
-            dbpool=50,
-            dbpooloverflow=20
+            threadpool=50
         )
 
     @property
@@ -589,9 +697,22 @@ class Settings(BaseSettings, ConfigModel, LogConfigModel):
     @property
     def PROXY_SERVER(self):
         if self.PROXY_HOST:
-            return {
-                "server": self.PROXY_HOST
-            }
+            try:
+                parsed = urlparse(self.PROXY_HOST)
+                if not parsed.scheme:
+                    return {"server": self.PROXY_HOST}
+                host = parsed.hostname or ""
+                port = f":{parsed.port}" if parsed.port else ""
+                server = f"{parsed.scheme}://{host}{port}"
+                proxy = {"server": server}
+                if parsed.username:
+                    proxy["username"] = parsed.username
+                if parsed.password:
+                    proxy["password"] = parsed.password
+                return proxy
+            except Exception as err:
+                logger.error(f"解析代理服务器地址 '{self.PROXY_HOST}' 时出错: {err}")
+                return {"server": self.PROXY_HOST}
         return None
 
     @property
@@ -602,7 +723,7 @@ class Settings(BaseSettings, ConfigModel, LogConfigModel):
         if self.GITHUB_TOKEN:
             return {
                 "Authorization": f"Bearer {self.GITHUB_TOKEN}",
-                "User-Agent": self.USER_AGENT,
+                "User-Agent": self.NORMAL_USER_AGENT,
             }
         return {}
 
@@ -631,7 +752,7 @@ class Settings(BaseSettings, ConfigModel, LogConfigModel):
                     continue
                 headers[repo_info] = {
                     "Authorization": f"Bearer {token}",
-                    "User-Agent": self.USER_AGENT,
+                    "User-Agent": self.NORMAL_USER_AGENT,
                 }
             except Exception as e:
                 print(f"处理令牌对 '{token_pair}' 时出错: {e}")
@@ -651,6 +772,23 @@ class Settings(BaseSettings, ConfigModel, LogConfigModel):
             return None
         return UrlUtils.combine_url(host=self.APP_DOMAIN, path=url)
 
+    def RENAME_FORMAT(self, media_type: MediaType):
+        """
+        获取指定类型的重命名格式
+
+        :param media_type: MediaType.TV 或 MediaType.Movie
+        :return: 重命名格式
+        """
+        rename_format = (
+            self.TV_RENAME_FORMAT
+            if media_type == MediaType.TV
+            else self.MOVIE_RENAME_FORMAT
+        )
+        # 规范重命名格式
+        rename_format = rename_format.replace("\\", "/")
+        rename_format = re.sub(r'/+', '/', rename_format)
+        return rename_format.strip("/")
+
 
 # 实例化配置
 settings = Settings()
@@ -666,6 +804,8 @@ class GlobalVar(object):
     SUBSCRIPTIONS: List[dict] = []
     # 需应急停止的工作流
     EMERGENCY_STOP_WORKFLOWS: List[int] = []
+    # 需应急停止文件整理
+    EMERGENCY_STOP_TRANSFER: List[str] = []
 
     def stop_system(self):
         """
@@ -706,11 +846,29 @@ class GlobalVar(object):
         if workflow_id in self.EMERGENCY_STOP_WORKFLOWS:
             self.EMERGENCY_STOP_WORKFLOWS.remove(workflow_id)
 
-    def is_workflow_stopped(self, workflow_id: int):
+    def is_workflow_stopped(self, workflow_id: int) -> bool:
         """
         是否停止工作流
         """
         return self.is_system_stopped or workflow_id in self.EMERGENCY_STOP_WORKFLOWS
+
+    def stop_transfer(self, path: str):
+        """
+        停止文件整理
+        """
+        if path not in self.EMERGENCY_STOP_TRANSFER:
+            self.EMERGENCY_STOP_TRANSFER.append(path)
+
+    def is_transfer_stopped(self, path: str) -> bool:
+        """
+        是否停止文件整理
+        """
+        if self.is_system_stopped:
+            return True
+        if path in self.EMERGENCY_STOP_TRANSFER:
+            self.EMERGENCY_STOP_TRANSFER.remove(path)
+            return True
+        return False
 
 
 # 全局标识

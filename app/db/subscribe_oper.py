@@ -34,6 +34,7 @@ class SubscribeOper(DbOper):
             "backdrop": mediainfo.get_backdrop_image(),
             "vote": mediainfo.vote_average,
             "description": mediainfo.overview,
+            "search_imdbid": 1 if kwargs.get('search_imdbid') else 0,
             "date": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
         })
         if not subscribe:
@@ -48,7 +49,44 @@ class SubscribeOper(DbOper):
         else:
             return subscribe.id, "订阅已存在"
 
-    def exists(self, tmdbid: Optional[int] = None, doubanid: Optional[str] = None, season: Optional[int] = None) -> bool:
+    async def async_add(self, mediainfo: MediaInfo, **kwargs) -> Tuple[int, str]:
+        """
+        异步新增订阅
+        """
+        subscribe = await Subscribe.async_exists(self._db,
+                                                 tmdbid=mediainfo.tmdb_id,
+                                                 doubanid=mediainfo.douban_id,
+                                                 season=kwargs.get('season'))
+        kwargs.update({
+            "name": mediainfo.title,
+            "year": mediainfo.year,
+            "type": mediainfo.type.value,
+            "tmdbid": mediainfo.tmdb_id,
+            "imdbid": mediainfo.imdb_id,
+            "tvdbid": mediainfo.tvdb_id,
+            "doubanid": mediainfo.douban_id,
+            "bangumiid": mediainfo.bangumi_id,
+            "episode_group": mediainfo.episode_group,
+            "poster": mediainfo.get_poster_image(),
+            "backdrop": mediainfo.get_backdrop_image(),
+            "vote": mediainfo.vote_average,
+            "description": mediainfo.overview,
+            "date": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+        })
+        if not subscribe:
+            subscribe = Subscribe(**kwargs)
+            await subscribe.async_create(self._db)
+            # 查询订阅
+            subscribe = await Subscribe.async_exists(self._db,
+                                                     tmdbid=mediainfo.tmdb_id,
+                                                     doubanid=mediainfo.douban_id,
+                                                     season=kwargs.get('season'))
+            return subscribe.id, "新增订阅成功"
+        else:
+            return subscribe.id, "订阅已存在"
+
+    def exists(self, tmdbid: Optional[int] = None, doubanid: Optional[str] = None,
+               season: Optional[int] = None) -> bool:
         """
         判断是否存在
         """
@@ -67,6 +105,12 @@ class SubscribeOper(DbOper):
         """
         return Subscribe.get(self._db, rid=sid)
 
+    async def async_get(self, sid: int) -> Subscribe:
+        """
+        获取订阅
+        """
+        return await Subscribe.async_get(self._db, rid=sid)
+
     def list(self, state: Optional[str] = None) -> List[Subscribe]:
         """
         获取订阅列表
@@ -74,6 +118,14 @@ class SubscribeOper(DbOper):
         if state:
             return Subscribe.get_by_state(self._db, state)
         return Subscribe.list(self._db)
+
+    async def async_list(self, state: Optional[str] = None) -> List[Subscribe]:
+        """
+        异步获取订阅列表
+        """
+        if state:
+            return await Subscribe.async_get_by_state(self._db, state)
+        return await Subscribe.async_list(self._db)
 
     def delete(self, sid: int):
         """
@@ -96,7 +148,8 @@ class SubscribeOper(DbOper):
         """
         return Subscribe.get_by_tmdbid(self._db, tmdbid=tmdbid, season=season)
 
-    def list_by_username(self, username: str, state: Optional[str] = None, mtype: Optional[str] = None) -> List[Subscribe]:
+    def list_by_username(self, username: str, state: Optional[str] = None,
+                         mtype: Optional[str] = None) -> List[Subscribe]:
         """
         获取指定用户的订阅
         """

@@ -8,9 +8,10 @@ from smbclient import ClientConfig, register_session, reset_connection_cache
 from smbprotocol.exceptions import SMBException, SMBResponseException, SMBAuthenticationError
 
 from app import schemas
-from app.core.config import settings
+from app.core.config import settings, global_vars
 from app.log import logger
 from app.modules.filemanager import StorageBase
+from app.modules.filemanager.storages import transfer_process
 from app.schemas.types import StorageSchema
 from app.utils.singleton import WeakSingleton
 
@@ -38,6 +39,9 @@ class SMB(StorageBase, metaclass=WeakSingleton):
         "copy": "复制",
     }
 
+    # 文件块大小，默认10MB
+    chunk_size = 10 * 1024 * 1024
+
     def __init__(self):
         super().__init__()
         self._connected = False
@@ -45,6 +49,7 @@ class SMB(StorageBase, metaclass=WeakSingleton):
         self._host = None
         self._username = None
         self._password = None
+
         self._init_connection()
 
     def _init_connection(self):
@@ -376,19 +381,95 @@ class SMB(StorageBase, metaclass=WeakSingleton):
             self._check_connection()
 
             smb_path = self._normalize_path(fileitem.path.rstrip("/"))
+            logger.info(f"【SMB】开始删除: {fileitem.path} (类型: {fileitem.type})")
+
+            # 先检查路径是否存在
+            if not smbclient.path.exists(smb_path):
+                logger.warn(f"【SMB】路径不存在，跳过删除: {fileitem.path}")
+                return True
 
             if fileitem.type == "dir":
-                # 删除目录
-                smbclient.rmdir(smb_path)
+                # 递归删除目录及其内容
+                logger.debug(f"【SMB】递归删除目录: {smb_path}")
+                self._recursive_delete(smb_path)
             else:
                 # 删除文件
+                logger.debug(f"【SMB】删除文件: {smb_path}")
                 smbclient.remove(smb_path)
 
             logger.info(f"【SMB】删除成功: {fileitem.path}")
             return True
-        except Exception as e:
-            logger.error(f"【SMB】删除失败: {e}")
+        except SMBConnectionError as e:
+            logger.error(f"【SMB】删除失败 - 连接错误: {fileitem.path} - {e}")
             return False
+        except SMBResponseException as e:
+            logger.error(f"【SMB】删除失败 - SMB响应错误: {fileitem.path} - {e}")
+            return False
+        except SMBException as e:
+            logger.error(f"【SMB】删除失败 - SMB错误: {fileitem.path} - {e}")
+            return False
+        except Exception as e:
+            logger.error(f"【SMB】删除失败 - 未知错误: {fileitem.path} - {e}")
+            return False
+
+    def _recursive_delete(self, smb_path: str):
+        """
+        递归删除目录及其所有内容
+        """
+        try:
+            # 检查路径是否存在
+            if not smbclient.path.exists(smb_path):
+                logger.debug(f"【SMB】路径不存在，跳过删除: {smb_path}")
+                return
+
+            # 如果是文件，直接删除
+            if smbclient.path.isfile(smb_path):
+                logger.debug(f"【SMB】删除文件: {smb_path}")
+                smbclient.remove(smb_path)
+                return
+
+            # 如果是目录，先删除其内容
+            if smbclient.path.isdir(smb_path):
+                logger.debug(f"【SMB】开始删除目录内容: {smb_path}")
+                try:
+                    # 列出目录内容
+                    entries = smbclient.listdir(smb_path)
+                    logger.debug(f"【SMB】目录 {smb_path} 包含 {len(entries)} 个项目")
+
+                    for entry in entries:
+                        if entry in [".", ".."]:
+                            continue
+                        entry_path = f"{smb_path}\\{entry}"
+                        logger.debug(f"【SMB】递归删除子项: {entry_path}")
+                        # 递归删除子项
+                        self._recursive_delete(entry_path)
+
+                    # 删除空目录
+                    logger.debug(f"【SMB】删除空目录: {smb_path}")
+                    smbclient.rmdir(smb_path)
+                    logger.debug(f"【SMB】目录删除成功: {smb_path}")
+
+                except SMBResponseException as e:
+                    # 如果目录不为空，尝试强制删除
+                    logger.warn(f"【SMB】目录不为空，尝试强制删除: {smb_path} - {e}")
+                    # 使用remove方法尝试删除（某些SMB服务器支持）
+                    try:
+                        smbclient.remove(smb_path)
+                        logger.info(f"【SMB】强制删除目录成功: {smb_path}")
+                    except Exception as remove_error:
+                        # 如果还是失败，记录错误并抛出异常
+                        logger.error(f"【SMB】无法删除非空目录: {smb_path} - {remove_error}")
+                        raise SMBConnectionError(f"无法删除非空目录 {smb_path}: {remove_error}")
+                except SMBException as e:
+                    logger.error(f"【SMB】SMB操作失败: {smb_path} - {e}")
+                    raise SMBConnectionError(f"SMB操作失败 {smb_path}: {e}")
+
+        except SMBConnectionError:
+            # 重新抛出SMB连接错误
+            raise
+        except Exception as e:
+            logger.error(f"【SMB】递归删除失败: {smb_path} - {e}")
+            raise SMBConnectionError(f"递归删除失败 {smb_path}: {e}")
 
     def rename(self, fileitem: schemas.FileItem, name: str) -> bool:
         """
@@ -412,63 +493,99 @@ class SMB(StorageBase, metaclass=WeakSingleton):
 
     def download(self, fileitem: schemas.FileItem, path: Path = None) -> Optional[Path]:
         """
-        下载文件
+        带实时进度显示的下载
         """
+        local_path = path or settings.TEMP_PATH / fileitem.name
+        smb_path = self._normalize_path(fileitem.path)
         try:
             self._check_connection()
-
-            smb_path = self._normalize_path(fileitem.path)
-            local_path = path or settings.TEMP_PATH / fileitem.name
 
             # 确保本地目录存在
             local_path.parent.mkdir(parents=True, exist_ok=True)
 
+            # 获取文件大小
+            file_size = fileitem.size
+
+            # 初始化进度条
+            logger.info(f"【SMB】开始下载: {fileitem.name} -> {local_path}")
+            progress_callback = transfer_process(Path(fileitem.path).as_posix())
+
             # 使用更高效的文件传输方式
             with smbclient.open_file(smb_path, mode="rb") as src_file:
                 with open(local_path, "wb") as dst_file:
-                    # 使用更大的缓冲区提高性能
-                    buffer_size = 1024 * 1024  # 1MB
+                    downloaded_size = 0
                     while True:
-                        chunk = src_file.read(buffer_size)
+                        if global_vars.is_transfer_stopped(fileitem.path):
+                            logger.info(f"【SMB】{fileitem.path} 下载已取消！")
+                            return None
+                        chunk = src_file.read(self.chunk_size)
                         if not chunk:
                             break
                         dst_file.write(chunk)
+                        downloaded_size += len(chunk)
+                        # 更新进度
+                        if file_size:
+                            progress = (downloaded_size * 100) / file_size
+                            progress_callback(progress)
 
-            logger.info(f"【SMB】下载成功: {fileitem.path} -> {local_path}")
+            # 完成下载
+            progress_callback(100)
+            logger.info(f"【SMB】下载完成: {fileitem.name}")
             return local_path
+
         except Exception as e:
-            logger.error(f"【SMB】下载失败: {e}")
+            logger.error(f"【SMB】下载失败: {fileitem.name} - {e}")
+            # 删除可能部分下载的文件
+            if local_path.exists():
+                local_path.unlink()
             return None
 
     def upload(self, fileitem: schemas.FileItem, path: Path,
                new_name: Optional[str] = None) -> Optional[schemas.FileItem]:
         """
-        上传文件
+        带实时进度显示的上传
         """
+        target_name = new_name or path.name
+        target_path = Path(fileitem.path) / target_name
+        smb_path = self._normalize_path(str(target_path))
+
         try:
             self._check_connection()
 
-            target_name = new_name or path.name
-            target_path = Path(fileitem.path) / target_name
-            smb_path = self._normalize_path(str(target_path))
+            # 获取文件大小
+            file_size = path.stat().st_size
+
+            # 初始化进度条
+            logger.info(f"【SMB】开始上传: {path} -> {target_path}")
+            progress_callback = transfer_process(path.as_posix())
 
             # 使用更高效的文件传输方式
             with open(path, "rb") as src_file:
                 with smbclient.open_file(smb_path, mode="wb") as dst_file:
-                    # 使用更大的缓冲区提高性能
-                    buffer_size = 1024 * 1024  # 1MB
+                    uploaded_size = 0
                     while True:
-                        chunk = src_file.read(buffer_size)
+                        if global_vars.is_transfer_stopped(path.as_posix()):
+                            logger.info(f"【SMB】{path} 上传已取消！")
+                            return None
+                        chunk = src_file.read(self.chunk_size)
                         if not chunk:
                             break
                         dst_file.write(chunk)
+                        uploaded_size += len(chunk)
+                        # 更新进度
+                        if file_size:
+                            progress = (uploaded_size * 100) / file_size
+                            progress_callback(progress)
 
-            logger.info(f"【SMB】上传成功: {path} -> {target_path}")
+            # 完成上传
+            progress_callback(100)
+            logger.info(f"【SMB】上传完成: {target_name}")
 
             # 返回上传后的文件信息
             return self.get_item(target_path)
+
         except Exception as e:
-            logger.error(f"【SMB】上传失败: {e}")
+            logger.error(f"【SMB】上传失败: {target_name} - {e}")
             return None
 
     def copy(self, fileitem: schemas.FileItem, path: Path, new_name: str) -> bool:
@@ -544,8 +661,7 @@ class SMB(StorageBase, metaclass=WeakSingleton):
         析构函数，清理连接
         """
         try:
-            # smbclient 自动管理连接池，但我们可以重置缓存
-            if hasattr(self, '_connected') and self._connected:
+            if self._connected:
                 reset_connection_cache()
         except Exception as e:
             logger.debug(f"【SMB】清理连接失败: {e}")

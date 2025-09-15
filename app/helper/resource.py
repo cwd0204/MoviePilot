@@ -2,13 +2,12 @@ import json
 from pathlib import Path
 
 from app.core.config import settings
-from app.helper.sites import SitesHelper
+from app.helper.sites import SitesHelper  # noqa
 from app.helper.system import SystemHelper
 from app.log import logger
 from app.utils.http import RequestUtils
 from app.utils.string import StringUtils
 from app.utils.system import SystemUtils
-from version import APP_VERSION
 
 
 class ResourceHelper:
@@ -59,12 +58,6 @@ class ResourceHelper:
                         if rtype == "auth":
                             # 站点认证资源
                             local_version = SitesHelper().auth_version
-                            # 阻断站点认证资源v2.3.0以下的版本直接更新，避免无限重启
-                            if StringUtils.compare_version(local_version, "<", "2.3.0"):
-                                continue
-                            # 阻断主程序版本v2.6.3以下的版本直接更新，避免搜索异常
-                            if StringUtils.compare_version(APP_VERSION, "<", "2.6.3"):
-                                continue
                         elif rtype == "sites":
                             # 站点索引资源
                             local_version = SitesHelper().indexer_version

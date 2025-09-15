@@ -1,10 +1,39 @@
 from abc import ABCMeta, abstractmethod
 from pathlib import Path
-from typing import Optional, List, Dict, Tuple
+from typing import Optional, List, Dict, Tuple, Callable, Union
+
+from tqdm import tqdm
 
 from app import schemas
+from app.helper.progress import ProgressHelper
 from app.helper.storage import StorageHelper
 from app.log import logger
+from app.utils.crypto import HashUtils
+
+
+def transfer_process(path: str) -> Callable[[int | float], None]:
+    """
+    传输进度回调
+    """
+    pbar = tqdm(total=100, desc="进度", unit="%")
+    progress = ProgressHelper(HashUtils.md5(path))
+    progress.start()
+
+    def update_progress(percent: Union[int, float]) -> None:
+        """
+        更新进度百分比
+        """
+        percent_value = round(percent, 2) if isinstance(percent, float) else percent
+        pbar.n = percent_value
+        # 更新进度
+        pbar.refresh()
+        progress.update(value=percent_value, text=f"{path} 进度：{percent_value}%")
+        # 完成时结束
+        if percent_value >= 100:
+            progress.end()
+            pbar.close()
+
+    return update_progress
 
 
 class StorageBase(metaclass=ABCMeta):
@@ -13,6 +42,7 @@ class StorageBase(metaclass=ABCMeta):
     """
     schema = None
     transtype = {}
+    snapshot_check_folder_modtime = True
 
     def __init__(self):
         self.storagehelper = StorageHelper()
@@ -214,7 +244,8 @@ class StorageBase(metaclass=ABCMeta):
                         return
 
                     # 增量检查：如果目录修改时间早于上次快照，跳过
-                    if (last_snapshot_time and
+                    if (self.snapshot_check_folder_modtime and
+                            last_snapshot_time and
                             _fileitm.modify_time and
                             _fileitm.modify_time <= last_snapshot_time):
                         return
@@ -225,11 +256,13 @@ class StorageBase(metaclass=ABCMeta):
                         __snapshot_file(sub_file, current_depth + 1)
                 else:
                     # 记录文件的完整信息用于比对
-                    files_info[_fileitm.path] = {
-                        'size': _fileitm.size or 0,
-                        'modify_time': getattr(_fileitm, 'modify_time', 0),
-                        'type': _fileitm.type
-                    }
+                    if getattr(_fileitm, 'modify_time', 0) > last_snapshot_time:
+                        files_info[_fileitm.path] = {
+                            'size': _fileitm.size or 0,
+                            'modify_time': getattr(_fileitm, 'modify_time', 0),
+                            'type': _fileitm.type
+                        }
+
             except Exception as e:
                 logger.debug(f"Snapshot error for {_fileitm.path}: {e}")
 

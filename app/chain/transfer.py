@@ -1,4 +1,3 @@
-import gc
 import queue
 import re
 import threading
@@ -498,16 +497,14 @@ class TransferChain(ChainBase, metaclass=Singleton):
                 if transferinfo.transfer_type in ["move"]:
                     # 所有成功的业务
                     tasks = self.jobview.success_tasks(task.mediainfo, task.meta.begin_season)
-                    # 记录已处理的种子hash
-                    processed_hashes = set()
                     storagechain = StorageChain()
+                    # 获取整理屏蔽词
+                    transfer_exclude_words = SystemConfigOper().get(SystemConfigKey.TransferExcludeWords)
                     for t in tasks:
-                        # 下载器hash
-                        if t.download_hash and t.download_hash not in processed_hashes:
-                            processed_hashes.add(t.download_hash)
+                        if t.download_hash and self._can_delete_torrent(t.download_hash, t.downloader,
+                                                                        transfer_exclude_words):
                             if self.remove_torrents(t.download_hash, downloader=t.downloader):
-                                logger.info(f"移动模式删除种子成功：{t.download_hash} ")
-                        # 删除残留目录
+                                logger.info(f"移动模式删除种子成功：{t.download_hash}")
                         if t.fileitem:
                             storagechain.delete_media_file(t.fileitem, delete_self=False)
             # 整理完成且有成功的任务时
@@ -558,8 +555,10 @@ class TransferChain(ChainBase, metaclass=Singleton):
         processed_num = 0
         # 失败数量
         fail_num = 0
+        # 已完成文件
+        finished_files = []
 
-        progress = ProgressHelper()
+        progress = ProgressHelper(ProgressKey.FileTransfer)
 
         while not global_vars.is_system_stopped:
             try:
@@ -574,7 +573,7 @@ class TransferChain(ChainBase, metaclass=Singleton):
                     if __queue_start:
                         logger.info("开始整理队列处理...")
                         # 启动进度
-                        progress.start(ProgressKey.FileTransfer)
+                        progress.start()
                         # 重置计数
                         processed_num = 0
                         fail_num = 0
@@ -582,8 +581,7 @@ class TransferChain(ChainBase, metaclass=Singleton):
                         __process_msg = f"开始整理队列处理，当前共 {total_num} 个文件 ..."
                         logger.info(__process_msg)
                         progress.update(value=0,
-                                        text=__process_msg,
-                                        key=ProgressKey.FileTransfer)
+                                        text=__process_msg)
                         # 队列已开始
                         __queue_start = False
                     # 更新进度
@@ -591,7 +589,10 @@ class TransferChain(ChainBase, metaclass=Singleton):
                     logger.info(__process_msg)
                     progress.update(value=processed_num / total_num * 100,
                                     text=__process_msg,
-                                    key=ProgressKey.FileTransfer)
+                                    data={
+                                        "current": Path(fileitem.path).as_posix(),
+                                        "finished": finished_files
+                                    })
                     # 整理
                     state, err_msg = self.__handle_transfer(task=task, callback=item.callback)
                     if not state:
@@ -599,20 +600,20 @@ class TransferChain(ChainBase, metaclass=Singleton):
                         fail_num += 1
                     # 更新进度
                     processed_num += 1
+                    finished_files.append(Path(fileitem.path).as_posix())
                     __process_msg = f"{fileitem.name} 整理完成"
                     logger.info(__process_msg)
-                    progress.update(value=processed_num / total_num * 100,
+                    progress.update(value=(processed_num / total_num) * 100,
                                     text=__process_msg,
-                                    key=ProgressKey.FileTransfer)
+                                    data={})
             except queue.Empty:
                 if not __queue_start:
                     # 结束进度
                     __end_msg = f"整理队列处理完成，共整理 {processed_num} 个文件，失败 {fail_num} 个"
                     logger.info(__end_msg)
                     progress.update(value=100,
-                                    text=__end_msg,
-                                    key=ProgressKey.FileTransfer)
-                    progress.end(ProgressKey.FileTransfer)
+                                    text=__end_msg)
+                    progress.end()
                     # 重置计数
                     processed_num = 0
                     fail_num = 0
@@ -867,7 +868,7 @@ class TransferChain(ChainBase, metaclass=Singleton):
                     state, errmsg = self.do_transfer(
                         fileitem=FileItem(
                             storage="local",
-                            path=str(file_path).replace("\\", "/"),
+                            path=file_path.as_posix(),
                             type="dir" if not file_path.is_file() else "file",
                             name=file_path.name,
                             size=file_path.stat().st_size,
@@ -886,10 +887,6 @@ class TransferChain(ChainBase, metaclass=Singleton):
             finally:
                 torrents.clear()
                 del torrents
-
-            # 如果不是大内存模式，进行垃圾回收
-            if not settings.BIG_MEMORY_MODE:
-                gc.collect()
 
             # 结束
             logger.info("所有下载器中下载完成的文件已整理完成")
@@ -1078,16 +1075,7 @@ class TransferChain(ChainBase, metaclass=Singleton):
                     continue
 
                 # 整理屏蔽词不处理
-                is_blocked = False
-                if transfer_exclude_words:
-                    for keyword in transfer_exclude_words:
-                        if not keyword:
-                            continue
-                        if keyword and re.search(r"%s" % keyword, file_item.path, re.IGNORECASE):
-                            logger.info(f"{file_item.path} 命中整理屏蔽词 {keyword}，不处理")
-                            is_blocked = True
-                            break
-                if is_blocked:
+                if self._is_blocked_by_exclude_words(file_item.path, transfer_exclude_words):
                     continue
 
                 # 整理成功的不再处理
@@ -1181,15 +1169,16 @@ class TransferChain(ChainBase, metaclass=Singleton):
             processed_num = 0
             # 失败数量
             fail_num = 0
+            # 已完成文件
+            finished_files = []
 
             # 启动进度
-            progress = ProgressHelper()
-            progress.start(ProgressKey.FileTransfer)
+            progress = ProgressHelper(ProgressKey.FileTransfer)
+            progress.start()
             __process_msg = f"开始整理，共 {total_num} 个文件 ..."
             logger.info(__process_msg)
             progress.update(value=0,
-                            text=__process_msg,
-                            key=ProgressKey.FileTransfer)
+                            text=__process_msg)
             try:
                 for transfer_task in transfer_tasks:
                     if global_vars.is_system_stopped:
@@ -1201,7 +1190,10 @@ class TransferChain(ChainBase, metaclass=Singleton):
                     logger.info(__process_msg)
                     progress.update(value=(processed_num + fail_num) / total_num * 100,
                                     text=__process_msg,
-                                    key=ProgressKey.FileTransfer)
+                                    data={
+                                        "current": Path(transfer_task.fileitem.path).as_posix(),
+                                        "finished": finished_files,
+                                    })
                     state, err_msg = self.__handle_transfer(
                         task=transfer_task,
                         callback=self.__default_callback
@@ -1213,6 +1205,8 @@ class TransferChain(ChainBase, metaclass=Singleton):
                         fail_num += 1
                     else:
                         processed_num += 1
+                    # 记录已完成
+                    finished_files.append(Path(transfer_task.fileitem.path).as_posix())
             finally:
                 transfer_tasks.clear()
                 del transfer_tasks
@@ -1222,8 +1216,8 @@ class TransferChain(ChainBase, metaclass=Singleton):
             logger.info(__end_msg)
             progress.update(value=100,
                             text=__end_msg,
-                            key=ProgressKey.FileTransfer)
-            progress.end(ProgressKey.FileTransfer)
+                            data={})
+            progress.end()
 
         error_msg = "、".join(err_msgs[:2]) + (f"，等{len(err_msgs)}个文件错误！" if len(err_msgs) > 2 else "")
         return all_success, error_msg
@@ -1363,16 +1357,12 @@ class TransferChain(ChainBase, metaclass=Singleton):
             mediainfo: MediaInfo = MediaChain().recognize_media(tmdbid=tmdbid, doubanid=doubanid,
                                                                 mtype=mtype, episode_group=episode_group)
             if not mediainfo:
-                return False, f"媒体信息识别失败，tmdbid：{tmdbid}，doubanid：{doubanid}，type: {mtype.value}"
+                return (False,
+                        f"媒体信息识别失败，tmdbid：{tmdbid}，doubanid：{doubanid}，type: {mtype.value if mtype else None}")
             else:
                 # 更新媒体图片
                 self.obtain_images(mediainfo=mediainfo)
-            # 开始进度
-            progress = ProgressHelper()
-            progress.start(ProgressKey.FileTransfer)
-            progress.update(value=0,
-                            text=f"开始整理 {fileitem.path} ...",
-                            key=ProgressKey.FileTransfer)
+
             # 开始整理
             state, errmsg = self.do_transfer(
                 fileitem=fileitem,
@@ -1393,7 +1383,6 @@ class TransferChain(ChainBase, metaclass=Singleton):
             if not state:
                 return False, errmsg
 
-            progress.end(ProgressKey.FileTransfer)
             logger.info(f"{fileitem.path} 整理完成")
             return True, ""
         else:
@@ -1433,3 +1422,63 @@ class TransferChain(ChainBase, metaclass=Singleton):
             season_episode=season_episode,
             username=username
         )
+
+    @staticmethod
+    def _is_blocked_by_exclude_words(file_path: str, exclude_words: list) -> bool:
+        """
+        检查文件是否被整理屏蔽词阻止处理
+        :param file_path: 文件路径
+        :param exclude_words: 整理屏蔽词列表
+        :return: 如果被屏蔽返回True，否则返回False
+        """
+        if not exclude_words:
+            return False
+
+        for keyword in exclude_words:
+            if keyword and re.search(r"%s" % keyword, file_path, re.IGNORECASE):
+                logger.debug(f"{file_path} 命中屏蔽词 {keyword}")
+                return True
+        return False
+
+    def _can_delete_torrent(self, download_hash: str, downloader: str, transfer_exclude_words) -> bool:
+        """
+        检查是否可以删除种子文件
+        :param download_hash: 种子Hash
+        :param downloader: 下载器名称
+        :param transfer_exclude_words: 整理屏蔽词
+        :return: 如果可以删除返回True，否则返回False
+        """
+        try:
+            # 获取种子信息
+            torrents = self.list_torrents(hashs=download_hash, downloader=downloader)
+            if not torrents:
+                return False
+
+            # 未下载完成
+            if torrents[0].progress < 100:
+                return False
+
+            # 获取种子文件列表
+            torrent_files = self.torrent_files(download_hash, downloader)
+            if not torrent_files:
+                return False
+
+            if not isinstance(torrent_files, list):
+                torrent_files = torrent_files.data
+
+            # 检查是否有媒体文件未被屏蔽且存在
+            save_path = torrents[0].path.parent
+            for file in torrent_files:
+                file_path = save_path / file.name
+                # 如果存在未被屏蔽的媒体文件，则不删除种子
+                if (file_path.suffix in self.all_exts
+                        and not self._is_blocked_by_exclude_words(str(file_path), transfer_exclude_words)
+                        and file_path.exists()):
+                    return False
+
+            # 所有媒体文件都被屏蔽或不存在，可以删除种子
+            return True
+
+        except Exception as e:
+            logger.error(f"检查种子 {download_hash} 是否需要删除失败：{e}")
+            return False

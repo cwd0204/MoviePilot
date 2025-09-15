@@ -1,6 +1,6 @@
 from fastapi import APIRouter
 
-from app.api.endpoints import login, user, site, message, webhook, subscribe, \
+from app.api.endpoints import login, user, webhook, message, site, subscribe, \
     media, douban, search, plugin, tmdb, history, system, download, dashboard, \
     transfer, mediaserver, bangumi, storage, discover, recommend, workflow, torrent
 

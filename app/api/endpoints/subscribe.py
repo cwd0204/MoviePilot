@@ -2,6 +2,7 @@ from typing import List, Any, Annotated, Optional
 
 import cn2an
 from fastapi import APIRouter, Request, BackgroundTasks, Depends, HTTPException, Header
+from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import Session
 
 from app import schemas
@@ -11,12 +12,12 @@ from app.core.context import MediaInfo
 from app.core.event import eventmanager
 from app.core.metainfo import MetaInfo
 from app.core.security import verify_token, verify_apitoken
-from app.db import get_db
+from app.db import get_async_db, get_db
 from app.db.models.subscribe import Subscribe
 from app.db.models.subscribehistory import SubscribeHistory
 from app.db.models.user import User
 from app.db.systemconfig_oper import SystemConfigOper
-from app.db.user_oper import get_current_active_user
+from app.db.user_oper import get_current_active_user_async
 from app.helper.subscribe import SubscribeHelper
 from app.scheduler import Scheduler
 from app.schemas.types import MediaType, EventType, SystemConfigKey
@@ -34,28 +35,28 @@ def start_subscribe_add(title: str, year: str,
 
 
 @router.get("/", summary="查询所有订阅", response_model=List[schemas.Subscribe])
-def read_subscribes(
-        db: Session = Depends(get_db),
+async def read_subscribes(
+        db: AsyncSession = Depends(get_async_db),
         _: schemas.TokenPayload = Depends(verify_token)) -> Any:
     """
     查询所有订阅
     """
-    return Subscribe.list(db)
+    return await Subscribe.async_list(db)
 
 
 @router.get("/list", summary="查询所有订阅（API_TOKEN）", response_model=List[schemas.Subscribe])
-def list_subscribes(_: Annotated[str, Depends(verify_apitoken)]) -> Any:
+async def list_subscribes(_: Annotated[str, Depends(verify_apitoken)]) -> Any:
     """
     查询所有订阅 API_TOKEN认证（?token=xxx）
     """
-    return read_subscribes()
+    return await read_subscribes()
 
 
 @router.post("/", summary="新增订阅", response_model=schemas.Response)
-def create_subscribe(
+async def create_subscribe(
         *,
         subscribe_in: schemas.Subscribe,
-        current_user: User = Depends(get_current_active_user),
+        current_user: User = Depends(get_current_active_user_async),
 ) -> schemas.Response:
     """
     新增订阅
@@ -77,26 +78,30 @@ def create_subscribe(
         title = None
     # 订阅用户
     subscribe_in.username = current_user.name
-    sid, message = SubscribeChain().add(mtype=mtype,
-                                        title=title,
-                                        exist_ok=True,
-                                        **subscribe_in.dict())
+    # 转化为字典
+    subscribe_dict = subscribe_in.dict()
+    if subscribe_in.id:
+        subscribe_dict.pop("id", None)
+    sid, message = await SubscribeChain().async_add(mtype=mtype,
+                                                    title=title,
+                                                    exist_ok=True,
+                                                    **subscribe_dict)
     return schemas.Response(
         success=bool(sid), message=message, data={"id": sid}
     )
 
 
 @router.put("/", summary="更新订阅", response_model=schemas.Response)
-def update_subscribe(
+async def update_subscribe(
         *,
         subscribe_in: schemas.Subscribe,
-        db: Session = Depends(get_db),
+        db: AsyncSession = Depends(get_async_db),
         _: schemas.TokenPayload = Depends(verify_token)
 ) -> Any:
     """
     更新订阅信息
     """
-    subscribe = Subscribe.get(db, subscribe_in.id)
+    subscribe = await Subscribe.async_get(db, subscribe_in.id)
     if not subscribe:
         return schemas.Response(success=False, message="订阅不存在")
     # 避免更新缺失集数
@@ -114,50 +119,55 @@ def update_subscribe(
     # 是否手动修改过总集数
     if subscribe_in.total_episode != subscribe.total_episode:
         subscribe_dict["manual_total_episode"] = 1
-    subscribe.update(db, subscribe_dict)
+    # 更新到数据库
+    await subscribe.async_update(db, subscribe_dict)
+    # 重新获取更新后的订阅数据
+    updated_subscribe = await Subscribe.async_get(db, subscribe_in.id)
     # 发送订阅调整事件
-    eventmanager.send_event(EventType.SubscribeModified, {
-        "subscribe_id": subscribe.id,
+    await eventmanager.async_send_event(EventType.SubscribeModified, {
+        "subscribe_id": subscribe_in.id,
         "old_subscribe_info": old_subscribe_dict,
-        "subscribe_info": subscribe.to_dict(),
+        "subscribe_info": updated_subscribe.to_dict() if updated_subscribe else {},
     })
     return schemas.Response(success=True)
 
 
 @router.put("/status/{subid}", summary="更新订阅状态", response_model=schemas.Response)
-def update_subscribe_status(
+async def update_subscribe_status(
         subid: int,
         state: str,
-        db: Session = Depends(get_db),
+        db: AsyncSession = Depends(get_async_db),
         _: schemas.TokenPayload = Depends(verify_token)) -> Any:
     """
     更新订阅状态
     """
-    subscribe = Subscribe.get(db, subid)
+    subscribe = await Subscribe.async_get(db, subid)
     if not subscribe:
         return schemas.Response(success=False, message="订阅不存在")
     valid_states = ["R", "P", "S"]
     if state not in valid_states:
         return schemas.Response(success=False, message="无效的订阅状态")
     old_subscribe_dict = subscribe.to_dict()
-    subscribe.update(db, {
+    await subscribe.async_update(db, {
         "state": state
     })
+    # 重新获取更新后的订阅数据
+    updated_subscribe = await Subscribe.async_get(db, subid)
     # 发送订阅调整事件
-    eventmanager.send_event(EventType.SubscribeModified, {
-        "subscribe_id": subscribe.id,
+    await eventmanager.async_send_event(EventType.SubscribeModified, {
+        "subscribe_id": subid,
         "old_subscribe_info": old_subscribe_dict,
-        "subscribe_info": subscribe.to_dict(),
+        "subscribe_info": updated_subscribe.to_dict() if updated_subscribe else {},
     })
     return schemas.Response(success=True)
 
 
 @router.get("/media/{mediaid}", summary="查询订阅", response_model=schemas.Subscribe)
-def subscribe_mediaid(
+async def subscribe_mediaid(
         mediaid: str,
         season: Optional[int] = None,
         title: Optional[str] = None,
-        db: Session = Depends(get_db),
+        db: AsyncSession = Depends(get_async_db),
         _: schemas.TokenPayload = Depends(verify_token)) -> Any:
     """
     根据 TMDBID/豆瓣ID/BangumiId 查询订阅 tmdb:/douban:
@@ -167,23 +177,23 @@ def subscribe_mediaid(
         tmdbid = mediaid[5:]
         if not tmdbid or not str(tmdbid).isdigit():
             return Subscribe()
-        result = Subscribe.exists(db, tmdbid=int(tmdbid), season=season)
+        result = await Subscribe.async_exists(db, tmdbid=int(tmdbid), season=season)
     elif mediaid.startswith("douban:"):
         doubanid = mediaid[7:]
         if not doubanid:
             return Subscribe()
-        result = Subscribe.get_by_doubanid(db, doubanid)
+        result = await Subscribe.async_get_by_doubanid(db, doubanid)
         if not result and title:
             title_check = True
     elif mediaid.startswith("bangumi:"):
         bangumiid = mediaid[8:]
         if not bangumiid or not str(bangumiid).isdigit():
             return Subscribe()
-        result = Subscribe.get_by_bangumiid(db, int(bangumiid))
+        result = await Subscribe.async_get_by_bangumiid(db, int(bangumiid))
         if not result and title:
             title_check = True
     else:
-        result = Subscribe.get_by_mediaid(db, mediaid)
+        result = await Subscribe.async_get_by_mediaid(db, mediaid)
         if not result and title:
             title_check = True
     # 使用名称检查订阅
@@ -191,7 +201,7 @@ def subscribe_mediaid(
         meta = MetaInfo(title)
         if season:
             meta.begin_season = season
-        result = Subscribe.get_by_title(db, title=meta.name, season=meta.begin_season)
+        result = await Subscribe.async_get_by_title(db, title=meta.name, season=meta.begin_season)
 
     return result if result else Subscribe()
 
@@ -207,26 +217,30 @@ def refresh_subscribes(
 
 
 @router.get("/reset/{subid}", summary="重置订阅", response_model=schemas.Response)
-def reset_subscribes(
+async def reset_subscribes(
         subid: int,
-        db: Session = Depends(get_db),
+        db: AsyncSession = Depends(get_async_db),
         _: schemas.TokenPayload = Depends(verify_token)) -> Any:
     """
     重置订阅
     """
-    subscribe = Subscribe.get(db, subid)
+    subscribe = await Subscribe.async_get(db, subid)
     if subscribe:
+        # 在更新之前获取旧数据
         old_subscribe_dict = subscribe.to_dict()
-        subscribe.update(db, {
+        # 更新订阅
+        await subscribe.async_update(db, {
             "note": [],
             "lack_episode": subscribe.total_episode,
             "state": "R"
         })
+        # 重新获取更新后的订阅数据
+        updated_subscribe = await Subscribe.async_get(db, subid)
         # 发送订阅调整事件
-        eventmanager.send_event(EventType.SubscribeModified, {
-            "subscribe_id": subscribe.id,
+        await eventmanager.async_send_event(EventType.SubscribeModified, {
+            "subscribe_id": subid,
             "old_subscribe_info": old_subscribe_dict,
-            "subscribe_info": subscribe.to_dict(),
+            "subscribe_info": updated_subscribe.to_dict() if updated_subscribe else {},
         })
         return schemas.Response(success=True)
     return schemas.Response(success=False, message="订阅不存在")
@@ -243,7 +257,7 @@ def check_subscribes(
 
 
 @router.get("/search", summary="搜索所有订阅", response_model=schemas.Response)
-def search_subscribes(
+async def search_subscribes(
         background_tasks: BackgroundTasks,
         _: schemas.TokenPayload = Depends(verify_token)) -> Any:
     """
@@ -262,7 +276,7 @@ def search_subscribes(
 
 
 @router.get("/search/{subscribe_id}", summary="搜索订阅", response_model=schemas.Response)
-def search_subscribe(
+async def search_subscribe(
         subscribe_id: int,
         background_tasks: BackgroundTasks,
         _: schemas.TokenPayload = Depends(verify_token)) -> Any:
@@ -282,10 +296,10 @@ def search_subscribe(
 
 
 @router.delete("/media/{mediaid}", summary="删除订阅", response_model=schemas.Response)
-def delete_subscribe_by_mediaid(
+async def delete_subscribe_by_mediaid(
         mediaid: str,
         season: Optional[int] = None,
-        db: Session = Depends(get_db),
+        db: AsyncSession = Depends(get_async_db),
         _: schemas.TokenPayload = Depends(verify_token)
 ) -> Any:
     """
@@ -296,25 +310,28 @@ def delete_subscribe_by_mediaid(
         tmdbid = mediaid[5:]
         if not tmdbid or not str(tmdbid).isdigit():
             return schemas.Response(success=False)
-        subscribes = Subscribe().get_by_tmdbid(db, int(tmdbid), season)
+        subscribes = await Subscribe.async_get_by_tmdbid(db, int(tmdbid), season)
         delete_subscribes.extend(subscribes)
     elif mediaid.startswith("douban:"):
         doubanid = mediaid[7:]
         if not doubanid:
             return schemas.Response(success=False)
-        subscribe = Subscribe().get_by_doubanid(db, doubanid)
+        subscribe = await Subscribe.async_get_by_doubanid(db, doubanid)
         if subscribe:
             delete_subscribes.append(subscribe)
     else:
-        subscribe = Subscribe().get_by_mediaid(db, mediaid)
+        subscribe = await Subscribe.async_get_by_mediaid(db, mediaid)
         if subscribe:
             delete_subscribes.append(subscribe)
     for subscribe in delete_subscribes:
-        Subscribe().delete(db, subscribe.id)
+        # 在删除之前获取订阅信息
+        subscribe_info = subscribe.to_dict()
+        subscribe_id = subscribe.id
+        await Subscribe.async_delete(db, subscribe_id)
         # 发送事件
-        eventmanager.send_event(EventType.SubscribeDeleted, {
-            "subscribe_id": subscribe.id,
-            "subscribe_info": subscribe.to_dict()
+        await eventmanager.async_send_event(EventType.SubscribeDeleted, {
+            "subscribe_id": subscribe_id,
+            "subscribe_info": subscribe_info
         })
     return schemas.Response(success=True)
 
@@ -373,33 +390,33 @@ async def seerr_subscribe(request: Request, background_tasks: BackgroundTasks,
 
 
 @router.get("/history/{mtype}", summary="查询订阅历史", response_model=List[schemas.Subscribe])
-def subscribe_history(
+async def subscribe_history(
         mtype: str,
         page: Optional[int] = 1,
         count: Optional[int] = 30,
-        db: Session = Depends(get_db),
+        db: AsyncSession = Depends(get_async_db),
         _: schemas.TokenPayload = Depends(verify_token)) -> Any:
     """
     查询电影/电视剧订阅历史
     """
-    return SubscribeHistory.list_by_type(db, mtype=mtype, page=page, count=count)
+    return await SubscribeHistory.async_list_by_type(db, mtype=mtype, page=page, count=count)
 
 
 @router.delete("/history/{history_id}", summary="删除订阅历史", response_model=schemas.Response)
-def delete_subscribe(
+async def delete_subscribe(
         history_id: int,
-        db: Session = Depends(get_db),
+        db: AsyncSession = Depends(get_async_db),
         _: schemas.TokenPayload = Depends(verify_token)
 ) -> Any:
     """
     删除订阅历史
     """
-    SubscribeHistory.delete(db, history_id)
+    await SubscribeHistory.async_delete(db, history_id)
     return schemas.Response(success=True)
 
 
 @router.get("/popular", summary="热门订阅（基于用户共享数据）", response_model=List[schemas.MediaInfo])
-def popular_subscribes(
+async def popular_subscribes(
         stype: str,
         page: Optional[int] = 1,
         count: Optional[int] = 30,
@@ -408,7 +425,7 @@ def popular_subscribes(
     """
     查询热门订阅
     """
-    subscribes = SubscribeHelper().get_statistic(stype=stype, page=page, count=count)
+    subscribes = await SubscribeHelper().async_get_statistic(stype=stype, page=page, count=count)
     if subscribes:
         ret_medias = []
         for sub in subscribes:
@@ -444,14 +461,14 @@ def popular_subscribes(
 
 
 @router.get("/user/{username}", summary="用户订阅", response_model=List[schemas.Subscribe])
-def user_subscribes(
+async def user_subscribes(
         username: str,
-        db: Session = Depends(get_db),
+        db: AsyncSession = Depends(get_async_db),
         _: schemas.TokenPayload = Depends(verify_token)) -> Any:
     """
     查询用户订阅
     """
-    return Subscribe.list_by_username(db, username)
+    return await Subscribe.async_list_by_username(db, username)
 
 
 @router.get("/files/{subscribe_id}", summary="订阅相关文件信息", response_model=schemas.SubscrbieInfo)
@@ -469,34 +486,34 @@ def subscribe_files(
 
 
 @router.post("/share", summary="分享订阅", response_model=schemas.Response)
-def subscribe_share(
+async def subscribe_share(
         sub: schemas.SubscribeShare,
         _: schemas.TokenPayload = Depends(verify_token)) -> Any:
     """
     分享订阅
     """
-    state, errmsg = SubscribeHelper().sub_share(subscribe_id=sub.subscribe_id,
-                                                share_title=sub.share_title,
-                                                share_comment=sub.share_comment,
-                                                share_user=sub.share_user)
+    state, errmsg = await SubscribeHelper().async_sub_share(subscribe_id=sub.subscribe_id,
+                                                            share_title=sub.share_title,
+                                                            share_comment=sub.share_comment,
+                                                            share_user=sub.share_user)
     return schemas.Response(success=state, message=errmsg)
 
 
 @router.delete("/share/{share_id}", summary="删除分享", response_model=schemas.Response)
-def subscribe_share_delete(
+async def subscribe_share_delete(
         share_id: int,
         _: schemas.TokenPayload = Depends(verify_token)) -> Any:
     """
     删除分享
     """
-    state, errmsg = SubscribeHelper().share_delete(share_id=share_id)
+    state, errmsg = await SubscribeHelper().async_share_delete(share_id=share_id)
     return schemas.Response(success=state, message=errmsg)
 
 
 @router.post("/fork", summary="复用订阅", response_model=schemas.Response)
-def subscribe_fork(
+async def subscribe_fork(
         sub: schemas.SubscribeShare,
-        current_user: User = Depends(get_current_active_user)) -> Any:
+        current_user: User = Depends(get_current_active_user_async)) -> Any:
     """
     复用订阅
     """
@@ -505,15 +522,15 @@ def subscribe_fork(
     for key in list(sub_dict.keys()):
         if not hasattr(schemas.Subscribe(), key):
             sub_dict.pop(key)
-    result = create_subscribe(subscribe_in=schemas.Subscribe(**sub_dict),
-                              current_user=current_user)
+    result = await create_subscribe(subscribe_in=schemas.Subscribe(**sub_dict),
+                                    current_user=current_user)
     if result.success:
-        SubscribeHelper().sub_fork(share_id=sub.id)
+        await SubscribeHelper().async_sub_fork(share_id=sub.id)
     return result
 
 
 @router.get("/follow", summary="查询已Follow的订阅分享人", response_model=List[str])
-def followed_subscribers(_: schemas.TokenPayload = Depends(verify_token)) -> Any:
+async def followed_subscribers(_: schemas.TokenPayload = Depends(verify_token)) -> Any:
     """
     查询已Follow的订阅分享人
     """
@@ -521,7 +538,7 @@ def followed_subscribers(_: schemas.TokenPayload = Depends(verify_token)) -> Any
 
 
 @router.post("/follow", summary="Follow订阅分享人", response_model=schemas.Response)
-def follow_subscriber(
+async def follow_subscriber(
         share_uid: Optional[str] = None,
         _: schemas.TokenPayload = Depends(verify_token)) -> Any:
     """
@@ -530,12 +547,12 @@ def follow_subscriber(
     subscribers = SystemConfigOper().get(SystemConfigKey.FollowSubscribers) or []
     if share_uid and share_uid not in subscribers:
         subscribers.append(share_uid)
-        SystemConfigOper().set(SystemConfigKey.FollowSubscribers, subscribers)
+        await SystemConfigOper().async_set(SystemConfigKey.FollowSubscribers, subscribers)
     return schemas.Response(success=True)
 
 
 @router.delete("/follow", summary="取消Follow订阅分享人", response_model=schemas.Response)
-def unfollow_subscriber(
+async def unfollow_subscriber(
         share_uid: Optional[str] = None,
         _: schemas.TokenPayload = Depends(verify_token)) -> Any:
     """
@@ -544,12 +561,12 @@ def unfollow_subscriber(
     subscribers = SystemConfigOper().get(SystemConfigKey.FollowSubscribers) or []
     if share_uid and share_uid in subscribers:
         subscribers.remove(share_uid)
-        SystemConfigOper().set(SystemConfigKey.FollowSubscribers, subscribers)
+        await SystemConfigOper().async_set(SystemConfigKey.FollowSubscribers, subscribers)
     return schemas.Response(success=True)
 
 
 @router.get("/shares", summary="查询分享的订阅", response_model=List[schemas.SubscribeShare])
-def popular_subscribes(
+async def popular_subscribes(
         name: Optional[str] = None,
         page: Optional[int] = 1,
         count: Optional[int] = 30,
@@ -557,38 +574,49 @@ def popular_subscribes(
     """
     查询分享的订阅
     """
-    return SubscribeHelper().get_shares(name=name, page=page, count=count)
+    return await SubscribeHelper().async_get_shares(name=name, page=page, count=count)
+
+
+@router.get("/share/statistics", summary="查询订阅分享统计", response_model=List[schemas.SubscribeShareStatistics])
+async def subscribe_share_statistics(_: schemas.TokenPayload = Depends(verify_token)) -> Any:
+    """
+    查询订阅分享统计
+    返回每个分享人分享的媒体数量以及总的复用人次
+    """
+    return await SubscribeHelper().async_get_share_statistics()
 
 
 @router.get("/{subscribe_id}", summary="订阅详情", response_model=schemas.Subscribe)
-def read_subscribe(
+async def read_subscribe(
         subscribe_id: int,
-        db: Session = Depends(get_db),
+        db: AsyncSession = Depends(get_async_db),
         _: schemas.TokenPayload = Depends(verify_token)) -> Any:
     """
     根据订阅编号查询订阅信息
     """
     if not subscribe_id:
         return Subscribe()
-    return Subscribe.get(db, subscribe_id)
+    return await Subscribe.async_get(db, subscribe_id)
 
 
 @router.delete("/{subscribe_id}", summary="删除订阅", response_model=schemas.Response)
-def delete_subscribe(
+async def delete_subscribe(
         subscribe_id: int,
-        db: Session = Depends(get_db),
+        db: AsyncSession = Depends(get_async_db),
         _: schemas.TokenPayload = Depends(verify_token)
 ) -> Any:
     """
     删除订阅信息
     """
-    subscribe = Subscribe.get(db, subscribe_id)
+    subscribe = await Subscribe.async_get(db, subscribe_id)
     if subscribe:
-        subscribe.delete(db, subscribe_id)
+        # 在删除之前获取订阅信息
+        subscribe_info = subscribe.to_dict()
+        await Subscribe.async_delete(db, subscribe_id)
         # 发送事件
-        eventmanager.send_event(EventType.SubscribeDeleted, {
+        await eventmanager.async_send_event(EventType.SubscribeDeleted, {
             "subscribe_id": subscribe_id,
-            "subscribe_info": subscribe.to_dict()
+            "subscribe_info": subscribe_info
         })
         # 统计订阅
         SubscribeHelper().sub_done_async({

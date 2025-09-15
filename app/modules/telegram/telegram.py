@@ -20,11 +20,17 @@ from app.utils.http import RequestUtils
 from app.utils.string import StringUtils
 
 
+class RetryException(Exception):
+    pass
+
+
 class Telegram:
     _ds_url = f"http://127.0.0.1:{settings.PORT}/api/v1/message?token={settings.API_TOKEN}"
     _event = Event()
     _bot: telebot.TeleBot = None
     _callback_handlers: Dict[str, Callable] = {}  # 存储回调处理器
+    _user_chat_mapping: Dict[str, str] = {}  # userid -> chat_id mapping for reply targeting
+    _bot_username: Optional[str] = None  # Bot username for mention detection
 
     def __init__(self, TELEGRAM_TOKEN: Optional[str] = None, TELEGRAM_CHAT_ID: Optional[str] = None, **kwargs):
         """
@@ -49,6 +55,15 @@ class Telegram:
             _bot = telebot.TeleBot(self._telegram_token, parse_mode="Markdown")
             # 记录句柄
             self._bot = _bot
+            # 获取并存储bot用户名用于@检测
+            try:
+                bot_info = _bot.get_me()
+                self._bot_username = bot_info.username
+                logger.info(f"Telegram bot用户名: @{self._bot_username}")
+            except Exception as e:
+                logger.error(f"获取bot信息失败: {e}")
+                self._bot_username = None
+
             # 标记渠道来源
             if kwargs.get("name"):
                 self._ds_url = f"{self._ds_url}&source={kwargs.get('name')}"
@@ -59,7 +74,12 @@ class Telegram:
 
             @_bot.message_handler(func=lambda message: True)
             def echo_all(message):
-                RequestUtils(timeout=15).post_res(self._ds_url, json=message.json)
+                # Update user-chat mapping when receiving messages
+                self._update_user_chat_mapping(message.from_user.id, message.chat.id)
+
+                # Check if we should process this message
+                if self._should_process_message(message):
+                    RequestUtils(timeout=15).post_res(self._ds_url, json=message.json)
 
             @_bot.callback_query_handler(func=lambda call: True)
             def callback_query(call):
@@ -67,6 +87,9 @@ class Telegram:
                 处理按钮点击回调
                 """
                 try:
+                    # Update user-chat mapping for callbacks too
+                    self._update_user_chat_mapping(call.from_user.id, call.message.chat.id)
+
                     # 解析回调数据
                     callback_data = call.data
                     user_id = str(call.from_user.id)
@@ -94,8 +117,8 @@ class Telegram:
                     # 发送给主程序处理
                     RequestUtils(timeout=15).post_res(self._ds_url, json=callback_json)
 
-                except Exception as e:
-                    logger.error(f"处理按钮回调失败：{str(e)}")
+                except Exception as err:
+                    logger.error(f"处理按钮回调失败：{str(err)}")
                     _bot.answer_callback_query(call.id, "处理失败，请重试")
 
             def run_polling():
@@ -111,6 +134,76 @@ class Telegram:
             self._polling_thread = threading.Thread(target=run_polling, daemon=True)
             self._polling_thread.start()
             logger.info("Telegram消息接收服务启动")
+
+    @property
+    def bot_username(self) -> Optional[str]:
+        """
+        获取Bot用户名
+        :return: Bot用户名或None
+        """
+        return self._bot_username
+
+    def _update_user_chat_mapping(self, userid: int, chat_id: int) -> None:
+        """
+        更新用户与聊天的映射关系
+        :param userid: 用户ID
+        :param chat_id: 聊天ID
+        """
+        if userid and chat_id:
+            self._user_chat_mapping[str(userid)] = str(chat_id)
+
+    def _get_user_chat_id(self, userid: str) -> Optional[str]:
+        """
+        获取用户对应的聊天ID
+        :param userid: 用户ID
+        :return: 聊天ID或None
+        """
+        return self._user_chat_mapping.get(str(userid)) if userid else None
+
+    def _should_process_message(self, message) -> bool:
+        """
+        判断是否应该处理这条消息
+        :param message: Telegram消息对象
+        :return: 是否处理
+        """
+        # 私聊消息总是处理
+        if message.chat.type == 'private':
+            logger.debug(f"处理私聊消息：用户 {message.from_user.id}")
+            return True
+
+        # 群聊中的命令消息总是处理（以/开头）
+        if message.text and message.text.startswith('/'):
+            logger.debug(f"处理群聊命令消息：{message.text[:20]}...")
+            return True
+
+        # 群聊中检查是否@了机器人
+        if message.chat.type in ['group', 'supergroup']:
+            if not self._bot_username:
+                # 如果没有获取到bot用户名，为了安全起见处理所有消息
+                logger.debug("未获取到bot用户名，处理所有群聊消息")
+                return True
+
+            # 检查消息文本中是否包含@bot_username
+            if message.text and f"@{self._bot_username}" in message.text:
+                logger.debug(f"检测到@{self._bot_username}，处理群聊消息")
+                return True
+
+            # 检查消息实体中是否有提及bot
+            if message.entities:
+                for entity in message.entities:
+                    if entity.type == 'mention':
+                        mention_text = message.text[entity.offset:entity.offset + entity.length]
+                        if mention_text == f"@{self._bot_username}":
+                            logger.debug(f"通过实体检测到@{self._bot_username}，处理群聊消息")
+                            return True
+
+            # 群聊中没有@机器人，不处理
+            logger.debug(f"群聊消息未@机器人，跳过处理：{message.text[:30] if message.text else 'No text'}...")
+            return False
+
+        # 其他类型的聊天默认处理
+        logger.debug(f"处理其他类型聊天消息：{message.chat.type}")
+        return True
 
     def get_state(self) -> bool:
         """
@@ -153,10 +246,8 @@ class Telegram:
             if link:
                 caption = f"{caption}\n[查看详情]({link})"
 
-            if userid:
-                chat_id = userid
-            else:
-                chat_id = self._telegram_chat_id
+            # Determine target chat_id with improved logic using user mapping
+            chat_id = self._determine_target_chat_id(userid, original_chat_id)
 
             # 创建按钮键盘
             reply_markup = None
@@ -174,6 +265,29 @@ class Telegram:
         except Exception as msg_e:
             logger.error(f"发送消息失败：{msg_e}")
             return False
+
+    def _determine_target_chat_id(self, userid: Optional[str] = None,
+                                  original_chat_id: Optional[str] = None) -> str:
+        """
+        确定目标聊天ID，使用用户映射确保回复到正确的聊天
+        :param userid: 用户ID
+        :param original_chat_id: 原消息的聊天ID
+        :return: 目标聊天ID
+        """
+        # 1. 优先使用原消息的聊天ID (编辑消息场景)
+        if original_chat_id:
+            return original_chat_id
+
+        # 2. 如果有userid，尝试从映射中获取用户的聊天ID
+        if userid:
+            mapped_chat_id = self._get_user_chat_id(userid)
+            if mapped_chat_id:
+                return mapped_chat_id
+            # 如果映射中没有，回退到使用userid作为聊天ID (私聊场景)
+            return userid
+
+        # 3. 最后使用默认聊天ID
+        return self._telegram_chat_id
 
     def send_medias_msg(self, medias: List[MediaInfo], userid: Optional[str] = None,
                         title: Optional[str] = None, link: Optional[str] = None,
@@ -216,10 +330,8 @@ class Telegram:
             if link:
                 caption = f"{caption}\n[查看详情]({link})"
 
-            if userid:
-                chat_id = userid
-            else:
-                chat_id = self._telegram_chat_id
+            # Determine target chat_id with improved logic using user mapping
+            chat_id = self._determine_target_chat_id(userid, original_chat_id)
 
             # 创建按钮键盘
             reply_markup = None
@@ -278,10 +390,8 @@ class Telegram:
             if link:
                 caption = f"{caption}\n[查看详情]({link})"
 
-            if userid:
-                chat_id = userid
-            else:
-                chat_id = self._telegram_chat_id
+            # Determine target chat_id with improved logic using user mapping
+            chat_id = self._determine_target_chat_id(userid, original_chat_id)
 
             # 创建按钮键盘
             reply_markup = None
@@ -410,7 +520,7 @@ class Telegram:
             logger.error(f"编辑消息失败：{str(e)}")
             return False
 
-    @retry(Exception, logger=logger)
+    @retry(RetryException, logger=logger)
     def __send_request(self, userid: Optional[str] = None, image="", caption="",
                        reply_markup: Optional[InlineKeyboardMarkup] = None) -> bool:
         """
@@ -418,7 +528,7 @@ class Telegram:
         :param reply_markup: 内联键盘
         """
         if image:
-            res = RequestUtils(proxies=settings.PROXY, ua=settings.USER_AGENT).get_res(image)
+            res = RequestUtils(proxies=settings.PROXY, ua=settings.NORMAL_USER_AGENT).get_res(image)
             if res is None:
                 raise Exception("获取图片失败")
             if res.content:
@@ -435,7 +545,7 @@ class Telegram:
                                            parse_mode="Markdown",
                                            reply_markup=reply_markup)
                 if ret is None:
-                    raise Exception("发送图片消息失败")
+                    raise RetryException("发送图片消息失败")
                 return True
         # 按4096分段循环发送消息
         ret = None
@@ -451,7 +561,7 @@ class Telegram:
                                          parse_mode="Markdown",
                                          reply_markup=reply_markup)
         if ret is None:
-            raise Exception("发送文本消息失败")
+            raise RetryException("发送文本消息失败")
         return True if ret else False
 
     def register_commands(self, commands: Dict[str, dict]):

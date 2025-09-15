@@ -1,4 +1,5 @@
 import copy
+import inspect
 import pickle
 import traceback
 from abc import ABCMeta
@@ -6,9 +7,11 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Optional, Any, Tuple, List, Set, Union, Dict
 
+from fastapi.concurrency import run_in_threadpool
 from qbittorrentapi import TorrentFilesList
 from transmission_rpc import File
 
+from app.core.cache import FileCache, AsyncFileCache
 from app.core.config import settings
 from app.core.context import Context, MediaInfo, TorrentInfo
 from app.core.event import EventManager
@@ -43,58 +46,127 @@ class ChainBase(metaclass=ABCMeta):
             send_callback=self.run_module
         )
         self.pluginmanager = PluginManager()
+        self.filecache = FileCache()
+        self.async_filecache = AsyncFileCache()
 
-    @staticmethod
-    def load_cache(filename: str) -> Any:
+    def load_cache(self, filename: str) -> Any:
         """
-        从本地加载缓存
+        加载缓存
         """
-        cache_path = settings.TEMP_PATH / filename
-        if cache_path.exists():
-            try:
-                with open(cache_path, 'rb') as f:
-                    return pickle.load(f)
-            except Exception as err:
-                logger.error(f"加载缓存 {filename} 出错：{str(err)}")
-        return None
+        content = self.filecache.get(filename)
+        if not content:
+            return None
+        try:
+            return pickle.loads(content)
+        except Exception as err:
+            logger.error(f"加载缓存 {filename} 出错：{str(err)}")
+            return None
 
-    @staticmethod
-    def save_cache(cache: Any, filename: str) -> None:
+    async def async_load_cache(self, filename: str) -> Any:
         """
-        保存缓存到本地
+        异步加载缓存
+        """
+        content = await self.async_filecache.get(filename)
+        if not content:
+            return None
+        try:
+            return pickle.loads(content)
+        except Exception as err:
+            logger.error(f"异步加载缓存 {filename} 出错：{str(err)}")
+            return None
+
+    async def async_save_cache(self, cache: Any, filename: str) -> None:
+        """
+        异步保存缓存
         """
         try:
-            with open(settings.TEMP_PATH / filename, 'wb') as f:
-                pickle.dump(cache, f)  # noqa
+            await self.async_filecache.set(filename, pickle.dumps(cache))
+        except Exception as err:
+            logger.error(f"异步保存缓存 {filename} 出错：{str(err)}")
+            return
+
+    def save_cache(self, cache: Any, filename: str) -> None:
+        """
+        保存缓存
+        """
+        try:
+            self.filecache.set(filename, pickle.dumps(cache))
         except Exception as err:
             logger.error(f"保存缓存 {filename} 出错：{str(err)}")
+            return
+
+    def remove_cache(self, filename: str) -> None:
+        """
+        删除缓存，同时删除Redis和本地缓存
+        """
+        self.filecache.delete(filename)
+
+    async def async_remove_cache(self, filename: str) -> None:
+        """
+        异步删除缓存，同时删除Redis和本地缓存
+        """
+        await self.async_filecache.delete(filename)
 
     @staticmethod
-    def remove_cache(filename: str) -> None:
+    def __is_valid_empty(ret):
         """
-        删除本地缓存
+        判断结果是否为空
         """
-        cache_path = settings.TEMP_PATH / filename
-        if cache_path.exists():
-            cache_path.unlink()
+        if isinstance(ret, tuple):
+            return all(value is None for value in ret)
+        else:
+            return ret is None
 
-    def run_module(self, method: str, *args, **kwargs) -> Any:
+    def __handle_plugin_error(self, err: Exception, plugin_id: str, plugin_name: str, method: str, **kwargs):
         """
-        运行包含该方法的所有模块，然后返回结果
-        当kwargs包含命名参数raise_exception时，如模块方法抛出异常且raise_exception为True，则同步抛出异常
+        处理插件模块执行错误
         """
+        if kwargs.get("raise_exception"):
+            raise
+        logger.error(
+            f"运行插件 {plugin_id} 模块 {method} 出错：{str(err)}\n{traceback.format_exc()}")
+        self.messagehelper.put(title=f"{plugin_name} 发生了错误",
+                               message=str(err),
+                               role="plugin")
+        self.eventmanager.send_event(
+            EventType.SystemError,
+            {
+                "type": "plugin",
+                "plugin_id": plugin_id,
+                "plugin_name": plugin_name,
+                "plugin_method": method,
+                "error": str(err),
+                "traceback": traceback.format_exc()
+            }
+        )
 
-        def is_result_empty(ret):
-            """
-            判断结果是否为空
-            """
-            if isinstance(ret, tuple):
-                return all(value is None for value in ret)
-            else:
-                return ret is None
+    def __handle_system_error(self, err: Exception, module_id: str, module_name: str, method: str, **kwargs):
+        """
+        处理系统模块执行错误
+        """
+        if kwargs.get("raise_exception"):
+            raise
+        logger.error(
+            f"运行模块 {module_id}.{method} 出错：{str(err)}\n{traceback.format_exc()}")
+        self.messagehelper.put(title=f"{module_name}发生了错误",
+                               message=str(err),
+                               role="system")
+        self.eventmanager.send_event(
+            EventType.SystemError,
+            {
+                "type": "module",
+                "module_id": module_id,
+                "module_name": module_name,
+                "module_method": method,
+                "error": str(err),
+                "traceback": traceback.format_exc()
+            }
+        )
 
-        result = None
-        # 插件模块
+    def __execute_plugin_modules(self, method: str, result: Any, *args, **kwargs) -> Any:
+        """
+        执行插件模块
+        """
         for plugin, module_dict in self.pluginmanager.get_plugin_modules().items():
             plugin_id, plugin_name = plugin
             if method in module_dict:
@@ -102,7 +174,7 @@ class ChainBase(metaclass=ABCMeta):
                 if func:
                     try:
                         logger.info(f"请求插件 {plugin_name} 执行：{method} ...")
-                        if is_result_empty(result):
+                        if self.__is_valid_empty(result):
                             # 返回None，第一次执行或者需继续执行下一模块
                             result = func(*args, **kwargs)
                         elif isinstance(result, list):
@@ -113,29 +185,46 @@ class ChainBase(metaclass=ABCMeta):
                         else:
                             break
                     except Exception as err:
-                        if kwargs.get("raise_exception"):
-                            raise
-                        logger.error(
-                            f"运行插件 {plugin_id} 模块 {method} 出错：{str(err)}\n{traceback.format_exc()}")
-                        self.messagehelper.put(title=f"{plugin_name} 发生了错误",
-                                               message=str(err),
-                                               role="plugin")
-                        self.eventmanager.send_event(
-                            EventType.SystemError,
-                            {
-                                "type": "plugin",
-                                "plugin_id": plugin_id,
-                                "plugin_name": plugin_name,
-                                "plugin_method": method,
-                                "error": str(err),
-                                "traceback": traceback.format_exc()
-                            }
-                        )
-        if not is_result_empty(result) and not isinstance(result, list):
-            # 插件模块返回结果不为空且不是列表，直接返回
-            return result
+                        self.__handle_plugin_error(err, plugin_id, plugin_name, method, **kwargs)
+        return result
 
-        # 系统模块
+    async def __async_execute_plugin_modules(self, method: str, result: Any, *args, **kwargs) -> Any:
+        """
+        异步执行插件模块
+        """
+        for plugin, module_dict in self.pluginmanager.get_plugin_modules().items():
+            plugin_id, plugin_name = plugin
+            if method in module_dict:
+                func = module_dict[method]
+                if func:
+                    try:
+                        logger.info(f"请求插件 {plugin_name} 执行：{method} ...")
+                        if self.__is_valid_empty(result):
+                            # 返回None，第一次执行或者需继续执行下一模块
+                            if inspect.iscoroutinefunction(func):
+                                result = await func(*args, **kwargs)
+                            else:
+                                # 插件同步函数在异步环境中运行，避免阻塞
+                                result = await run_in_threadpool(func, *args, **kwargs)
+                        elif isinstance(result, list):
+                            # 返回为列表，有多个模块运行结果时进行合并
+                            if inspect.iscoroutinefunction(func):
+                                temp = await func(*args, **kwargs)
+                            else:
+                                # 插件同步函数在异步环境中运行，避免阻塞
+                                temp = await run_in_threadpool(func, *args, **kwargs)
+                            if isinstance(temp, list):
+                                result.extend(temp)
+                        else:
+                            break
+                    except Exception as err:
+                        self.__handle_plugin_error(err, plugin_id, plugin_name, method, **kwargs)
+        return result
+
+    def __execute_system_modules(self, method: str, result: Any, *args, **kwargs) -> Any:
+        """
+        执行系统模块
+        """
         logger.debug(f"请求系统模块执行：{method} ...")
         for module in sorted(self.modulemanager.get_running_modules(method), key=lambda x: x.get_priority()):
             module_id = module.__class__.__name__
@@ -146,7 +235,7 @@ class ChainBase(metaclass=ABCMeta):
                 module_name = module_id
             try:
                 func = getattr(module, method)
-                if is_result_empty(result):
+                if self.__is_valid_empty(result):
                     # 返回None，第一次执行或者需继续执行下一模块
                     result = func(*args, **kwargs)
                 elif ObjectUtils.check_signature(func, result):
@@ -161,25 +250,84 @@ class ChainBase(metaclass=ABCMeta):
                     # 中止继续执行
                     break
             except Exception as err:
-                if kwargs.get("raise_exception"):
-                    raise
-                logger.error(
-                    f"运行模块 {module_id}.{method} 出错：{str(err)}\n{traceback.format_exc()}")
-                self.messagehelper.put(title=f"{module_name}发生了错误",
-                                       message=str(err),
-                                       role="system")
-                self.eventmanager.send_event(
-                    EventType.SystemError,
-                    {
-                        "type": "module",
-                        "module_id": module_id,
-                        "module_name": module_name,
-                        "module_method": method,
-                        "error": str(err),
-                        "traceback": traceback.format_exc()
-                    }
-                )
+                self.__handle_system_error(err, module_id, module_name, method, **kwargs)
         return result
+
+    async def __async_execute_system_modules(self, method: str, result: Any, *args, **kwargs) -> Any:
+        """
+        异步执行系统模块
+        """
+        logger.debug(f"请求系统模块执行：{method} ...")
+        for module in sorted(self.modulemanager.get_running_modules(method), key=lambda x: x.get_priority()):
+            module_id = module.__class__.__name__
+            try:
+                module_name = module.get_name()
+            except Exception as err:
+                logger.debug(f"获取模块名称出错：{str(err)}")
+                module_name = module_id
+            try:
+                func = getattr(module, method)
+                if self.__is_valid_empty(result):
+                    # 返回None，第一次执行或者需继续执行下一模块
+                    if inspect.iscoroutinefunction(func):
+                        result = await func(*args, **kwargs)
+                    else:
+                        result = func(*args, **kwargs)
+                elif ObjectUtils.check_signature(func, result):
+                    # 返回结果与方法签名一致，将结果传入
+                    if inspect.iscoroutinefunction(func):
+                        result = await func(result)
+                    else:
+                        result = func(result)
+                elif isinstance(result, list):
+                    # 返回为列表，有多个模块运行结果时进行合并
+                    if inspect.iscoroutinefunction(func):
+                        temp = await func(*args, **kwargs)
+                    else:
+                        temp = func(*args, **kwargs)
+                    if isinstance(temp, list):
+                        result.extend(temp)
+                else:
+                    # 中止继续执行
+                    break
+            except Exception as err:
+                self.__handle_system_error(err, module_id, module_name, method, **kwargs)
+        return result
+
+    def run_module(self, method: str, *args, **kwargs) -> Any:
+        """
+        运行包含该方法的所有模块，然后返回结果
+        当kwargs包含命名参数raise_exception时，如模块方法抛出异常且raise_exception为True，则同步抛出异常
+        """
+        result = None
+
+        # 执行插件模块
+        result = self.__execute_plugin_modules(method, result, *args, **kwargs)
+
+        if not self.__is_valid_empty(result) and not isinstance(result, list):
+            # 插件模块返回结果不为空且不是列表，直接返回
+            return result
+
+        # 执行系统模块
+        return self.__execute_system_modules(method, result, *args, **kwargs)
+
+    async def async_run_module(self, method: str, *args, **kwargs) -> Any:
+        """
+        异步运行包含该方法的所有模块，然后返回结果
+        当kwargs包含命名参数raise_exception时，如模块方法抛出异常且raise_exception为True，则同步抛出异常
+        支持异步和同步方法的混合调用
+        """
+        result = None
+
+        # 执行插件模块
+        result = await self.__async_execute_plugin_modules(method, result, *args, **kwargs)
+
+        if not self.__is_valid_empty(result) and not isinstance(result, list):
+            # 插件模块返回结果不为空且不是列表，直接返回
+            return result
+
+        # 执行系统模块
+        return await self.__async_execute_system_modules(method, result, *args, **kwargs)
 
     def recognize_media(self, meta: MetaBase = None,
                         mtype: Optional[MediaType] = None,
@@ -214,6 +362,39 @@ class ChainBase(metaclass=ABCMeta):
                                tmdbid=tmdbid, doubanid=doubanid, bangumiid=bangumiid,
                                episode_group=episode_group, cache=cache)
 
+    async def async_recognize_media(self, meta: MetaBase = None,
+                                    mtype: Optional[MediaType] = None,
+                                    tmdbid: Optional[int] = None,
+                                    doubanid: Optional[str] = None,
+                                    bangumiid: Optional[int] = None,
+                                    episode_group: Optional[str] = None,
+                                    cache: bool = True) -> Optional[MediaInfo]:
+        """
+        识别媒体信息，不含Fanart图片（异步版本）
+        :param meta:     识别的元数据
+        :param mtype:    识别的媒体类型，与tmdbid配套
+        :param tmdbid:   tmdbid
+        :param doubanid: 豆瓣ID
+        :param bangumiid: BangumiID
+        :param episode_group: 剧集组
+        :param cache:    是否使用缓存
+        :return: 识别的媒体信息，包括剧集信息
+        """
+        # 识别用名中含指定信息情形
+        if not mtype and meta and meta.type in [MediaType.TV, MediaType.MOVIE]:
+            mtype = meta.type
+        if not tmdbid and hasattr(meta, "tmdbid"):
+            tmdbid = meta.tmdbid
+        if not doubanid and hasattr(meta, "doubanid"):
+            doubanid = meta.doubanid
+        # 有tmdbid时不使用其它ID
+        if tmdbid:
+            doubanid = None
+            bangumiid = None
+        return await self.async_run_module("async_recognize_media", meta=meta, mtype=mtype,
+                                           tmdbid=tmdbid, doubanid=doubanid, bangumiid=bangumiid,
+                                           episode_group=episode_group, cache=cache)
+
     def match_doubaninfo(self, name: str, imdbid: Optional[str] = None,
                          mtype: Optional[MediaType] = None, year: Optional[str] = None, season: Optional[int] = None,
                          raise_exception: bool = False) -> Optional[dict]:
@@ -229,6 +410,22 @@ class ChainBase(metaclass=ABCMeta):
         return self.run_module("match_doubaninfo", name=name, imdbid=imdbid,
                                mtype=mtype, year=year, season=season, raise_exception=raise_exception)
 
+    async def async_match_doubaninfo(self, name: str, imdbid: Optional[str] = None,
+                                     mtype: Optional[MediaType] = None, year: Optional[str] = None,
+                                     season: Optional[int] = None,
+                                     raise_exception: bool = False) -> Optional[dict]:
+        """
+        搜索和匹配豆瓣信息（异步版本）
+        :param name: 标题
+        :param imdbid: imdbid
+        :param mtype: 类型
+        :param year: 年份
+        :param season: 季
+        :param raise_exception: 触发速率限制时是否抛出异常
+        """
+        return await self.async_run_module("async_match_doubaninfo", name=name, imdbid=imdbid,
+                                           mtype=mtype, year=year, season=season, raise_exception=raise_exception)
+
     def match_tmdbinfo(self, name: str, mtype: Optional[MediaType] = None,
                        year: Optional[str] = None, season: Optional[int] = None) -> Optional[dict]:
         """
@@ -241,6 +438,18 @@ class ChainBase(metaclass=ABCMeta):
         return self.run_module("match_tmdbinfo", name=name,
                                mtype=mtype, year=year, season=season)
 
+    async def async_match_tmdbinfo(self, name: str, mtype: Optional[MediaType] = None,
+                                   year: Optional[str] = None, season: Optional[int] = None) -> Optional[dict]:
+        """
+        搜索和匹配TMDB信息（异步版本）
+        :param name: 标题
+        :param mtype: 类型
+        :param year: 年份
+        :param season: 季
+        """
+        return await self.async_run_module("async_match_tmdbinfo", name=name,
+                                           mtype=mtype, year=year, season=season)
+
     def obtain_images(self, mediainfo: MediaInfo) -> Optional[MediaInfo]:
         """
         补充抓取媒体信息图片
@@ -248,6 +457,14 @@ class ChainBase(metaclass=ABCMeta):
         :return: 更新后的媒体信息
         """
         return self.run_module("obtain_images", mediainfo=mediainfo)
+
+    async def async_obtain_images(self, mediainfo: MediaInfo) -> Optional[MediaInfo]:
+        """
+        补充抓取媒体信息图片（异步版本）
+        :param mediainfo:  识别的媒体信息
+        :return: 更新后的媒体信息
+        """
+        return await self.async_run_module("async_obtain_images", mediainfo=mediainfo)
 
     def obtain_specific_image(self, mediaid: Union[str, int], mtype: MediaType,
                               image_type: MediaImageType, image_prefix: Optional[str] = None,
@@ -276,6 +493,18 @@ class ChainBase(metaclass=ABCMeta):
         """
         return self.run_module("douban_info", doubanid=doubanid, mtype=mtype, raise_exception=raise_exception)
 
+    async def async_douban_info(self, doubanid: str, mtype: Optional[MediaType] = None,
+                                raise_exception: bool = False) -> Optional[dict]:
+        """
+        获取豆瓣信息（异步版本）
+        :param doubanid: 豆瓣ID
+        :param mtype: 媒体类型
+        :return: 豆瓣信息
+        :param raise_exception: 触发速率限制时是否抛出异常
+        """
+        return await self.async_run_module("async_douban_info", doubanid=doubanid, mtype=mtype,
+                                           raise_exception=raise_exception)
+
     def tvdb_info(self, tvdbid: int) -> Optional[dict]:
         """
         获取TVDB信息
@@ -294,6 +523,16 @@ class ChainBase(metaclass=ABCMeta):
         """
         return self.run_module("tmdb_info", tmdbid=tmdbid, mtype=mtype, season=season)
 
+    async def async_tmdb_info(self, tmdbid: int, mtype: MediaType, season: Optional[int] = None) -> Optional[dict]:
+        """
+        获取TMDB信息（异步版本）
+        :param tmdbid: int
+        :param mtype:  媒体类型
+        :param season: 季
+        :return: TVDB信息
+        """
+        return await self.async_run_module("async_tmdb_info", tmdbid=tmdbid, mtype=mtype, season=season)
+
     def bangumi_info(self, bangumiid: int) -> Optional[dict]:
         """
         获取Bangumi信息
@@ -301,6 +540,14 @@ class ChainBase(metaclass=ABCMeta):
         :return: Bangumi信息
         """
         return self.run_module("bangumi_info", bangumiid=bangumiid)
+
+    async def async_bangumi_info(self, bangumiid: int) -> Optional[dict]:
+        """
+        获取Bangumi信息（异步版本）
+        :param bangumiid: int
+        :return: Bangumi信息
+        """
+        return await self.async_run_module("async_bangumi_info", bangumiid=bangumiid)
 
     def message_parser(self, source: str, body: Any, form: Any,
                        args: Any) -> Optional[CommingMessage]:
@@ -335,12 +582,27 @@ class ChainBase(metaclass=ABCMeta):
         """
         return self.run_module("search_medias", meta=meta)
 
+    async def async_search_medias(self, meta: MetaBase) -> Optional[List[MediaInfo]]:
+        """
+        搜索媒体信息（异步版本）
+        :param meta:  识别的元数据
+        :reutrn: 媒体信息列表
+        """
+        return await self.async_run_module("async_search_medias", meta=meta)
+
     def search_persons(self, name: str) -> Optional[List[MediaPerson]]:
         """
         搜索人物信息
         :param name:  人物名称
         """
         return self.run_module("search_persons", name=name)
+
+    async def async_search_persons(self, name: str) -> Optional[List[MediaPerson]]:
+        """
+        搜索人物信息（异步版本）
+        :param name:  人物名称
+        """
+        return await self.async_run_module("async_search_persons", name=name)
 
     def search_collections(self, name: str) -> Optional[List[MediaInfo]]:
         """
@@ -349,20 +611,42 @@ class ChainBase(metaclass=ABCMeta):
         """
         return self.run_module("search_collections", name=name)
 
+    async def async_search_collections(self, name: str) -> Optional[List[MediaInfo]]:
+        """
+        搜索集合信息（异步版本）
+        :param name:  集合名称
+        """
+        return await self.async_run_module("async_search_collections", name=name)
+
     def search_torrents(self, site: dict,
-                        keywords: List[str],
+                        keyword: str,
                         mtype: Optional[MediaType] = None,
                         page: Optional[int] = 0) -> List[TorrentInfo]:
         """
         搜索一个站点的种子资源
         :param site:  站点
-        :param keywords:  搜索关键词列表
+        :param keyword:  搜索关键词
         :param mtype:  媒体类型
         :param page:  页码
         :reutrn: 资源列表
         """
-        return self.run_module("search_torrents", site=site, keywords=keywords,
+        return self.run_module("search_torrents", site=site, keyword=keyword,
                                mtype=mtype, page=page)
+
+    async def async_search_torrents(self, site: dict,
+                                    keyword: str,
+                                    mtype: Optional[MediaType] = None,
+                                    page: Optional[int] = 0) -> List[TorrentInfo]:
+        """
+        异步搜索一个站点的种子资源
+        :param site:  站点
+        :param keyword:  搜索关键词
+        :param mtype:  媒体类型
+        :param page:  页码
+        :reutrn: 资源列表
+        """
+        return await self.async_run_module("async_search_torrents", site=site, keyword=keyword,
+                                           mtype=mtype, page=page)
 
     def refresh_torrents(self, site: dict, keyword: Optional[str] = None,
                          cat: Optional[str] = None, page: Optional[int] = 0) -> List[TorrentInfo]:
@@ -375,6 +659,19 @@ class ChainBase(metaclass=ABCMeta):
         :reutrn: 种子资源列表
         """
         return self.run_module("refresh_torrents", site=site, keyword=keyword, cat=cat, page=page)
+
+    async def async_refresh_torrents(self, site: dict, keyword: Optional[str] = None,
+                                     cat: Optional[str] = None, page: Optional[int] = 0) -> List[TorrentInfo]:
+        """
+        异步获取站点最新一页的种子，多个站点需要多线程处理
+        :param site:  站点
+        :param keyword:  标题
+        :param cat:  分类
+        :param page:  页码
+        :reutrn: 种子资源列表
+        """
+        return await self.async_run_module("async_refresh_torrents",
+                                           site=site, keyword=keyword, cat=cat, page=page)
 
     def filter_torrents(self, rule_groups: List[str],
                         torrent_list: List[TorrentInfo],
@@ -389,13 +686,13 @@ class ChainBase(metaclass=ABCMeta):
         return self.run_module("filter_torrents", rule_groups=rule_groups,
                                torrent_list=torrent_list, mediainfo=mediainfo)
 
-    def download(self, content: Union[Path, str], download_dir: Path, cookie: str,
+    def download(self, content: Union[Path, str, bytes], download_dir: Path, cookie: str,
                  episodes: Set[int] = None, category: Optional[str] = None, label: Optional[str] = None,
                  downloader: Optional[str] = None
                  ) -> Optional[Tuple[Optional[str], Optional[str], Optional[str], str]]:
         """
         根据种子文件，选择并添加下载任务
-        :param content:  种子文件地址或者磁力链接
+        :param content:  种子文件地址或者磁力链接或者种子内容
         :param download_dir:  下载目录
         :param cookie:  cookie
         :param episodes:  需要下载的集数
@@ -408,15 +705,16 @@ class ChainBase(metaclass=ABCMeta):
                                cookie=cookie, episodes=episodes, category=category, label=label,
                                downloader=downloader)
 
-    def download_added(self, context: Context, download_dir: Path, torrent_path: Path = None) -> None:
+    def download_added(self, context: Context, download_dir: Path, torrent_content: Union[str, bytes] = None) -> None:
         """
         添加下载任务成功后，从站点下载字幕，保存到下载目录
         :param context:  上下文，包括识别信息、媒体信息、种子信息
         :param download_dir:  下载目录
-        :param torrent_path:  种子文件地址
+        :param torrent_content:  种子内容，如果有则直接使用该内容，否则从context中获取种子文件路径
         :return: None，该方法可被多个模块同时处理
         """
-        return self.run_module("download_added", context=context, torrent_path=torrent_path,
+        return self.run_module("download_added", context=context,
+                               torrent_content=torrent_content,
                                download_dir=download_dir)
 
     def list_torrents(self, status: TorrentStatus = None,
@@ -610,6 +908,86 @@ class ChainBase(metaclass=ABCMeta):
         # 按原消息发送
         self.messagequeue.send_message("post_message", message=message,
                                        immediately=True if message.userid else False)
+
+    async def async_post_message(self,
+                                 message: Optional[Notification] = None,
+                                 meta: Optional[MetaBase] = None,
+                                 mediainfo: Optional[MediaInfo] = None,
+                                 torrentinfo: Optional[TorrentInfo] = None,
+                                 transferinfo: Optional[TransferInfo] = None,
+                                 **kwargs) -> None:
+        """
+        异步发送消息
+        :param message:  Notification实例
+        :param meta:  元数据
+        :param mediainfo:  媒体信息
+        :param torrentinfo:  种子信息
+        :param transferinfo:  文件整理信息
+        :param kwargs:  其他参数(覆盖业务对象属性值)
+        :return: 成功或失败
+        """
+        # 渲染消息
+        message = MessageTemplateHelper.render(message=message, meta=meta, mediainfo=mediainfo,
+                                               torrentinfo=torrentinfo, transferinfo=transferinfo, **kwargs)
+        # 保存消息
+        self.messagehelper.put(message, role="user", title=message.title)
+        await self.messageoper.async_add(**message.dict())
+        # 发送消息按设置隔离
+        if not message.userid and message.mtype:
+            # 消息隔离设置
+            notify_action = ServiceConfigHelper.get_notification_switch(message.mtype)
+            if notify_action:
+                # 'admin' 'user,admin' 'user' 'all'
+                actions = notify_action.split(",")
+                # 是否已发送管理员标志
+                admin_sended = False
+                send_orignal = False
+                useroper = UserOper()
+                for action in actions:
+                    send_message = copy.deepcopy(message)
+                    if action == "admin" and not admin_sended:
+                        # 仅发送管理员
+                        logger.info(f"{send_message.mtype} 的消息已设置发送给管理员")
+                        # 读取管理员消息IDS
+                        send_message.targets = useroper.get_settings(settings.SUPERUSER)
+                        admin_sended = True
+                    elif action == "user" and send_message.username:
+                        # 发送对应用户
+                        logger.info(f"{send_message.mtype} 的消息已设置发送给用户 {send_message.username}")
+                        # 读取用户消息IDS
+                        send_message.targets = useroper.get_settings(send_message.username)
+                        if send_message.targets is None:
+                            # 没有找到用户
+                            if not admin_sended:
+                                # 回滚发送管理员
+                                logger.info(f"用户 {send_message.username} 不存在，消息将发送给管理员")
+                                # 读取管理员消息IDS
+                                send_message.targets = useroper.get_settings(settings.SUPERUSER)
+                                admin_sended = True
+                            else:
+                                # 管理员发过了，此消息不发了
+                                logger.info(f"用户 {send_message.username} 不存在，消息无法发送到对应用户")
+                                continue
+                        elif send_message.username == settings.SUPERUSER:
+                            # 管理员同名已发送
+                            admin_sended = True
+                    else:
+                        # 按原消息发送全体
+                        if not admin_sended:
+                            send_orignal = True
+                        break
+                    # 按设定发送
+                    await self.eventmanager.async_send_event(etype=EventType.NoticeMessage,
+                                                             data={**send_message.dict(), "type": send_message.mtype})
+                    await self.messagequeue.async_send_message("post_message", message=send_message)
+                if not send_orignal:
+                    return
+        # 发送消息事件
+        await self.eventmanager.async_send_event(etype=EventType.NoticeMessage,
+                                                 data={**message.dict(), "type": message.mtype})
+        # 按原消息发送
+        await self.messagequeue.async_send_message("post_message", message=message,
+                                                   immediately=True if message.userid else False)
 
     def post_medias_message(self, message: Notification, medias: List[MediaInfo]) -> None:
         """

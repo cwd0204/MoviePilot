@@ -27,6 +27,7 @@ jobs:
         with:
           images: |
             ${{ secrets.DOCKER_USERNAME }}/moviepilot-v2
+            ${{ secrets.DOCKER_USERNAME }}/moviepilot
             ghcr.io/${{ github.repository }}
           tags: |
             type=raw,value=${{ env.app_version }}
@@ -92,6 +93,6 @@ jobs:
           body: ${{ env.RELEASE_BODY }}
           draft: false
           prerelease: false
-          make_latest: false
+          make_latest: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

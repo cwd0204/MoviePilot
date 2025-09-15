@@ -1,7 +1,7 @@
 from typing import Any, List, Dict, Optional
 
 from fastapi import APIRouter, Depends
-from sqlalchemy.orm import Session
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from app import schemas
 from app.chain.download import DownloadChain
@@ -9,7 +9,7 @@ from app.chain.mediaserver import MediaServerChain
 from app.core.context import MediaInfo
 from app.core.metainfo import MetaInfo
 from app.core.security import verify_token
-from app.db import get_db
+from app.db import get_async_db
 from app.db.mediaserver_oper import MediaServerOper
 from app.db.models import MediaServerItem
 from app.db.systemconfig_oper import SystemConfigOper
@@ -43,13 +43,13 @@ def play_item(itemid: str, _: schemas.TokenPayload = Depends(verify_token)) -> s
 
 
 @router.get("/exists", summary="查询本地是否存在（数据库）", response_model=schemas.Response)
-def exists_local(title: Optional[str] = None,
-                 year: Optional[str] = None,
-                 mtype: Optional[str] = None,
-                 tmdbid: Optional[int] = None,
-                 season: Optional[int] = None,
-                 db: Session = Depends(get_db),
-                 _: schemas.TokenPayload = Depends(verify_token)) -> Any:
+async def exists_local(title: Optional[str] = None,
+                       year: Optional[str] = None,
+                       mtype: Optional[str] = None,
+                       tmdbid: Optional[int] = None,
+                       season: Optional[int] = None,
+                       db: AsyncSession = Depends(get_async_db),
+                       _: schemas.TokenPayload = Depends(verify_token)) -> Any:
     """
     判断本地是否存在
     """
@@ -59,7 +59,7 @@ def exists_local(title: Optional[str] = None,
     # 返回对象
     ret_info = {}
     # 本地数据库是否存在
-    exist: MediaServerItem = MediaServerOper(db).exists(
+    exist: MediaServerItem = await MediaServerOper(db).async_exists(
         title=meta.name, year=year, mtype=mtype, tmdbid=tmdbid, season=season
     )
     if exist:
@@ -148,7 +148,7 @@ def library(server: str, hidden: Optional[bool] = False,
 
 
 @router.get("/clients", summary="查询可用媒体服务器", response_model=List[dict])
-def clients(_: schemas.TokenPayload = Depends(verify_token)) -> Any:
+async def clients(_: schemas.TokenPayload = Depends(verify_token)) -> Any:
     """
     查询可用媒体服务器
     """

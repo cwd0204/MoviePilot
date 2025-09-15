@@ -10,9 +10,9 @@ from datetime import datetime
 from typing import Any, Literal, Optional, List, Dict, Union
 from typing import Callable
 
-from cachetools import TTLCache
 from jinja2 import Template
 
+from app.core.cache import TTLCache
 from app.core.config import global_vars
 from app.core.context import MediaInfo, TorrentInfo
 from app.core.meta import MetaBase
@@ -307,7 +307,7 @@ class TemplateHelper(metaclass=SingletonClass):
 
     def __init__(self):
         self.builder = TemplateContextBuilder()
-        self.cache = TTLCache(maxsize=100, ttl=600)
+        self.cache = TTLCache(region="notification", maxsize=100, ttl=600)
 
     @staticmethod
     def _generate_cache_key(cuntent: Union[str, dict]) -> str:
@@ -470,6 +470,13 @@ class TemplateHelper(metaclass=SingletonClass):
             return restore_chars(rendered_dict)
         except json.JSONDecodeError:
             return rendered
+
+    def close(self):
+        """
+        清理资源
+        """
+        if self.cache:
+            self.cache.close()
 
 
 class MessageTemplateHelper:
@@ -657,6 +664,17 @@ class MessageQueueManager(metaclass=SingletonClass):
             })
             logger.info(f"消息已加入队列，当前队列长度：{self.queue.qsize()}")
 
+    async def async_send_message(self, *args, **kwargs) -> None:
+        """
+        异步发送消息（直接加入队列）
+        """
+        kwargs.pop("immediately", False)
+        self.queue.put({
+            "args": args,
+            "kwargs": kwargs
+        })
+        logger.info(f"消息已加入队列，当前队列长度：{self.queue.qsize()}")
+
     def _send(self, *args, **kwargs) -> None:
         """
         实际发送消息（可通过回调函数自定义）
@@ -693,7 +711,9 @@ class MessageQueueManager(metaclass=SingletonClass):
         停止队列管理器
         """
         self._running = False
+        logger.info("正在停止消息队列...")
         self.thread.join()
+        logger.info("消息队列已停止")
 
 
 class MessageHelper(metaclass=Singleton):
@@ -754,3 +774,13 @@ class MessageHelper(metaclass=Singleton):
             if not self.user_queue.empty():
                 return self.user_queue.get(block=False)
         return None
+
+
+def stop_message():
+    """
+    停止消息服务
+    """
+    # 停止消息队列
+    MessageQueueManager().stop()
+    # 关闭消息演染器
+    TemplateHelper().close()

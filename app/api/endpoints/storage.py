@@ -12,9 +12,10 @@ from app.core.config import settings
 from app.core.metainfo import MetaInfoPath
 from app.core.security import verify_token
 from app.db.models import User
-from app.db.user_oper import get_current_active_superuser
+from app.db.user_oper import get_current_active_superuser, get_current_active_superuser_async
 from app.helper.progress import ProgressHelper
 from app.schemas.types import ProgressKey
+from app.utils.string import StringUtils
 
 router = APIRouter()
 
@@ -80,7 +81,7 @@ def list_files(fileitem: schemas.FileItem,
     file_list = StorageChain().list_files(fileitem)
     if file_list:
         if sort == "name":
-            file_list.sort(key=lambda x: x.name or "")
+            file_list.sort(key=lambda x: StringUtils.natural_sort_key(x.name or ""))
         else:
             file_list.sort(key=lambda x: x.modify_time or datetime.min, reverse=True)
     return file_list
@@ -171,15 +172,14 @@ def rename(fileitem: schemas.FileItem,
         sub_files: List[schemas.FileItem] = StorageChain().list_files(fileitem)
         if sub_files:
             # 开始进度
-            progress = ProgressHelper()
-            progress.start(ProgressKey.BatchRename)
+            progress = ProgressHelper(ProgressKey.BatchRename)
+            progress.start()
             total = len(sub_files)
             handled = 0
             for sub_file in sub_files:
                 handled += 1
                 progress.update(value=handled / total * 100,
-                                text=f"正在处理 {sub_file.name} ...",
-                                key=ProgressKey.BatchRename)
+                                text=f"正在处理 {sub_file.name} ...")
                 if sub_file.type == "dir":
                     continue
                 if not sub_file.extension:
@@ -190,19 +190,19 @@ def rename(fileitem: schemas.FileItem,
                 meta = MetaInfoPath(sub_path)
                 mediainfo = transferchain.recognize_media(meta)
                 if not mediainfo:
-                    progress.end(ProgressKey.BatchRename)
+                    progress.end()
                     return schemas.Response(success=False, message=f"{sub_path.name} 未识别到媒体信息")
                 new_path = transferchain.recommend_name(meta=meta, mediainfo=mediainfo)
                 if not new_path:
-                    progress.end(ProgressKey.BatchRename)
+                    progress.end()
                     return schemas.Response(success=False, message=f"{sub_path.name} 未识别到新名称")
                 ret: schemas.Response = rename(fileitem=sub_file,
                                                new_name=Path(new_path).name,
                                                recursive=False)
                 if not ret.success:
-                    progress.end(ProgressKey.BatchRename)
+                    progress.end()
                     return schemas.Response(success=False, message=f"{sub_path.name} 重命名失败！")
-            progress.end(ProgressKey.BatchRename)
+            progress.end()
     # 重命名自己
     result = StorageChain().rename_file(fileitem, new_name)
     if result:
@@ -222,7 +222,7 @@ def usage(name: str, _: User = Depends(get_current_active_superuser)) -> Any:
 
 
 @router.get("/transtype/{name}", summary="支持的整理方式获取", response_model=schemas.StorageTransType)
-def transtype(name: str, _: User = Depends(get_current_active_superuser)) -> Any:
+async def transtype(name: str, _: User = Depends(get_current_active_superuser_async)) -> Any:
     """
     查询支持的整理方式
     """

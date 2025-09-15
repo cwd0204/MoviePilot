@@ -1,6 +1,5 @@
 import base64
 import hashlib
-import io
 import secrets
 import threading
 import time
@@ -11,12 +10,12 @@ import oss2
 import requests
 from oss2 import SizedFileAdapter, determine_part_size
 from oss2.models import PartInfo
-from tqdm import tqdm
 
 from app import schemas
-from app.core.config import settings
+from app.core.config import settings, global_vars
 from app.log import logger
 from app.modules.filemanager import StorageBase
+from app.modules.filemanager.storages import transfer_process
 from app.schemas.types import StorageSchema
 from app.utils.singleton import WeakSingleton
 from app.utils.string import StringUtils
@@ -43,6 +42,12 @@ class U115Pan(StorageBase, metaclass=WeakSingleton):
     }
     # 基础url
     base_url = "https://proapi.115.com"
+
+    # 文件块大小，默认10MB
+    chunk_size = 10 * 1024 * 1024
+
+    # 流控重试间隔时间
+    retry_delay = 70
 
     def __init__(self):
         super().__init__()
@@ -193,6 +198,7 @@ class U115Pan(StorageBase, metaclass=WeakSingleton):
         result = resp.json()
         if result.get("code") != 0:
             logger.warn(f"【115】刷新 access_token 失败：{result.get('code')} - {result.get('message')}！")
+            return None
         return result.get("data")
 
     def _request_api(self, method: str, endpoint: str,
@@ -203,10 +209,18 @@ class U115Pan(StorageBase, metaclass=WeakSingleton):
         # 检查会话
         self._check_session()
 
-        resp = self.session.request(
-            method, f"{self.base_url}{endpoint}",
-            **kwargs
-        )
+        # 错误日志标志
+        no_error_log = kwargs.pop("no_error_log", False)
+
+        try:
+            resp = self.session.request(
+                method, f"{self.base_url}{endpoint}",
+                **kwargs
+            )
+        except requests.exceptions.RequestException as e:
+            logger.error(f"【115】{method} 请求 {endpoint} 网络错误: {str(e)}")
+            return None
+
         if resp is None:
             logger.warn(f"【115】{method} 请求 {endpoint} 失败！")
             return None
@@ -226,7 +240,19 @@ class U115Pan(StorageBase, metaclass=WeakSingleton):
         # 返回数据
         ret_data = resp.json()
         if ret_data.get("code") != 0:
-            logger.warn(f"【115】{method} 请求 {endpoint} 出错：{ret_data.get('message')}！")
+            error_msg = ret_data.get("message")
+            if not no_error_log:
+                logger.warn(f"【115】{method} 请求 {endpoint} 出错：{error_msg}")
+            retry_times = kwargs.get("retry_limit", 5)
+            if "已达到当前访问上限" in error_msg:
+                if retry_times <= 0:
+                    logger.error(f"【115】{method} 请求 {endpoint} 达到访问上限，重试次数用尽！")
+                    return None
+                kwargs["retry_limit"] = retry_times - 1
+                logger.info(f"【115】{method} 请求 {endpoint} 达到访问上限，等待 {self.retry_delay} 秒后重试...")
+                time.sleep(self.retry_delay)
+                return self._request_api(method, endpoint, result_key, **kwargs)
+            return None
 
         if result_key:
             return ret_data.get(result_key)
@@ -252,8 +278,8 @@ class U115Pan(StorageBase, metaclass=WeakSingleton):
         """
         自动延迟重试 get_item 模块
         """
-        for _ in range(2):
-            time.sleep(2)
+        for i in range(1, 4):
+            time.sleep(2 ** i)
             fileitem = self.get_item(path)
             if fileitem:
                 return fileitem
@@ -352,29 +378,6 @@ class U115Pan(StorageBase, metaclass=WeakSingleton):
             modify_time=int(time.time())
         )
 
-    @staticmethod
-    def _log_progress(desc: str, total: int) -> tqdm:
-        """
-        创建一个可以输出到日志的进度条
-        """
-
-        class TqdmToLogger(io.StringIO):
-            def write(s, buf):  # noqa
-                buf = buf.strip('\r\n\t ')
-                if buf:
-                    logger.info(buf)
-
-        return tqdm(
-            total=total,
-            unit='B',
-            unit_scale=True,
-            desc=desc,
-            file=TqdmToLogger(),
-            mininterval=1.0,
-            maxinterval=5.0,
-            miniters=1
-        )
-
     def upload(self, target_dir: schemas.FileItem, local_path: Path,
                new_name: Optional[str] = None) -> Optional[schemas.FileItem]:
         """
@@ -450,6 +453,9 @@ class U115Pan(StorageBase, metaclass=WeakSingleton):
                 data=init_data
             )
             if not init_resp:
+                return None
+            if not init_resp.get("state"):
+                logger.warn(f"【115】上传二次认证失败: {init_resp.get('error')}")
                 return None
             # 二次认证结果
             init_result = init_resp.get("data")
@@ -534,18 +540,12 @@ class U115Pan(StorageBase, metaclass=WeakSingleton):
             security_token=SecurityToken
         )
         bucket = oss2.Bucket(auth, endpoint, bucket_name)  # noqa
-        # determine_part_size方法用于确定分片大小，设置分片大小为 100M
-        part_size = determine_part_size(file_size, preferred_size=100 * 1024 * 1024)
+        # determine_part_size方法用于确定分片大小，设置分片大小为 10M
+        part_size = determine_part_size(file_size, preferred_size=10 * 1024 * 1024)
 
         # 初始化进度条
         logger.info(f"【115】开始上传: {local_path} -> {target_path}，分片大小：{StringUtils.str_filesize(part_size)}")
-        progress_bar = tqdm(
-            total=file_size,
-            unit='B',
-            unit_scale=True,
-            desc="上传进度",
-            ascii=True
-        )
+        progress_callback = transfer_process(local_path.as_posix())
 
         # 初始化分片
         upload_id = bucket.init_multipart_upload(object_name,
@@ -559,6 +559,9 @@ class U115Pan(StorageBase, metaclass=WeakSingleton):
             part_number = 1
             offset = 0
             while offset < file_size:
+                if global_vars.is_transfer_stopped(local_path.as_posix()):
+                    logger.info(f"【115】{local_path} 上传已取消！")
+                    return None
                 num_to_upload = min(part_size, file_size - offset)
                 # 调用SizedFileAdapter(fileobj, size)方法会生成一个新的文件对象，重新计算起始追加位置。
                 logger.info(f"【115】开始上传 {target_name} 分片 {part_number}: {offset} -> {offset + num_to_upload}")
@@ -569,11 +572,11 @@ class U115Pan(StorageBase, metaclass=WeakSingleton):
                 offset += num_to_upload
                 part_number += 1
                 # 更新进度
-                progress_bar.update(num_to_upload)
+                progress = (offset * 100) / file_size
+                progress_callback(progress)
 
-        # 关闭进度条
-        if progress_bar:
-            progress_bar.close()
+        # 完成上传
+        progress_callback(100)
 
         # 请求头
         headers = {
@@ -601,11 +604,13 @@ class U115Pan(StorageBase, metaclass=WeakSingleton):
 
     def download(self, fileitem: schemas.FileItem, path: Path = None) -> Optional[Path]:
         """
-        带限速处理的下载
+        带实时进度显示的下载
         """
         detail = self.get_item(Path(fileitem.path))
         if not detail:
+            logger.error(f"【115】获取文件详情失败: {fileitem.name}")
             return None
+
         download_info = self._request_api(
             "POST",
             "/open/ufile/downurl",
@@ -615,14 +620,58 @@ class U115Pan(StorageBase, metaclass=WeakSingleton):
             }
         )
         if not download_info:
+            logger.error(f"【115】获取下载链接失败: {fileitem.name}")
             return None
+
         download_url = list(download_info.values())[0].get("url", {}).get("url")
+        if not download_url:
+            logger.error(f"【115】下载链接为空: {fileitem.name}")
+            return None
+
         local_path = path or settings.TEMP_PATH / fileitem.name
-        with self.session.get(download_url, stream=True) as r:
-            r.raise_for_status()
-            with open(local_path, "wb") as f:
-                for chunk in r.iter_content(chunk_size=8192):
-                    f.write(chunk)
+
+        # 获取文件大小
+        file_size = detail.size
+
+        # 初始化进度条
+        logger.info(f"【115】开始下载: {fileitem.name} -> {local_path}")
+        progress_callback = transfer_process(Path(fileitem.path).as_posix())
+
+        try:
+            with self.session.get(download_url, stream=True) as r:
+                r.raise_for_status()
+                downloaded_size = 0
+
+                with open(local_path, "wb") as f:
+                    for chunk in r.iter_content(chunk_size=self.chunk_size):
+                        if global_vars.is_transfer_stopped(fileitem.path):
+                            logger.info(f"【115】{fileitem.path} 下载已取消！")
+                            return None
+                        if chunk:
+                            f.write(chunk)
+                            downloaded_size += len(chunk)
+                            # 更新进度
+                            if file_size:
+                                progress = (downloaded_size * 100) / file_size
+                                progress_callback(progress)
+
+                # 完成下载
+                progress_callback(100)
+                logger.info(f"【115】下载完成: {fileitem.name}")
+
+        except requests.exceptions.RequestException as e:
+            logger.error(f"【115】下载网络错误: {fileitem.name} - {str(e)}")
+            # 删除可能部分下载的文件
+            if local_path.exists():
+                local_path.unlink()
+            return None
+        except Exception as e:
+            logger.error(f"【115】下载失败: {fileitem.name} - {str(e)}")
+            # 删除可能部分下载的文件
+            if local_path.exists():
+                local_path.unlink()
+            return None
+
         return local_path
 
     def check(self) -> bool:
@@ -672,15 +721,16 @@ class U115Pan(StorageBase, metaclass=WeakSingleton):
                 "/open/folder/get_info",
                 "data",
                 data={
-                    "path": str(path)
-                }
+                    "path": path.as_posix()
+                },
+                no_error_log=True
             )
             if not resp:
                 return None
             return schemas.FileItem(
                 storage=self.schema.value,
                 fileid=str(resp["file_id"]),
-                path=str(path) + ("/" if resp["file_category"] == "0" else ""),
+                path=path.as_posix() + ("/" if resp["file_category"] == "0" else ""),
                 type="file" if resp["file_category"] == "1" else "dir",
                 name=resp["file_name"],
                 basename=Path(resp["file_name"]).stem,
@@ -737,7 +787,11 @@ class U115Pan(StorageBase, metaclass=WeakSingleton):
         """
         企业级复制实现（支持目录递归复制）
         """
-        src_fid = fileitem.fileid
+        if fileitem.fileid is None:
+            fileitem = self.get_item(Path(fileitem.path))
+            if not fileitem:
+                logger.warn(f"【115】获取文件 {fileitem.path} 失败！")
+                return False
         dest_fileitem = self.get_item(path)
         if not dest_fileitem or dest_fileitem.type != "dir":
             logger.warn(f"【115】目标路径 {path} 不是一个有效的目录！")
@@ -747,7 +801,7 @@ class U115Pan(StorageBase, metaclass=WeakSingleton):
             "POST",
             "/open/ufile/copy",
             data={
-                "file_id": int(src_fid),
+                "file_id": int(fileitem.fileid),
                 "pid": int(dest_fileitem.fileid),
             }
         )
@@ -756,15 +810,21 @@ class U115Pan(StorageBase, metaclass=WeakSingleton):
         if resp["state"]:
             new_path = Path(path) / fileitem.name
             new_item = self._delay_get_item(new_path)
-            self.rename(new_item, new_name)
-            return True
+            if not new_item:
+                return False
+            if self.rename(new_item, new_name):
+                return True
         return False
 
     def move(self, fileitem: schemas.FileItem, path: Path, new_name: str) -> bool:
         """
         原子性移动操作实现
         """
-        src_fid = fileitem.fileid
+        if fileitem.fileid is None:
+            fileitem = self.get_item(Path(fileitem.path))
+            if not fileitem:
+                logger.warn(f"【115】获取文件 {fileitem.path} 失败！")
+                return False
         dest_fileitem = self.get_item(path)
         if not dest_fileitem or dest_fileitem.type != "dir":
             logger.warn(f"【115】目标路径 {path} 不是一个有效的目录！")
@@ -773,7 +833,7 @@ class U115Pan(StorageBase, metaclass=WeakSingleton):
             "POST",
             "/open/ufile/move",
             data={
-                "file_ids": int(src_fid),
+                "file_ids": int(fileitem.fileid),
                 "to_cid": int(dest_fileitem.fileid),
             }
         )
@@ -782,8 +842,10 @@ class U115Pan(StorageBase, metaclass=WeakSingleton):
         if resp["state"]:
             new_path = Path(path) / fileitem.name
             new_file = self._delay_get_item(new_path)
-            self.rename(new_file, new_name)
-            return True
+            if not new_file:
+                return False
+            if self.rename(new_file, new_name):
+                return True
         return False
 
     def link(self, fileitem: schemas.FileItem, target_file: Path) -> bool:

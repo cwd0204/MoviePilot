@@ -1,15 +1,16 @@
 from typing import Any, List, Annotated
 
 from fastapi import APIRouter, HTTPException, Depends
+from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import Session
 
 from app import schemas
 from app.chain.media import MediaChain
-from app.chain.tvdb import TvdbChain
 from app.chain.subscribe import SubscribeChain
+from app.chain.tvdb import TvdbChain
 from app.core.metainfo import MetaInfo
 from app.core.security import verify_apikey
-from app.db import get_db
+from app.db import get_db, get_async_db
 from app.db.models.subscribe import Subscribe
 from app.schemas import RadarrMovie, SonarrSeries
 from app.schemas.types import MediaType
@@ -19,7 +20,7 @@ arr_router = APIRouter(tags=['servarr'])
 
 
 @arr_router.get("/system/status", summary="系统状态")
-def arr_system_status(_: Annotated[str, Depends(verify_apikey)]) -> Any:
+async def arr_system_status(_: Annotated[str, Depends(verify_apikey)]) -> Any:
     """
     模拟Radarr、Sonarr系统状态
     """
@@ -73,7 +74,7 @@ def arr_system_status(_: Annotated[str, Depends(verify_apikey)]) -> Any:
 
 
 @arr_router.get("/qualityProfile", summary="质量配置")
-def arr_qualityProfile(_: Annotated[str, Depends(verify_apikey)]) -> Any:
+async def arr_qualityProfile(_: Annotated[str, Depends(verify_apikey)]) -> Any:
     """
     模拟Radarr、Sonarr质量配置
     """
@@ -114,7 +115,7 @@ def arr_qualityProfile(_: Annotated[str, Depends(verify_apikey)]) -> Any:
 
 
 @arr_router.get("/rootfolder", summary="根目录")
-def arr_rootfolder(_: Annotated[str, Depends(verify_apikey)]) -> Any:
+async def arr_rootfolder(_: Annotated[str, Depends(verify_apikey)]) -> Any:
     """
     模拟Radarr、Sonarr根目录
     """
@@ -130,7 +131,7 @@ def arr_rootfolder(_: Annotated[str, Depends(verify_apikey)]) -> Any:
 
 
 @arr_router.get("/tag", summary="标签")
-def arr_tag(_: Annotated[str, Depends(verify_apikey)]) -> Any:
+async def arr_tag(_: Annotated[str, Depends(verify_apikey)]) -> Any:
     """
     模拟Radarr、Sonarr标签
     """
@@ -143,7 +144,7 @@ def arr_tag(_: Annotated[str, Depends(verify_apikey)]) -> Any:
 
 
 @arr_router.get("/languageprofile", summary="语言")
-def arr_languageprofile(_: Annotated[str, Depends(verify_apikey)]) -> Any:
+async def arr_languageprofile(_: Annotated[str, Depends(verify_apikey)]) -> Any:
     """
     模拟Radarr、Sonarr语言
     """
@@ -169,7 +170,7 @@ def arr_languageprofile(_: Annotated[str, Depends(verify_apikey)]) -> Any:
 
 
 @arr_router.get("/movie", summary="所有订阅电影", response_model=List[schemas.RadarrMovie])
-def arr_movies(_: Annotated[str, Depends(verify_apikey)], db: Session = Depends(get_db)) -> Any:
+async def arr_movies(_: Annotated[str, Depends(verify_apikey)], db: AsyncSession = Depends(get_async_db)) -> Any:
     """
     查询Rardar电影
     """
@@ -240,7 +241,7 @@ def arr_movies(_: Annotated[str, Depends(verify_apikey)], db: Session = Depends(
     """
     # 查询所有电影订阅
     result = []
-    subscribes = Subscribe.list(db)
+    subscribes = await Subscribe.async_list(db)
     for subscribe in subscribes:
         if subscribe.type != MediaType.MOVIE.value:
             continue
@@ -306,11 +307,12 @@ def arr_movie_lookup(term: str, _: Annotated[str, Depends(verify_apikey)], db: S
 
 
 @arr_router.get("/movie/{mid}", summary="电影订阅详情", response_model=schemas.RadarrMovie)
-def arr_movie(mid: int, _: Annotated[str, Depends(verify_apikey)], db: Session = Depends(get_db)) -> Any:
+async def arr_movie(mid: int, _: Annotated[str, Depends(verify_apikey)],
+                    db: AsyncSession = Depends(get_async_db)) -> Any:
     """
     查询Rardar电影订阅
     """
-    subscribe = Subscribe.get(db, mid)
+    subscribe = await Subscribe.async_get(db, mid)
     if subscribe:
         return RadarrMovie(
             id=subscribe.id,
@@ -332,25 +334,25 @@ def arr_movie(mid: int, _: Annotated[str, Depends(verify_apikey)], db: Session =
 
 
 @arr_router.post("/movie", summary="新增电影订阅")
-def arr_add_movie(_: Annotated[str, Depends(verify_apikey)],
-                  movie: RadarrMovie,
-                  db: Session = Depends(get_db)
-                  ) -> Any:
+async def arr_add_movie(_: Annotated[str, Depends(verify_apikey)],
+                        movie: RadarrMovie,
+                        db: AsyncSession = Depends(get_async_db)
+                        ) -> Any:
     """
     新增Rardar电影订阅
     """
     # 检查订阅是否已存在
-    subscribe = Subscribe.get_by_tmdbid(db, movie.tmdbId)
+    subscribe = await Subscribe.async_get_by_tmdbid(db, movie.tmdbId)
     if subscribe:
         return {
             "id": subscribe.id
         }
     # 添加订阅
-    sid, message = SubscribeChain().add(title=movie.title,
-                                        year=movie.year,
-                                        mtype=MediaType.MOVIE,
-                                        tmdbid=movie.tmdbId,
-                                        username="Seerr")
+    sid, message = await SubscribeChain().async_add(title=movie.title,
+                                                    year=movie.year,
+                                                    mtype=MediaType.MOVIE,
+                                                    tmdbid=movie.tmdbId,
+                                                    username="Seerr")
     if sid:
         return {
             "id": sid
@@ -363,13 +365,14 @@ def arr_add_movie(_: Annotated[str, Depends(verify_apikey)],
 
 
 @arr_router.delete("/movie/{mid}", summary="删除电影订阅", response_model=schemas.Response)
-def arr_remove_movie(mid: int, _: Annotated[str, Depends(verify_apikey)], db: Session = Depends(get_db)) -> Any:
+async def arr_remove_movie(mid: int, _: Annotated[str, Depends(verify_apikey)],
+                           db: AsyncSession = Depends(get_async_db)) -> Any:
     """
     删除Rardar电影订阅
     """
-    subscribe = Subscribe.get(db, mid)
+    subscribe = await Subscribe.async_get(db, mid)
     if subscribe:
-        subscribe.delete(db, mid)
+        await subscribe.async_delete(db, mid)
         return schemas.Response(success=True)
     else:
         raise HTTPException(
@@ -379,7 +382,7 @@ def arr_remove_movie(mid: int, _: Annotated[str, Depends(verify_apikey)], db: Se
 
 
 @arr_router.get("/series", summary="所有剧集", response_model=List[schemas.SonarrSeries])
-def arr_series(_: Annotated[str, Depends(verify_apikey)], db: Session = Depends(get_db)) -> Any:
+async def arr_series(_: Annotated[str, Depends(verify_apikey)], db: AsyncSession = Depends(get_async_db)) -> Any:
     """
     查询Sonarr剧集
     """
@@ -487,7 +490,7 @@ def arr_series(_: Annotated[str, Depends(verify_apikey)], db: Session = Depends(
     """
     # 查询所有电视剧订阅
     result = []
-    subscribes = Subscribe.list(db)
+    subscribes = await Subscribe.async_list(db)
     for subscribe in subscribes:
         if subscribe.type != MediaType.TV.value:
             continue
@@ -605,11 +608,12 @@ def arr_series_lookup(term: str, _: Annotated[str, Depends(verify_apikey)], db: 
 
 
 @arr_router.get("/series/{tid}", summary="剧集详情")
-def arr_serie(tid: int, _: Annotated[str, Depends(verify_apikey)], db: Session = Depends(get_db)) -> Any:
+async def arr_serie(tid: int, _: Annotated[str, Depends(verify_apikey)],
+                    db: AsyncSession = Depends(get_async_db)) -> Any:
     """
     查询Sonarr剧集
     """
-    subscribe = Subscribe.get(db, tid)
+    subscribe = await Subscribe.async_get(db, tid)
     if subscribe:
         return SonarrSeries(
             id=subscribe.id,
@@ -639,17 +643,17 @@ def arr_serie(tid: int, _: Annotated[str, Depends(verify_apikey)], db: Session =
 
 
 @arr_router.post("/series", summary="新增剧集订阅")
-def arr_add_series(tv: schemas.SonarrSeries,
-                   _: Annotated[str, Depends(verify_apikey)],
-                   db: Session = Depends(get_db)) -> Any:
+async def arr_add_series(tv: schemas.SonarrSeries,
+                         _: Annotated[str, Depends(verify_apikey)],
+                         db: AsyncSession = Depends(get_async_db)) -> Any:
     """
     新增Sonarr剧集订阅
     """
     # 检查订阅是否存在
     left_seasons = []
     for season in tv.seasons:
-        subscribe = Subscribe.get_by_tmdbid(db, tmdbid=tv.tmdbId,
-                                            season=season.get("seasonNumber"))
+        subscribe = await Subscribe.async_get_by_tmdbid(db, tmdbid=tv.tmdbId,
+                                                        season=season.get("seasonNumber"))
         if subscribe:
             continue
         left_seasons.append(season)
@@ -664,12 +668,12 @@ def arr_add_series(tv: schemas.SonarrSeries,
     for season in left_seasons:
         if not season.get("monitored"):
             continue
-        sid, message = SubscribeChain().add(title=tv.title,
-                                            year=tv.year,
-                                            season=season.get("seasonNumber"),
-                                            tmdbid=tv.tmdbId,
-                                            mtype=MediaType.TV,
-                                            username="Seerr")
+        sid, message = await SubscribeChain().async_add(title=tv.title,
+                                                        year=tv.year,
+                                                        season=season.get("seasonNumber"),
+                                                        tmdbid=tv.tmdbId,
+                                                        mtype=MediaType.TV,
+                                                        username="Seerr")
 
     if sid:
         return {
@@ -683,21 +687,22 @@ def arr_add_series(tv: schemas.SonarrSeries,
 
 
 @arr_router.put("/series", summary="更新剧集订阅")
-def arr_update_series(tv: schemas.SonarrSeries) -> Any:
+async def arr_update_series(tv: schemas.SonarrSeries, _: Annotated[str, Depends(verify_apikey)]) -> Any:
     """
     更新Sonarr剧集订阅
     """
-    return arr_add_series(tv)
+    return await arr_add_series(tv)
 
 
 @arr_router.delete("/series/{tid}", summary="删除剧集订阅")
-def arr_remove_series(tid: int, _: Annotated[str, Depends(verify_apikey)], db: Session = Depends(get_db)) -> Any:
+async def arr_remove_series(tid: int, _: Annotated[str, Depends(verify_apikey)],
+                            db: AsyncSession = Depends(get_async_db)) -> Any:
     """
     删除Sonarr剧集订阅
     """
-    subscribe = Subscribe.get(db, tid)
+    subscribe = await Subscribe.async_get(db, tid)
     if subscribe:
-        subscribe.delete(db, tid)
+        await subscribe.async_delete(db, tid)
         return schemas.Response(success=True)
     else:
         raise HTTPException(

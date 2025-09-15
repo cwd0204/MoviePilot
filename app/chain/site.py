@@ -1,5 +1,4 @@
 import base64
-import gc
 import re
 from datetime import datetime
 from typing import Optional, Tuple, Union, Dict
@@ -9,7 +8,7 @@ from lxml import etree
 
 from app.chain import ChainBase
 from app.core.config import global_vars, settings
-from app.core.event import Event, EventManager, eventmanager
+from app.core.event import Event, eventmanager
 from app.db.models.site import Site
 from app.db.site_oper import SiteOper
 from app.db.systemconfig_oper import SystemConfigOper
@@ -18,7 +17,7 @@ from app.helper.cloudflare import under_challenge
 from app.helper.cookie import CookieHelper
 from app.helper.cookiecloud import CookieCloudHelper
 from app.helper.rss import RssHelper
-from app.helper.sites import SitesHelper
+from app.helper.sites import SitesHelper  # noqa
 from app.log import logger
 from app.schemas import MessageChannel, Notification, SiteUserData
 from app.schemas.types import EventType, NotificationType
@@ -59,7 +58,7 @@ class SiteChain(ChainBase):
                                        name=site.get("name"),
                                        payload=userdata.dict())
             # 发送事件
-            EventManager().send_event(EventType.SiteRefreshed, {
+            eventmanager.send_event(EventType.SiteRefreshed, {
                 "site_id": site.get("id")
             })
             # 发送站点消息
@@ -104,13 +103,9 @@ class SiteChain(ChainBase):
                     any_site_updated = True
                     result[site.get("name")] = userdata
         if any_site_updated:
-            EventManager().send_event(EventType.SiteRefreshed, {
+            eventmanager.send_event(EventType.SiteRefreshed, {
                 "site_id": "*"
             })
-
-        # 如果不是大内存模式，进行垃圾回收
-        if not settings.BIG_MEMORY_MODE:
-            gc.collect()
 
         return result
 
@@ -318,11 +313,16 @@ class SiteChain(ChainBase):
         siteoper = SiteOper()
         rsshelper = RssHelper()
         for domain, cookie in cookies.items():
+            # 检查系统是否停止
+            if global_vars.is_system_stopped:
+                logger.info("系统正在停止，中断CookieCloud同步")
+                return False, "系统正在停止，同步被中断"
+                
             # 索引器信息
             indexer = siteshelper.get_indexer(domain)
             # 数据库的站点信息
             site_info = siteoper.get_by_domain(domain)
-            if site_info and site_info.is_active == 1:
+            if site_info and site_info.is_active:
                 # 站点已存在，检查站点连通性
                 status, msg = self.test(domain)
                 # 更新站点Cookie
@@ -335,7 +335,8 @@ class SiteChain(ChainBase):
                             url=site_info.url,
                             cookie=cookie,
                             ua=site_info.ua or settings.USER_AGENT,
-                            proxy=True if site_info.proxy else False
+                            proxy=True if site_info.proxy else False,
+                            timeout=site_info.timeout or 15
                         )
                         if rss_url:
                             logger.info(f"更新站点 {domain} RSS地址 ...")
@@ -420,7 +421,7 @@ class SiteChain(ChainBase):
 
             # 通知站点更新
             if indexer:
-                EventManager().send_event(EventType.SiteUpdated, {
+                eventmanager.send_event(EventType.SiteUpdated, {
                     "domain": domain,
                 })
         # 处理完成
@@ -563,13 +564,15 @@ class SiteChain(ChainBase):
         public = site_info.public
         proxies = settings.PROXY if site_info.proxy else None
         proxy_server = settings.PROXY_SERVER if site_info.proxy else None
+        timeout = site_info.timeout or 60
 
         # 访问链接
         if render:
             page_source = PlaywrightHelper().get_page_source(url=site_url,
                                                              cookies=site_cookie,
                                                              ua=ua,
-                                                             proxies=proxy_server)
+                                                             proxies=proxy_server,
+                                                             timeout=timeout)
             if not public and not SiteUtils.is_logged_in(page_source):
                 if under_challenge(page_source):
                     return False, f"无法通过Cloudflare！"
@@ -702,7 +705,8 @@ class SiteChain(ChainBase):
             username=username,
             password=password,
             two_step_code=two_step_code,
-            proxies=settings.PROXY_HOST if site_info.proxy else None
+            proxies=settings.PROXY_SERVER if site_info.proxy else None,
+            timeout=site_info.timeout or 60
         )
         if result:
             cookie, ua, msg = result

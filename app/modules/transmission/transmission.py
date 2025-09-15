@@ -24,6 +24,7 @@ class Transmission:
         """
         若不设置参数，则创建配置文件设置的下载器
         """
+        self.trc = None
         if host and port:
             self._protocol, self._host, self._port = kwargs.get("protocol", "http"), host, port
         elif host:
@@ -91,7 +92,7 @@ class Transmission:
         if status and not isinstance(status, list):
             status = [status]
         if tags and not isinstance(tags, list):
-            tags = [tags]
+            tags = tags.split(',')
         ret_torrents = []
         try:
             for torrent in torrents:

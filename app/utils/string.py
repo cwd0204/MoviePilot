@@ -229,7 +229,7 @@ class StringUtils:
                 size = float(size)
                 d = [(1024 - 1, 'K'), (1024 ** 2 - 1, 'M'), (1024 ** 3 - 1, 'G'), (1024 ** 4 - 1, 'T')]
                 s = [x[0] for x in d]
-                index = bisect.bisect_left(s, size) - 1 # noqa
+                index = bisect.bisect_left(s, size) - 1  # noqa
                 if index == -1:
                     return str(size) + "B"
                 else:
@@ -925,3 +925,32 @@ class StringUtils:
         if re.match(r'^[a-zA-Z0-9.-]+(\.[a-zA-Z]{2,})?$', text):
             return True
         return False
+
+    @staticmethod
+    def is_magnet_link(content: Union[str, bytes]) -> bool:
+        """
+        判断内容是否为磁力链接
+        """
+        if not content:
+            return False
+        if isinstance(content, str) and content.startswith("magnet:"):
+            return True
+        if isinstance(content, bytes) and content.startswith(b"magnet:"):
+            return True
+        return False
+
+    @staticmethod
+    def natural_sort_key(text: str) -> List[Union[int, str]]:
+        """
+        自然排序
+        将字符串拆分为数字和非数字部分，数字部分转换为整数，非数字部分转换为小写字母
+        :param text: 要处理的字符串
+        :return 用于排序的数字和字符串列表
+        """
+        if text is None:
+            return []
+
+        if not isinstance(text, str):
+            text = str(text)
+
+        return [int(part) if part.isdigit() else part.lower() for part in re.split(r'(\d+)', text)]

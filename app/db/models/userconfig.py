@@ -1,14 +1,14 @@
-from sqlalchemy import Column, Integer, String, Sequence, UniqueConstraint, Index, JSON
+from sqlalchemy import Column, String, UniqueConstraint, Index, JSON
 from sqlalchemy.orm import Session
 
-from app.db import db_query, db_update, Base
+from app.db import db_query, db_update, get_id_column, Base
 
 
 class UserConfig(Base):
     """
     用户配置表
     """
-    id = Column(Integer, Sequence('id'), primary_key=True, index=True)
+    id = get_id_column()
     # 用户名
     username = Column(String, index=True)
     # 配置键
@@ -22,12 +22,12 @@ class UserConfig(Base):
         Index('ix_userconfig_username_key', 'username', 'key'),
     )
 
-    @staticmethod
+    @classmethod
     @db_query
-    def get_by_key(db: Session, username: str, key: str):
-        return db.query(UserConfig) \
-                 .filter(UserConfig.username == username) \
-                 .filter(UserConfig.key == key) \
+    def get_by_key(cls, db: Session, username: str, key: str):
+        return db.query(cls) \
+                 .filter(cls.username == username) \
+                 .filter(cls.key == key) \
                  .first()
 
     @db_update

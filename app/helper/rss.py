@@ -384,6 +384,9 @@ class RssHelper:
                             pubdate = ""
                             if pubdate_nodes and pubdate_nodes[0].text:
                                 pubdate = StringUtils.get_time(pubdate_nodes[0].text)
+                                if pubdate is not None:
+                                    # 转为本地时区
+                                    pubdate = pubdate.astimezone(tz=None)
 
                             # 获取豆瓣昵称
                             nickname_nodes = item.xpath('.//*[local-name()="creator"]')
@@ -429,13 +432,14 @@ class RssHelper:
 
         return ret_array
 
-    def get_rss_link(self, url: str, cookie: str, ua: str, proxy: bool = False) -> Tuple[str, str]:
+    def get_rss_link(self, url: str, cookie: str, ua: str, proxy: bool = False, timeout: int = None) -> Tuple[str, str]:
         """
         获取站点rss地址
         :param url: 站点地址
         :param cookie: 站点cookie
         :param ua: 站点ua
         :param proxy: 是否使用代理
+        :param timeout: 请求超时时间
         :return: rss地址、错误信息
         """
         try:
@@ -453,12 +457,13 @@ class RssHelper:
                     url=rss_url,
                     cookies=cookie,
                     ua=ua,
-                    proxies=settings.PROXY if proxy else None
+                    proxies=settings.PROXY_SERVER if proxy else None,
+                    timeout=timeout or 60
                 )
             else:
                 res = RequestUtils(
                     cookies=cookie,
-                    timeout=60,
+                    timeout=timeout or 30,
                     ua=ua,
                     proxies=settings.PROXY if proxy else None
                 ).post_res(url=rss_url, data=rss_params)

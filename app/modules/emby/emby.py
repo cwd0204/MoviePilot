@@ -10,10 +10,10 @@ from requests import Response
 from app import schemas
 from app.core.config import settings
 from app.log import logger
+from app.schemas import MediaServerItem
 from app.schemas.types import MediaType
 from app.utils.http import RequestUtils
 from app.utils.url import UrlUtils
-from app.schemas import MediaServerItem
 
 
 class Emby:
@@ -22,9 +22,10 @@ class Emby:
     _apikey: Optional[str] = None
     _sync_libraries: List[str] = []
     user: Optional[Union[str, int]] = None
+    _username: Optional[str] = None
 
     def __init__(self, host: Optional[str] = None, apikey: Optional[str] = None, play_host: Optional[str] = None,
-                 sync_libraries: list = None, **kwargs):
+                 username: Optional[str] = None, sync_libraries: list = None, **kwargs):
         if not host or not apikey:
             logger.error("Emby服务器配置不完整！")
             return
@@ -35,7 +36,8 @@ class Emby:
         if self._playhost:
             self._playhost = UrlUtils.standardize_base_url(self._playhost)
         self._apikey = apikey
-        self.user = self.get_user(settings.SUPERUSER)
+        self._username = username
+        self.user = self.get_user(username or settings.SUPERUSER)
         self.folders = self.get_emby_folders()
         self.serverid = self.get_server_id()
         self._sync_libraries = sync_libraries or []
@@ -139,7 +141,8 @@ class Emby:
             logger.error(f"连接User/Views 出错：" + str(e))
             return []
 
-    def get_librarys(self, username: Optional[str] = None, hidden: Optional[bool] = False) -> List[schemas.MediaServerLibrary]:
+    def get_librarys(self, username: Optional[str] = None, hidden: Optional[bool] = False) -> List[
+        schemas.MediaServerLibrary]:
         """
         获取媒体服务器所有媒体库列表
         """
@@ -166,7 +169,8 @@ class Emby:
                     type=library_type,
                     image=image,
                     link=f'{self._playhost or self._host}web/index.html'
-                         f'#!/videos?serverId={self.serverid}&parentId={library.get("Id")}'
+                         f'#!/videos?serverId={self.serverid}&parentId={library.get("Id")}',
+                    server_type="emby"
                 )
             )
         return libraries
@@ -496,7 +500,7 @@ class Emby:
                 logger.info(f"影片图片链接:{res.url}")
                 return res.url
             else:
-                logger.error("Items/Id/Images 未获取到返回数据或无该影片{}图片".format(image_type))
+                logger.info("Items/Id/Images 未获取到返回数据或无该影片{}图片".format(image_type))
                 return None
         except Exception as e:
             logger.error(f"连接Items/Id/Images出错：" + str(e))
@@ -566,6 +570,7 @@ class Emby:
             if library_id != "/":
                 return self.__refresh_emby_library_by_id(library_id)
         logger.info(f"Emby媒体库刷新完成")
+        return True
 
     def __get_emby_library_id_by_item(self, item: schemas.RefreshMediaItem) -> Optional[str]:
         """
@@ -705,9 +710,9 @@ class Emby:
                         yield items
                 elif item.get("Type") in ["Movie", "Series"]:
                     yield self.__format_item_info(item)
-
         except Exception as e:
             logger.error(f"连接Users/Items出错：" + str(e))
+        return None
 
     def get_webhook_message(self, form: any, args: dict) -> Optional[schemas.WebhookEventInfo]:
         """
@@ -1108,7 +1113,8 @@ class Emby:
             return ""
         return "%sItems/%s/Images/Primary" % (self._host, item_id)
 
-    def get_resume(self, num: Optional[int] = 12, username: Optional[str] = None) -> Optional[List[schemas.MediaServerPlayItem]]:
+    def get_resume(self, num: Optional[int] = 12, username: Optional[str] = None) -> Optional[
+        List[schemas.MediaServerPlayItem]]:
         """
         获得继续观看
         """
@@ -1167,7 +1173,8 @@ class Emby:
                         type=item_type,
                         image=image,
                         link=link,
-                        percent=item.get("UserData", {}).get("PlayedPercentage")
+                        percent=item.get("UserData", {}).get("PlayedPercentage"),
+                        server_type='emby'
                     ))
                 return ret_resume
             else:
@@ -1176,7 +1183,8 @@ class Emby:
             logger.error(f"连接Users/Items/Resume出错：" + str(e))
         return []
 
-    def get_latest(self, num: Optional[int] = 20, username: Optional[str] = None) -> Optional[List[schemas.MediaServerPlayItem]]:
+    def get_latest(self, num: Optional[int] = 20, username: Optional[str] = None) -> Optional[
+        List[schemas.MediaServerPlayItem]]:
         """
         获得最近更新
         """
@@ -1219,7 +1227,8 @@ class Emby:
                         type=item_type,
                         image=image,
                         link=link,
-                        BackdropImageTags=item.get("BackdropImageTags")
+                        BackdropImageTags=item.get("BackdropImageTags"),
+                        server_type='emby'
                     ))
                 return ret_latest
             else:

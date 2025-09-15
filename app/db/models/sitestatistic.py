@@ -1,16 +1,17 @@
 from datetime import datetime
 
-from sqlalchemy import Column, Integer, String, Sequence, JSON
+from sqlalchemy import Column, Integer, String, JSON, select
+from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import Session
 
-from app.db import db_query, db_update, Base
+from app.db import db_query, db_update, get_id_column, Base, async_db_query
 
 
 class SiteStatistic(Base):
     """
     站点统计表
     """
-    id = Column(Integer, Sequence('id'), primary_key=True, index=True)
+    id = get_id_column()
     # 域名Key
     domain = Column(String, index=True)
     # 成功次数
@@ -26,12 +27,18 @@ class SiteStatistic(Base):
     # 耗时记录 Json
     note = Column(JSON)
 
-    @staticmethod
+    @classmethod
     @db_query
-    def get_by_domain(db: Session, domain: str):
-        return db.query(SiteStatistic).filter(SiteStatistic.domain == domain).first()
+    def get_by_domain(cls, db: Session, domain: str):
+        return db.query(cls).filter(cls.domain == domain).first()
 
-    @staticmethod
+    @classmethod
+    @async_db_query
+    async def async_get_by_domain(cls, db: AsyncSession, domain: str):
+        result = await db.execute(select(cls).where(cls.domain == domain))
+        return result.scalar_one_or_none()
+
+    @classmethod
     @db_update
-    def reset(db: Session):
-        db.query(SiteStatistic).delete()
+    def reset(cls, db: Session):
+        db.query(cls).delete()

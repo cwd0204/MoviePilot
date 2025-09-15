@@ -68,35 +68,57 @@ class SystemUtils:
         """
         if SystemUtils.is_windows():
             return False
-        return True if "synology" in SystemUtils.execute('uname -a') else False
+        return "synology" in SystemUtils.execute('uname -a')
 
     @staticmethod
     def is_windows() -> bool:
         """
         判断是否为Windows系统
         """
-        return True if os.name == "nt" else False
+        return os.name == "nt"
 
     @staticmethod
     def is_frozen() -> bool:
         """
         判断是否为冻结的二进制文件
         """
-        return True if getattr(sys, 'frozen', False) else False
+        return getattr(sys, 'frozen', False)
 
     @staticmethod
     def is_macos() -> bool:
         """
         判断是否为MacOS系统
         """
-        return True if platform.system() == 'Darwin' else False
+        return platform.system() == 'Darwin'
 
     @staticmethod
     def is_aarch64() -> bool:
         """
         判断是否为ARM64架构
         """
-        return True if platform.machine() == 'aarch64' else False
+        return platform.machine().lower() in ('aarch64', 'arm64')
+
+    @staticmethod
+    def is_aarch() -> bool:
+        """
+        判断是否为ARM32架构
+        """
+        arch_name = platform.machine().lower()
+        return arch_name.startswith(('arm', 'aarch')) and arch_name not in ('aarch64', 'arm64')
+
+    @staticmethod
+    def is_x86_64() -> bool:
+        """
+        判断是否为AMD64架构
+        """
+        return platform.machine().lower() in ('amd64', 'x86_64')
+
+    @staticmethod
+    def is_x86_32() -> bool:
+        """
+        判断是否为AMD32架构
+        """
+        return platform.machine().lower() in ('i386', 'i686', 'x86', '386', 'x86_32')
 
     @staticmethod
     def platform() -> str:
@@ -111,6 +133,22 @@ class SystemUtils:
             return "Arm64"
         else:
             return "Linux"
+
+    @staticmethod
+    def cpu_arch() -> str:
+        """
+        获取CPU架构
+        """
+        if SystemUtils.is_x86_64():
+            return "x86_64"
+        elif SystemUtils.is_x86_32():
+            return "x86_32"
+        elif SystemUtils.is_aarch64():
+            return "Arm64"
+        elif SystemUtils.is_aarch():
+            return "Arm32"
+        else:
+            return platform.machine()
 
     @staticmethod
     def copy(src: Path, dest: Path) -> Tuple[int, str]:
@@ -456,11 +494,11 @@ class SystemUtils:
         time.sleep(1)  # 等待1秒
         # 获取1秒后的网络统计
         net_io_2 = psutil.net_io_counters()
-        
+
         # 计算1秒内的流量变化
         upload_speed = net_io_2.bytes_sent - net_io_1.bytes_sent
         download_speed = net_io_2.bytes_recv - net_io_1.bytes_recv
-        
+
         return [upload_speed, download_speed]
 
     @staticmethod
@@ -488,6 +526,45 @@ class SystemUtils:
         except Exception as e:
             print(f"Error occurred: {e}")
             return False
+
+    @staticmethod
+    def is_network_filesystem(directory: Path) -> bool:
+        """
+        检测是否为网络文件系统
+        :param directory: 目录路径
+        :return: 是否为网络文件系统
+        """
+        try:
+            system = platform.system()
+            if system == 'Linux':
+                # 检查挂载信息
+                result = subprocess.run(['df', '-T', str(directory)],
+                                        capture_output=True, text=True, timeout=5)
+                if result.returncode == 0:
+                    output = result.stdout.lower()
+                    # 以下本地文件系统含有fuse关键字
+                    local_fs = [
+                        "fuse.shfs",  # Unraid
+                        "zfuse.zfsv",  # 极空间(zfuse.zfsv2、zfuse.zfsv3、...)
+                        # TBD
+                    ]
+                    if any(fs in output for fs in local_fs):
+                        return False
+                    network_fs = ['nfs', 'cifs', 'smbfs', 'fuse', 'sshfs', 'ftpfs']
+                    return any(fs in output for fs in network_fs)
+            elif system == 'Darwin':
+                # macOS 检查
+                result = subprocess.run(['df', '-T', str(directory)],
+                                        capture_output=True, text=True, timeout=5)
+                if result.returncode == 0:
+                    output = result.stdout.lower()
+                    return 'nfs' in output or 'smbfs' in output
+            elif system == 'Windows':
+                # Windows 检查网络驱动器
+                return str(directory).startswith('\\\\')
+        except Exception as e:
+            print(f"Error occurred: {e}")
+        return False
 
     @staticmethod
     def is_same_disk(src: Path, dest: Path) -> bool:

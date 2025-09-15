@@ -140,8 +140,7 @@ class FileManagerModule(_ModuleBase):
         """
         handler = TransHandler()
         # 重命名格式
-        rename_format = settings.TV_RENAME_FORMAT \
-            if mediainfo.type == MediaType.TV else settings.MOVIE_RENAME_FORMAT
+        rename_format = settings.RENAME_FORMAT(mediainfo.type)
         # 获取集信息
         episodes_info: Optional[List[TmdbEpisode]] = None
         if mediainfo.type == MediaType.TV:
@@ -166,7 +165,7 @@ class FileManagerModule(_ModuleBase):
                                                 episodes_info=episodes_info,
                                                 file_ext=Path(meta.title).suffix)
         )
-        return str(path)
+        return path.as_posix() if path else ""
 
     def save_config(self, storage: str, conf: Dict) -> None:
         """
@@ -429,6 +428,12 @@ class FileManagerModule(_ModuleBase):
                                 message=f"{target_path} 不是有效目录")
         # 获取目标路径
         if target_directory:
+            # 目标媒体库目录未设置
+            if not target_directory.library_path:
+                logger.error(f"目标媒体库目录未设置，无法整理文件，源路径：{fileitem.path}")
+                return TransferInfo(success=False,
+                                    fileitem=fileitem,
+                                    message="目标媒体库目录未设置")
             # 整理方式
             if not transfer_type:
                 transfer_type = target_directory.transfer_type
@@ -528,8 +533,7 @@ class FileManagerModule(_ModuleBase):
             # 媒体分类路径
             dir_path = handler.get_dest_dir(mediainfo=mediainfo, target_dir=dest_dir)
             # 重命名格式
-            rename_format = settings.TV_RENAME_FORMAT \
-                if mediainfo.type == MediaType.TV else settings.MOVIE_RENAME_FORMAT
+            rename_format = settings.RENAME_FORMAT(mediainfo.type)
             # 元数据补上常用属性，尽可能确保重命名后的路径不出现空白
             meta = MetaInfo(mediainfo.title)
             if meta.type == MediaType.UNKNOWN and mediainfo.type is not None:
@@ -554,7 +558,7 @@ class FileManagerModule(_ModuleBase):
             if not media_path:
                 # 忽略
                 continue
-            if dir_path.is_relative_to(media_path):
+            if dir_path != media_path and dir_path.is_relative_to(media_path):
                 # 兜底检查，避免不必要的扫盘
                 logger.warn(f"{media_path} 是媒体库目录 {dir_path} 的父目录，忽略获取媒体文件列表，请检查重命名格式！")
                 continue

@@ -23,6 +23,7 @@ class Qbittorrent:
         """
         若不设置参数，则创建配置文件设置的下载器
         """
+        self.qbc = None
         if host and port:
             self._host, self._port = host, port
         elif host:
@@ -97,7 +98,7 @@ class Qbittorrent:
             if tags:
                 results = []
                 if not isinstance(tags, list):
-                    tags = [tags]
+                    tags = tags.split(',')
                 try:
                     for torrent in torrents:
                         torrent_tags = [str(tag).strip() for tag in torrent.get("tags").split(',')]

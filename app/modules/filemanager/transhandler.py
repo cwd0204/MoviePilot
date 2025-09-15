@@ -14,10 +14,10 @@ from app.helper.directory import DirectoryHelper
 from app.helper.message import TemplateHelper
 from app.log import logger
 from app.modules.filemanager.storages import StorageBase
-from app.schemas import TransferInfo, TmdbEpisode, TransferDirectoryConf, FileItem, TransferInterceptEventData
+from app.schemas import TransferInfo, TmdbEpisode, TransferDirectoryConf, FileItem, TransferInterceptEventData, \
+    TransferRenameEventData
 from app.schemas.types import MediaType, ChainEventType
 from app.utils.system import SystemUtils
-from app.schemas import TransferRenameEventData
 
 lock = Lock()
 
@@ -106,8 +106,7 @@ class TransHandler:
         try:
 
             # 重命名格式
-            rename_format = settings.TV_RENAME_FORMAT \
-                if mediainfo.type == MediaType.TV else settings.MOVIE_RENAME_FORMAT
+            rename_format = settings.RENAME_FORMAT(mediainfo.type)
 
             # 判断是否为文件夹
             if fileitem.type == "dir":
@@ -240,7 +239,8 @@ class TransHandler:
                             overflag = True
                     if not overflag:
                         # 目标文件已存在
-                        logger.info(f"目的文件系统中已经存在同名文件 {target_file}，当前整理覆盖模式设置为 {overwrite_mode}")
+                        logger.info(
+                            f"目的文件系统中已经存在同名文件 {target_file}，当前整理覆盖模式设置为 {overwrite_mode}")
                         if overwrite_mode == 'always':
                             # 总是覆盖同名文件
                             overflag = True
@@ -331,7 +331,7 @@ class TransHandler:
             """
             return FileItem(
                 storage=target_storage,
-                path=str(_path).replace("\\", "/"),
+                path=_path.as_posix(),
                 name=_path.name,
                 basename=_path.stem,
                 type="file",

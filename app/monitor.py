@@ -1,7 +1,6 @@
 import json
 import platform
 import re
-import subprocess
 import threading
 import time
 import traceback
@@ -10,13 +9,13 @@ from threading import Lock
 from typing import Any, Optional, Dict, List
 
 from apscheduler.schedulers.background import BackgroundScheduler
-from cachetools import TTLCache
 from watchdog.events import FileSystemEventHandler, FileSystemMovedEvent, FileSystemEvent
 from watchdog.observers.polling import PollingObserver
 
 from app.chain import ChainBase
 from app.chain.storage import StorageChain
 from app.chain.transfer import TransferChain
+from app.core.cache import TTLCache, FileCache
 from app.core.config import settings
 from app.core.event import Event, eventmanager
 from app.helper.directory import DirectoryHelper
@@ -25,7 +24,8 @@ from app.log import logger
 from app.schemas import ConfigChangeEventData
 from app.schemas import FileItem
 from app.schemas.types import SystemConfigKey, EventType
-from app.utils.singleton import Singleton
+from app.utils.singleton import SingletonClass
+from app.utils.system import SystemUtils
 
 lock = Lock()
 snapshot_lock = Lock()
@@ -54,12 +54,10 @@ class FileMonitorHandler(FileSystemEventHandler):
                                     file_size=Path(event.dest_path).stat().st_size)
 
 
-class Monitor(metaclass=Singleton):
+class Monitor(metaclass=SingletonClass):
     """
     目录监控处理链，单例模式
     """
-
-
 
     def __init__(self):
         super().__init__()
@@ -69,17 +67,14 @@ class Monitor(metaclass=Singleton):
         self._observers = []
         # 定时服务
         self._scheduler = None
-        # 存储快照缓存目录
-        self._snapshot_cache_dir = None
         # 存储过照间隔（分钟）
         self._snapshot_interval = 5
         # TTL缓存，10秒钟有效
-        self._cache = TTLCache(maxsize=1024, ttl=10)
+        self._cache = TTLCache(region="monitor", maxsize=1024, ttl=10)
+        # 快照文件缓存
+        self._snapshot_cache = FileCache(base=settings.CACHE_PATH / "snapshots")
         # 监控的文件扩展名
         self.all_exts = settings.RMT_MEDIAEXT
-        # 初始化快照缓存目录
-        self._snapshot_cache_dir = settings.TEMP_PATH / "snapshots"
-        self._snapshot_cache_dir.mkdir(exist_ok=True)
         # 启动目录监控和文件整理
         self.init()
 
@@ -97,23 +92,29 @@ class Monitor(metaclass=Singleton):
         logger.info("配置变更事件触发，重新初始化目录监控...")
         self.init()
 
-    def save_snapshot(self, storage: str, snapshot: Dict, file_count: int = 0):
+    def save_snapshot(self, storage: str, snapshot: Dict, file_count: int = 0,
+                      last_snapshot_time: Optional[float] = None):
         """
-        保存快照到文件
+        保存快照到文件缓存
         :param storage: 存储名称
         :param snapshot: 快照数据
+        :param last_snapshot_time: 上次快照时间戳
         :param file_count: 文件数量，用于调整监控间隔
         """
         try:
-            cache_file = self._snapshot_cache_dir / f"{storage}_snapshot.json"
+            snapshot_time = max((item.get('modify_time', 0) for item in snapshot.values()), default=None)
+            if snapshot_time is None:
+                snapshot_time = last_snapshot_time or time.time()
             snapshot_data = {
-                'timestamp': time.time(),
+                'timestamp': snapshot_time,
                 'file_count': file_count,
                 'snapshot': snapshot
             }
-            with open(cache_file, 'w', encoding='utf-8') as f:
-                json.dump(snapshot_data, f, ensure_ascii=False, indent=2)  # noqa
-            logger.debug(f"快照已保存到 {cache_file}")
+            # 使用FileCache保存快照数据
+            cache_key = f"{storage}_snapshot"
+            snapshot_json = json.dumps(snapshot_data, ensure_ascii=False, indent=2)
+            self._snapshot_cache.set(cache_key, snapshot_json.encode('utf-8'), region="snapshots")
+            logger.debug(f"快照已保存到缓存: {storage}")
         except Exception as e:
             logger.error(f"保存快照失败: {e}")
 
@@ -124,9 +125,9 @@ class Monitor(metaclass=Singleton):
         :return: 是否成功
         """
         try:
-            cache_file = self._snapshot_cache_dir / f"{storage}_snapshot.json"
-            if cache_file.exists():
-                cache_file.unlink()
+            cache_key = f"{storage}_snapshot"
+            if self._snapshot_cache.exists(cache_key, region="snapshots"):
+                self._snapshot_cache.delete(cache_key, region="snapshots")
                 logger.info(f"快照已重置: {storage}")
                 return True
             logger.debug(f"快照文件不存在，无需重置: {storage}")
@@ -184,18 +185,18 @@ class Monitor(metaclass=Singleton):
 
     def load_snapshot(self, storage: str) -> Optional[Dict]:
         """
-        从文件加载快照
+        从文件缓存加载快照
         :param storage: 存储名称
         :return: 快照数据或None
         """
         try:
-            cache_file = self._snapshot_cache_dir / f"{storage}_snapshot.json"
-            if cache_file.exists():
-                with open(cache_file, 'r', encoding='utf-8') as f:
-                    data = json.load(f)
-                    logger.debug(f"成功加载快照: {cache_file}, 包含 {len(data.get('snapshot', {}))} 个文件")
-                    return data
-            logger.debug(f"快照文件不存在: {cache_file}")
+            cache_key = f"{storage}_snapshot"
+            snapshot_data = self._snapshot_cache.get(cache_key, region="snapshots")
+            if snapshot_data:
+                data = json.loads(snapshot_data.decode('utf-8'))
+                logger.debug(f"成功加载快照: {storage}, 包含 {len(data.get('snapshot', {}))} 个文件")
+                return data
+            logger.debug(f"快照文件不存在: {storage}")
             return None
         except Exception as e:
             logger.error(f"加载快照失败: {e}")
@@ -354,7 +355,8 @@ class Monitor(metaclass=Singleton):
 
         return tips
 
-    def should_use_polling(self, directory: Path, monitor_mode: str,
+    @staticmethod
+    def should_use_polling(directory: Path, monitor_mode: str,
                            file_count: int, limits: dict) -> tuple[bool, str]:
         """
         判断是否应该使用轮询模式
@@ -368,44 +370,13 @@ class Monitor(metaclass=Singleton):
             return True, "用户配置为兼容模式"
 
         # 检查网络文件系统
-        if self.is_network_filesystem(directory):
+        if SystemUtils.is_network_filesystem(directory):
             return True, "检测到网络文件系统，建议使用兼容模式"
 
         max_watches = limits.get('max_user_watches')
         if max_watches and file_count > max_watches * 0.8:
             return True, f"目录文件数量({file_count})接近系统限制({max_watches})"
         return False, "使用快速模式"
-
-    @staticmethod
-    def is_network_filesystem(directory: Path) -> bool:
-        """
-        检测是否为网络文件系统
-        :param directory: 目录路径
-        :return: 是否为网络文件系统
-        """
-        try:
-            system = platform.system()
-            if system == 'Linux':
-                # 检查挂载信息
-                result = subprocess.run(['df', '-T', str(directory)],
-                                        capture_output=True, text=True, timeout=5)
-                if result.returncode == 0:
-                    output = result.stdout.lower()
-                    network_fs = ['nfs', 'cifs', 'smbfs', 'fuse', 'sshfs', 'ftpfs']
-                    return any(fs in output for fs in network_fs)
-            elif system == 'Darwin':
-                # macOS 检查
-                result = subprocess.run(['df', '-T', str(directory)],
-                                        capture_output=True, text=True, timeout=5)
-                if result.returncode == 0:
-                    output = result.stdout.lower()
-                    return 'nfs' in output or 'smbfs' in output
-            elif system == 'Windows':
-                # Windows 检查网络驱动器
-                return str(directory).startswith('\\\\')
-        except Exception as e:
-            logger.debug(f"检测网络文件系统时出错: {e}")
-        return False
 
     def init(self):
         """
@@ -428,6 +399,7 @@ class Monitor(metaclass=Singleton):
         self._scheduler = BackgroundScheduler(timezone=settings.TZ)
 
         messagehelper = MessageHelper()
+        mon_storages = {}
         for mon_dir in monitor_dirs:
             if not mon_dir.library_path:
                 logger.warn(f"跳过监控配置 {mon_dir.download_path}：未设置媒体库目录")
@@ -512,28 +484,33 @@ class Monitor(metaclass=Singleton):
 
                     messagehelper.put(f"启动本地目录监控失败: {mon_path}\n错误: {err_msg}", title="目录监控")
             else:
-                # 远程目录监控 - 使用智能间隔
-                # 先尝试加载已有快照获取文件数量
-                snapshot_data = self.load_snapshot(mon_dir.storage)
-                file_count = snapshot_data.get('file_count', 0) if snapshot_data else 0
-                interval = self.adjust_monitor_interval(file_count)
+                if not mon_storages.get(mon_dir.storage):
+                    mon_storages[mon_dir.storage] = []
+                mon_storages[mon_dir.storage].append(mon_path)
 
-                logger.info(f"正在启动远程目录监控: {mon_path} [{mon_dir.storage}]")
-                logger.info("*** 重要提示：远程目录监控只处理新增和修改的文件，不会处理监控启动前已存在的文件 ***")
-                logger.info(f"预估文件数量: {file_count}, 监控间隔: {interval}分钟")
+        for storage, paths in mon_storages.items():
+            # 远程目录监控 - 使用智能间隔
+            # 先尝试加载已有快照获取文件数量
+            snapshot_data = self.load_snapshot(storage)
+            file_count = snapshot_data.get('file_count', 0) if snapshot_data else 0
+            interval = self.adjust_monitor_interval(file_count)
+            for path in paths:
+                logger.info(f"正在启动远程目录监控: {path} [{storage}]")
+            logger.info("*** 重要提示：远程目录监控只处理新增和修改的文件，不会处理监控启动前已存在的文件 ***")
+            logger.info(f"预估文件数量: {file_count}, 监控间隔: {interval}分钟")
 
-                self._scheduler.add_job(
-                    self.polling_observer,
-                    'interval',
-                    minutes=interval,
-                    kwargs={
-                        'storage': mon_dir.storage,
-                        'mon_path': mon_path
-                    },
-                    id=f"monitor_{mon_dir.storage}_{mon_dir.download_path}",
-                    replace_existing=True
-                )
-                logger.info(f"✓ 远程目录监控已启动: {mon_path} [间隔: {interval}分钟]")
+            self._scheduler.add_job(
+                self.polling_observer,
+                'interval',
+                minutes=interval,
+                kwargs={
+                    'storage': storage,
+                    'mon_paths': paths
+                },
+                id=f"monitor_{storage}",
+                replace_existing=True
+            )
+            logger.info(f"✓ 远程目录监控已启动: [间隔: {interval}分钟]")
 
         # 启动定时服务
         if self._scheduler.get_jobs():
@@ -604,14 +581,12 @@ class Monitor(metaclass=Singleton):
             logger.debug(f"导入 {module_name}.{class_name} 失败: {e}")
             return None
 
-    def polling_observer(self, storage: str, mon_path: Path):
+    def polling_observer(self, storage: str, mon_paths: List[Path]):
         """
         轮询监控（改进版）
         """
         with snapshot_lock:
             try:
-                logger.debug(f"开始对 {storage}:{mon_path} 进行快照...")
-
                 # 加载上次快照数据
                 old_snapshot_data = self.load_snapshot(storage)
                 old_snapshot = old_snapshot_data.get('snapshot', {}) if old_snapshot_data else {}
@@ -619,21 +594,24 @@ class Monitor(metaclass=Singleton):
 
                 # 判断是否为首次快照：检查快照文件是否存在且有效
                 is_first_snapshot = old_snapshot_data is None
+                new_snapshot = {}
+                for mon_path in mon_paths:
+                    logger.debug(f"开始对 {storage}:{mon_path} 进行快照...")
 
-                # 生成新快照（增量模式）
-                new_snapshot = StorageChain().snapshot_storage(
-                    storage=storage,
-                    path=mon_path,
-                    last_snapshot_time=last_snapshot_time
-                )
+                    # 生成新快照（增量模式）
+                    snapshot = StorageChain().snapshot_storage(
+                        storage=storage,
+                        path=mon_path,
+                        last_snapshot_time=last_snapshot_time
+                    )
 
-                if new_snapshot is None:
-                    logger.warn(f"获取 {storage}:{mon_path} 快照失败")
-                    return
-
+                    if snapshot is None:
+                        logger.warn(f"获取 {storage}:{mon_path} 快照失败")
+                        continue
+                    new_snapshot.update(snapshot)
+                    file_count = len(snapshot)
+                    logger.info(f"{storage}:{mon_path} 快照完成，发现 {file_count} 个文件")
                 file_count = len(new_snapshot)
-                logger.info(f"{storage}:{mon_path} 快照完成，发现 {file_count} 个文件")
-
                 if not is_first_snapshot:
                     # 比较快照找出变化
                     changes = self.compare_snapshots(old_snapshot, new_snapshot)
@@ -654,23 +632,23 @@ class Monitor(metaclass=Singleton):
 
                     if changes['added'] or changes['modified']:
                         logger.info(
-                            f"{storage}:{mon_path} 发现 {len(changes['added'])} 个新增文件，{len(changes['modified'])} 个修改文件")
+                            f"{storage} 发现 {len(changes['added'])} 个新增文件，{len(changes['modified'])} 个修改文件")
                     else:
-                        logger.debug(f"{storage}:{mon_path} 无文件变化")
+                        logger.debug(f"{storage} 无文件变化")
                 else:
-                    logger.info(f"{storage}:{mon_path} 首次快照完成，共 {file_count} 个文件")
+                    logger.info(f"{storage} 首次快照完成，共 {file_count} 个文件")
                     logger.info("*** 首次快照仅建立基准，不会处理现有文件。后续监控将处理新增和修改的文件 ***")
 
                 # 保存新快照
-                self.save_snapshot(storage, new_snapshot, file_count)
+                self.save_snapshot(storage, new_snapshot, file_count, last_snapshot_time)
 
                 # 动态调整监控间隔
                 new_interval = self.adjust_monitor_interval(file_count)
-                current_job = self._scheduler.get_job(f"monitor_{storage}_{mon_path}")
+                current_job = self._scheduler.get_job(f"monitor_{storage}")
                 if current_job and current_job.trigger.interval.total_seconds() / 60 != new_interval:
                     # 重新安排任务
                     self._scheduler.modify_job(
-                        f"monitor_{storage}_{mon_path}",
+                        f"monitor_{storage}",
                         trigger='interval',
                         minutes=new_interval
                     )
@@ -706,7 +684,7 @@ class Monitor(metaclass=Singleton):
             """
             判断是否蓝光原盘目录内的子目录或文件
             """
-            return True if re.search(r"BDMV[/\\]STREAM", str(_path), re.IGNORECASE) else False
+            return True if re.search(r"BDMV/STREAM", _path.as_posix(), re.IGNORECASE) else False
 
         def __get_bluray_dir(_path: Path) -> Optional[Path]:
             """
@@ -737,7 +715,7 @@ class Monitor(metaclass=Singleton):
                 TransferChain().do_transfer(
                     fileitem=FileItem(
                         storage=storage,
-                        path=str(event_path).replace("\\", "/"),
+                        path=event_path.as_posix(),
                         type="file",
                         name=event_path.name,
                         basename=event_path.stem,
@@ -750,7 +728,7 @@ class Monitor(metaclass=Singleton):
 
     def stop(self):
         """
-        退出插件
+        退出监控
         """
         self._event.set()
         if self._observers:
@@ -773,4 +751,8 @@ class Monitor(metaclass=Singleton):
                 except Exception as e:
                     logger.error(f"停止定时服务出现了错误：{e}")
             self._scheduler = None
+        if self._cache:
+            self._cache.close()
+        if self._snapshot_cache:
+            self._snapshot_cache.close()
         self._event.clear()

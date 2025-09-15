@@ -1,16 +1,17 @@
 from datetime import datetime
 
-from sqlalchemy import Boolean, Column, Integer, String, Sequence, JSON
+from sqlalchemy import Boolean, Column, Integer, String, JSON, select, delete
+from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import Session
 
-from app.db import db_query, db_update, Base
+from app.db import db_query, db_update, Base, async_db_query, async_db_update, get_id_column
 
 
 class Site(Base):
     """
     站点表
     """
-    id = Column(Integer, Sequence('id'), primary_key=True, index=True)
+    id = get_id_column()
     # 站点名
     name = Column(String, nullable=False)
     # 域名Key
@@ -54,27 +55,50 @@ class Site(Base):
     # 下载器
     downloader = Column(String)
 
-    @staticmethod
+    @classmethod
     @db_query
-    def get_by_domain(db: Session, domain: str):
-        return db.query(Site).filter(Site.domain == domain).first()
+    def get_by_domain(cls, db: Session, domain: str):
+        return db.query(cls).filter(cls.domain == domain).first()
 
-    @staticmethod
+    @classmethod
+    @async_db_query
+    async def async_get_by_domain(cls, db: AsyncSession, domain: str):
+        result = await db.execute(select(cls).where(cls.domain == domain))
+        return result.scalar_one_or_none()
+
+    @classmethod
     @db_query
-    def get_actives(db: Session):
-        return db.query(Site).filter(Site.is_active == 1).all()
+    def get_actives(cls, db: Session):
+        return db.query(cls).filter(cls.is_active).all()
 
-    @staticmethod
+    @classmethod
+    @async_db_query
+    async def async_get_actives(cls, db: AsyncSession):
+        result = await db.execute(select(cls).where(cls.is_active))
+        return result.scalars().all()
+
+    @classmethod
     @db_query
-    def list_order_by_pri(db: Session):
-        return db.query(Site).order_by(Site.pri).all()
+    def list_order_by_pri(cls, db: Session):
+        return db.query(cls).order_by(cls.pri).all()
 
-    @staticmethod
+    @classmethod
+    @async_db_query
+    async def async_list_order_by_pri(cls, db: AsyncSession):
+        result = await db.execute(select(cls).order_by(cls.pri))
+        return result.scalars().all()
+
+    @classmethod
     @db_query
-    def get_domains_by_ids(db: Session, ids: list):
-        return [r[0] for r in db.query(Site.domain).filter(Site.id.in_(ids)).all()]
+    def get_domains_by_ids(cls, db: Session, ids: list):
+        return [r[0] for r in db.query(cls.domain).filter(cls.id.in_(ids)).all()]
 
-    @staticmethod
+    @classmethod
     @db_update
-    def reset(db: Session):
-        db.query(Site).delete()
+    def reset(cls, db: Session):
+        db.query(cls).delete()
+
+    @classmethod
+    @async_db_update
+    async def async_reset(cls, db: AsyncSession):
+        await db.execute(delete(cls))
