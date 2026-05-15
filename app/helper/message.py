@@ -164,6 +164,8 @@ class TemplateContextBuilder:
             "part": meta.part,
             # 自定义占位符
             "customization": meta.customization,
+            # fps
+            "fps": meta.fps,
         }
 
         tech_metadata = {
@@ -539,7 +541,7 @@ class MessageTemplateHelper:
         获取消息模板
         """
         template_dict: dict[str, str] = SystemConfigOper().get(SystemConfigKey.NotificationTemplates)
-        return template_dict.get(f"{message.ctype.value}")
+        return template_dict.get(message.ctype.value)
 
 
 class MessageQueueManager(metaclass=SingletonClass):

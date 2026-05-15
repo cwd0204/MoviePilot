@@ -1,7 +1,7 @@
 """查询下载器工具"""
 
 import json
-from typing import Type
+from typing import Optional, Type
 
 from pydantic import BaseModel, Field
 
@@ -19,13 +19,22 @@ class QueryDownloadersInput(BaseModel):
 class QueryDownloadersTool(MoviePilotTool):
     name: str = "query_downloaders"
     description: str = "Query downloader configuration and list all available downloaders. Shows downloader status, connection details, and configuration settings."
+    require_admin: bool = True
     args_schema: Type[BaseModel] = QueryDownloadersInput
+
+    def get_tool_message(self, **kwargs) -> Optional[str]:
+        """生成友好的提示消息"""
+        return "查询下载器配置"
+
+    @staticmethod
+    def _load_downloaders_config():
+        """从内存配置缓存中读取下载器配置。"""
+        return SystemConfigOper().get(SystemConfigKey.Downloaders)
 
     async def run(self, **kwargs) -> str:
         logger.info(f"执行工具: {self.name}")
         try:
-            system_config_oper = SystemConfigOper()
-            downloaders_config = system_config_oper.get(SystemConfigKey.Downloaders)
+            downloaders_config = self._load_downloaders_config()
             if downloaders_config:
                 return json.dumps(downloaders_config, ensure_ascii=False, indent=2)
             return "未配置下载器。"

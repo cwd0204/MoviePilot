@@ -1,7 +1,7 @@
 import time
 from typing import Optional
 
-from sqlalchemy import Column, Integer, String, Float, JSON, select
+from sqlalchemy import Column, Integer, String, Float, JSON, Index, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import Session
 
@@ -64,15 +64,19 @@ class Subscribe(Base):
     # 创建时间
     date = Column(String)
     # 订阅用户
-    username = Column(String)
+    username = Column(String, index=True)
     # 订阅站点
     sites = Column(JSON, default=list)
     # 下载器
     downloader = Column(String)
     # 是否洗版
     best_version = Column(Integer, default=0)
+    # 是否只洗全集整包，开启后电视剧洗版不按单集下载
+    best_version_full = Column(Integer, default=0)
     # 当前优先级
     current_priority = Column(Integer)
+    # 洗版时已下载剧集的优先级状态，格式：{"1": 90, "2": 100}
+    episode_priority = Column(JSON)
     # 保存路径
     save_path = Column(String)
     # 是否使用 imdbid 搜索
@@ -88,12 +92,16 @@ class Subscribe(Base):
     # 选择的剧集组
     episode_group = Column(String)
 
+    __table_args__ = (
+        Index('ix_subscribe_type_date', 'type', 'date'),
+    )
+
     @classmethod
     @db_query
     def exists(cls, db: Session, tmdbid: Optional[int] = None, doubanid: Optional[str] = None,
                season: Optional[int] = None):
         if tmdbid:
-            if season:
+            if season is not None:
                 return db.query(cls).filter(cls.tmdbid == tmdbid,
                                             cls.season == season).first()
             return db.query(cls).filter(cls.tmdbid == tmdbid).first()
@@ -106,7 +114,7 @@ class Subscribe(Base):
     async def async_exists(cls, db: AsyncSession, tmdbid: Optional[int] = None, doubanid: Optional[str] = None,
                            season: Optional[int] = None):
         if tmdbid:
-            if season:
+            if season is not None:
                 result = await db.execute(
                     select(cls).filter(cls.tmdbid == tmdbid, cls.season == season)
                 )
@@ -148,7 +156,7 @@ class Subscribe(Base):
     @classmethod
     @db_query
     def get_by_title(cls, db: Session, title: str, season: Optional[int] = None):
-        if season:
+        if season is not None:
             return db.query(cls).filter(cls.name == title,
                                         cls.season == season).first()
         return db.query(cls).filter(cls.name == title).first()
@@ -156,7 +164,7 @@ class Subscribe(Base):
     @classmethod
     @async_db_query
     async def async_get_by_title(cls, db: AsyncSession, title: str, season: Optional[int] = None):
-        if season:
+        if season is not None:
             result = await db.execute(
                 select(cls).filter(cls.name == title, cls.season == season)
             )
@@ -169,7 +177,7 @@ class Subscribe(Base):
     @classmethod
     @db_query
     def get_by_tmdbid(cls, db: Session, tmdbid: int, season: Optional[int] = None):
-        if season:
+        if season is not None:
             return db.query(cls).filter(cls.tmdbid == tmdbid,
                                         cls.season == season).all()
         else:
@@ -178,7 +186,7 @@ class Subscribe(Base):
     @classmethod
     @async_db_query
     async def async_get_by_tmdbid(cls, db: AsyncSession, tmdbid: int, season: Optional[int] = None):
-        if season:
+        if season is not None:
             result = await db.execute(
                 select(cls).filter(cls.tmdbid == tmdbid, cls.season == season)
             )
@@ -225,6 +233,66 @@ class Subscribe(Base):
         result = await db.execute(
             select(cls).filter(cls.mediaid == mediaid)
         )
+        return result.scalars().first()
+
+    @classmethod
+    @db_query
+    def get_by(cls, db: Session, type: str, season: Optional[str] = None,
+                tmdbid: Optional[int] = None, doubanid: Optional[str] = None, bangumiid: Optional[str] = None):
+        """
+        根据条件查询订阅
+        """
+        # TMDBID
+        if tmdbid:
+            if season is not None:
+                result = db.query(cls).filter(
+                    cls.tmdbid == tmdbid, cls.type == type, cls.season == season
+                )
+            else:
+                result = db.query(cls).filter(cls.tmdbid == tmdbid, cls.type == type)
+        # 豆瓣ID
+        elif doubanid:
+            result = db.query(cls).filter(cls.doubanid == doubanid, cls.type == type)
+        # BangumiID
+        elif bangumiid:
+            result = db.query(cls).filter(cls.bangumiid == bangumiid, cls.type == type)
+        else:
+            return None
+
+        return result.first()
+
+    @classmethod
+    @async_db_query
+    async def async_get_by(cls, db: AsyncSession, type: str, season: Optional[str] = None,
+                tmdbid: Optional[int] = None, doubanid: Optional[str] = None, bangumiid: Optional[str] = None):
+        """
+        根据条件查询订阅
+        """
+        # TMDBID
+        if tmdbid:
+            if season is not None:
+                result = await db.execute(
+                    select(cls).filter(
+                        cls.tmdbid == tmdbid, cls.type == type, cls.season == season
+                    )
+                )
+            else:
+                result = await db.execute(
+                    select(cls).filter(cls.tmdbid == tmdbid, cls.type == type)
+                )
+        # 豆瓣ID
+        elif doubanid:
+            result = await db.execute(
+                select(cls).filter(cls.doubanid == doubanid, cls.type == type)
+            )
+        # BangumiID
+        elif bangumiid:
+            result = await db.execute(
+                select(cls).filter(cls.bangumiid == bangumiid, cls.type == type)
+            )
+        else:
+            return None
+
         return result.scalars().first()
 
     @db_update

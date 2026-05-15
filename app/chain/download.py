@@ -19,7 +19,7 @@ from app.db.mediaserver_oper import MediaServerOper
 from app.helper.directory import DirectoryHelper
 from app.helper.torrent import TorrentHelper
 from app.log import logger
-from app.schemas import ExistMediaInfo, NotExistMediaInfo, DownloadingTorrent, Notification, ResourceSelectionEventData, \
+from app.schemas import ExistMediaInfo, FileURI, NotExistMediaInfo, DownloadingTorrent, Notification, ResourceSelectionEventData, \
     ResourceDownloadEventData
 from app.schemas.types import MediaType, TorrentStatus, EventType, MessageChannel, NotificationType, ContentType, \
     ChainEventType
@@ -152,7 +152,8 @@ class DownloadChain(ChainBase):
                         save_path: Optional[str] = None,
                         userid: Union[str, int] = None,
                         username: Optional[str] = None,
-                        label: Optional[str] = None) -> Optional[str]:
+                        label: Optional[str] = None,
+                        return_detail: bool = False) -> Union[Optional[str], Tuple[Optional[str], Optional[str]]]:
         """
         下载及发送通知
         :param context: 资源上下文
@@ -162,10 +163,12 @@ class DownloadChain(ChainBase):
         :param channel: 通知渠道
         :param source: 来源（消息通知、Subscribe、Manual等）
         :param downloader: 下载器
-        :param save_path: 保存路径
+        :param save_path: 保存路径, 支持<storage>:<path>, 如rclone:/MP, smb:/server/share/Movies等
         :param userid: 用户ID
         :param username: 调用下载的用户名/插件名
         :param label: 自定义标签
+        :param return_detail: 是否返回详细结果；False 时返回下载任务 hash 或 None，True 时返回 (hash, error_msg)
+        :return: return_detail=False 时返回下载任务 hash 或 None；return_detail=True 时返回 (hash, error_msg)
         """
         _torrent = context.torrent_info
         _media = context.media_info
@@ -195,7 +198,7 @@ class DownloadChain(ChainBase):
                 logger.debug(
                     f"Resource download canceled by event: {event_data.source},"
                     f"Reason: {event_data.reason}")
-                return None
+                return (None, "下载被事件取消") if return_detail else None
             # 如果事件修改了下载路径，使用新路径
             if event_data.options and event_data.options.get("save_path"):
                 save_path = event_data.options.get("save_path")
@@ -210,6 +213,12 @@ class DownloadChain(ChainBase):
 
         # 实际下载的集数
         download_episodes = StringUtils.format_ep(list(episodes)) if episodes else None
+        if episodes is not None:
+            context.selected_episodes = sorted(set(episodes))
+        elif _meta and _meta.episode_list:
+            context.selected_episodes = sorted(set(_meta.episode_list))
+        else:
+            context.selected_episodes = []
         _folder_name = ""
         if not torrent_file and not torrent_content:
             # 下载种子文件，得到的可能是文件也可能是磁力链
@@ -227,18 +236,19 @@ class DownloadChain(ChainBase):
                 torrent_content = cache_backend.get(torrent_file.as_posix(), region="torrents")
 
         if not torrent_content:
-            return None
+            return (None, "下载种子内容为空") if return_detail else None
 
         # 获取种子文件的文件夹名和文件清单
         _folder_name, _file_list = TorrentHelper().get_fileinfo_from_torrent_content(torrent_content)
 
+        storage = 'local'
         # 下载目录
         if save_path:
-            # 下载目录使用自定义的
             download_dir = Path(save_path)
         else:
             # 根据媒体信息查询下载目录配置
-            dir_info = DirectoryHelper().get_dir(_media, storage="local", include_unsorted=True)
+            dir_info = DirectoryHelper().get_dir(_media, include_unsorted=True)
+            storage = dir_info.storage if dir_info else storage
             # 拼装子目录
             if dir_info:
                 # 一级目录
@@ -258,7 +268,9 @@ class DownloadChain(ChainBase):
                 logger.error(f"未找到下载目录：{_media.type.value} {_media.title_year}")
                 self.messagehelper.put(f"{_media.type.value} {_media.title_year} 未找到下载目录！",
                                        title="下载失败", role="system")
-                return None
+                return (None, "未找到下载目录") if return_detail else None
+            fileURI = FileURI(storage=storage, path=download_dir.as_posix())
+            download_dir = Path(fileURI.uri)
 
         # 添加下载
         result: Optional[tuple] = self.download(content=torrent_content,
@@ -324,9 +336,10 @@ class DownloadChain(ChainBase):
                     if not file_meta.begin_episode \
                             or file_meta.begin_episode not in episodes:
                         continue
-                # 只处理视频格式
+                # 只处理音视频、字幕格式
+                media_exts = settings.RMT_MEDIAEXT + settings.RMT_SUBEXT + settings.RMT_AUDIOEXT
                 if not Path(file).suffix \
-                        or Path(file).suffix.lower() not in settings.RMT_MEDIAEXT:
+                        or Path(file).suffix.lower() not in media_exts:
                     continue
                 files_to_add.append({
                     "download_hash": _hash,
@@ -384,6 +397,8 @@ class DownloadChain(ChainBase):
                      f"错误信息：{error_msg}",
                 image=_media.get_message_image(),
                 userid=userid))
+        if return_detail:
+            return _hash, error_msg
         return _hash
 
     def batch_download(self,
@@ -400,7 +415,7 @@ class DownloadChain(ChainBase):
         根据缺失数据，自动种子列表中组合择优下载
         :param contexts:  资源上下文列表
         :param no_exists:  缺失的剧集信息
-        :param save_path:  保存路径
+        :param save_path:  保存路径, 支持<storage>:<path>, 如rclone:/MP, smb:/server/share/Movies等
         :param channel:  通知渠道
         :param source:  来源（消息通知、订阅、手工下载等）
         :param userid:  用户ID
@@ -941,9 +956,13 @@ class DownloadChain(ChainBase):
         torrents = self.list_torrents(downloader=name, status=TorrentStatus.DOWNLOADING)
         if not torrents:
             return []
+
+        history_map = DownloadHistoryOper().get_by_hashes(
+            [torrent.hash for torrent in torrents if torrent.hash]
+        )
         ret_torrents = []
         for torrent in torrents:
-            history = DownloadHistoryOper().get_by_hash(torrent.hash)
+            history = history_map.get(torrent.hash)
             if history:
                 # 媒体信息
                 torrent.media = {

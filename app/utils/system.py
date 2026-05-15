@@ -166,10 +166,8 @@ class SystemUtils:
         移动
         """
         try:
-            # 当前目录改名
-            temp = src.replace(src.parent / dest.name)
-            # 移动到目标目录
-            shutil.move(temp, dest)
+            # 直接移动到目标路径，避免中间改名步骤触发目录监控
+            shutil.move(src, dest)
             return 0, ""
         except Exception as err:
             return -1, str(err)
@@ -479,6 +477,8 @@ class SystemUtils:
     def is_bluray_dir(dir_path: Path) -> bool:
         """
         判断是否为蓝光原盘目录
+
+        (该方法已弃用，改用`StorageChain().is_bluray_folder)`
         """
         if not dir_path.is_dir():
             return False
@@ -583,6 +583,7 @@ class SystemUtils:
                     local_fs = [
                         "fuse.shfs",  # Unraid
                         "zfuse.zfsv",  # 极空间(zfuse.zfsv2、zfuse.zfsv3、...)
+                        "fuseblk",
                         # TBD
                     ]
                     if any(fs in output for fs in local_fs):

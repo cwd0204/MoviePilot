@@ -1,4 +1,5 @@
 from enum import Enum
+from typing import Optional
 
 
 # 媒体类型
@@ -7,6 +8,26 @@ class MediaType(Enum):
     TV = '电视剧'
     COLLECTION = '系列'
     UNKNOWN = '未知'
+
+    @staticmethod
+    def from_agent(key: str) -> Optional["MediaType"]:
+        """'movie' -> MediaType.MOVIE, 'tv' -> MediaType.TV, 否则 None"""
+        _map = {"movie": MediaType.MOVIE, "tv": MediaType.TV}
+        return _map.get(key.strip().lower() if key else "")
+
+    def to_agent(self) -> str:
+        """MediaType.MOVIE -> 'movie', MediaType.TV -> 'tv', 其他返回 .value"""
+        return {MediaType.MOVIE: "movie", MediaType.TV: "tv"}.get(self, self.value)
+
+
+def media_type_to_agent(value) -> Optional[str]:
+    """将 MediaType 枚举或中文字符串统一转为 'movie'/'tv'"""
+    if isinstance(value, MediaType):
+        return value.to_agent()
+    if isinstance(value, str):
+        mt = MediaType.from_agent(value)
+        return mt.to_agent() if mt else value
+    return None
 
 
 # 排序类型枚举
@@ -38,8 +59,18 @@ class EventType(Enum):
     SiteUpdated = "site.updated"
     # 站点已刷新
     SiteRefreshed = "site.refreshed"
-    # 转移完成
+    # 媒体文件整理完成
     TransferComplete = "transfer.complete"
+    # 媒体文件整理失败
+    TransferFailed = "transfer.failed"
+    # 字幕整理完成
+    SubtitleTransferComplete = "transfer.subtitle.complete"
+    # 字幕整理失败
+    SubtitleTransferFailed = "transfer.subtitle.failed"
+    # 音频文件整理完成
+    AudioTransferComplete = "transfer.audio.complete"
+    # 音频文件整理失败
+    AudioTransferFailed = "transfer.audio.failed"
     # 下载已添加
     DownloadAdded = "download.added"
     # 删除历史记录
@@ -86,6 +117,11 @@ EVENT_TYPE_NAMES = {
     EventType.SiteUpdated: "站点已更新",
     EventType.SiteRefreshed: "站点已刷新",
     EventType.TransferComplete: "整理完成",
+    EventType.TransferFailed: "整理失败",
+    EventType.SubtitleTransferComplete: "字幕整理完成",
+    EventType.SubtitleTransferFailed: "字幕整理失败",
+    EventType.AudioTransferComplete: "音频整理完成",
+    EventType.AudioTransferFailed: "音频整理失败",
     EventType.DownloadAdded: "添加下载",
     EventType.HistoryDeleted: "删除历史记录",
     EventType.DownloadFileDeleted: "删除下载源文件",
@@ -120,6 +156,8 @@ class ChainEventType(Enum):
     TransferRename = "transfer.rename"
     # 整理拦截
     TransferIntercept = "transfer.intercept"
+    # 整理覆盖检查
+    TransferOverwriteCheck = "transfer.overwrite.check"
     # 资源选择
     ResourceSelection = "resource.selection"
     # 资源下载
@@ -204,6 +242,8 @@ class SystemConfigKey(Enum):
     PluginInstallReport = "PluginInstallReport"
     # 配置向导状态
     SetupWizardState = "SetupWizardState"
+    # 绿联影视登录会话缓存
+    UgreenSessionCache = "UgreenSessionCache"
 
 
 # 处理进度Key字典
@@ -238,6 +278,8 @@ class NotificationType(Enum):
     Manual = "手动处理"
     # 插件消息
     Plugin = "插件"
+    # 智能体消息
+    Agent = "智能体"
     # 其它消息
     Other = "其它"
 
@@ -263,12 +305,16 @@ class MessageChannel(Enum):
     消息渠道
     """
     Wechat = "微信"
+    Feishu = "飞书"
+    WechatClawBot = "微信ClawBot"
     Telegram = "Telegram"
     Slack = "Slack"
+    Discord = "Discord"
     SynologyChat = "SynologyChat"
     VoceChat = "VoceChat"
     Web = "Web"
     WebPush = "WebPush"
+    QQ = "QQ"
 
 
 # 下载器类型
@@ -277,6 +323,8 @@ class DownloaderType(Enum):
     Qbittorrent = "Qbittorrent"
     # Transmission
     Transmission = "Transmission"
+    # Rtorrent
+    Rtorrent = "Rtorrent"
     # Aria2
     # Aria2 = "Aria2"
 
@@ -285,12 +333,16 @@ class DownloaderType(Enum):
 class MediaServerType(Enum):
     # Emby
     Emby = "Emby"
+    # 极影视
+    ZSpace = "ZSpace"
     # Jellyfin
     Jellyfin = "Jellyfin"
     # Plex
     Plex = "Plex"
     # 飞牛影视
     TrimeMedia = "TrimeMedia"
+    # 绿联影视
+    Ugreen = "Ugreen"
 
 
 # 识别器类型
@@ -354,3 +406,41 @@ class OtherModulesType(Enum):
     PostgreSQL = "PostgreSQL"
     # Redis
     Redis = "Redis"
+
+
+class NameValueEnum(Enum):
+    """支持通过 name 或 value 实例化的枚举基类"""
+
+    @classmethod
+    def _missing_(cls, value):
+        if isinstance(value, str):
+            for member in cls:
+                if member.name.lower() == value.lower() or member.value == value:
+                    return member
+        return None
+
+
+# 刮削策略
+class ScrapingPolicy(NameValueEnum):
+    MISSINGONLY = "仅缺失"
+    SKIP = "跳过"
+    OVERWRITE = "覆盖"
+
+
+# 刮削目标类型
+class ScrapingTarget(NameValueEnum):
+    MOVIE = "电影"
+    TV = "电视剧"
+    SEASON = "季"
+    EPISODE = "集"
+
+
+# 刮削元数据类型
+class ScrapingMetadata(NameValueEnum):
+    NFO = "NFO"
+    POSTER = "海报"
+    BACKDROP = "背景图"
+    LOGO = "Logo"
+    BANNER = "横幅图"
+    THUMB = "缩略图"
+    DISC = "光盘图"

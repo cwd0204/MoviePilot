@@ -17,13 +17,12 @@ from app.chain.storage import StorageChain
 from app.chain.transfer import TransferChain
 from app.core.cache import TTLCache, FileCache
 from app.core.config import settings
-from app.core.event import Event, eventmanager
 from app.helper.directory import DirectoryHelper
 from app.helper.message import MessageHelper
 from app.log import logger
-from app.schemas import ConfigChangeEventData
 from app.schemas import FileItem
-from app.schemas.types import SystemConfigKey, EventType
+from app.schemas.types import SystemConfigKey
+from app.utils.mixins import ConfigReloadMixin
 from app.utils.singleton import SingletonClass
 from app.utils.system import SystemUtils
 
@@ -60,10 +59,11 @@ class FileMonitorHandler(FileSystemEventHandler):
             logger.error(f"on_moved 异常: {e}")
 
 
-class Monitor(metaclass=SingletonClass):
+class Monitor(ConfigReloadMixin, metaclass=SingletonClass):
     """
     目录监控处理链，单例模式
     """
+    CONFIG_WATCH = {SystemConfigKey.Directories.value}
 
     def __init__(self):
         super().__init__()
@@ -80,23 +80,15 @@ class Monitor(metaclass=SingletonClass):
         # 快照文件缓存
         self._snapshot_cache = FileCache(base=settings.CACHE_PATH / "snapshots")
         # 监控的文件扩展名
-        self.all_exts = settings.RMT_MEDIAEXT
+        self.all_exts = settings.RMT_MEDIAEXT + settings.RMT_SUBEXT + settings.RMT_AUDIOEXT
         # 启动目录监控和文件整理
         self.init()
 
-    @eventmanager.register(EventType.ConfigChanged)
-    def handle_config_changed(self, event: Event):
-        """
-        处理配置变更事件
-        :param event: 事件对象
-        """
-        if not event:
-            return
-        event_data: ConfigChangeEventData = event.event_data
-        if event_data.key not in [SystemConfigKey.Directories.value]:
-            return
-        logger.info("配置变更事件触发，重新初始化目录监控...")
+    def on_config_changed(self):
         self.init()
+
+    def get_reload_name(self):
+        return "目录监控"
 
     def save_snapshot(self, storage: str, snapshot: Dict, file_count: int = 0,
                       last_snapshot_time: Optional[float] = None):
@@ -703,11 +695,13 @@ class Monitor(metaclass=SingletonClass):
 
         # 全程加锁
         with lock:
+            is_bluray_folder = False
             # 蓝光原盘文件处理
             if __is_bluray_sub(event_path):
                 event_path = __get_bluray_dir(event_path)
                 if not event_path:
                     return
+                is_bluray_folder = True
 
             # TTL缓存控重
             if self._cache.get(str(event_path)):
@@ -716,13 +710,20 @@ class Monitor(metaclass=SingletonClass):
             self._cache[str(event_path)] = True
 
             try:
-                logger.info(f"开始整理文件: {event_path}")
+                if is_bluray_folder:
+                    logger.info(f"开始整理蓝光原盘: {event_path}")
+                else:
+                    logger.info(f"开始整理文件: {event_path}")
                 # 开始整理
                 TransferChain().do_transfer(
                     fileitem=FileItem(
                         storage=storage,
-                        path=event_path.as_posix(),
-                        type="file",
+                        path=(
+                            event_path.as_posix()
+                            if not is_bluray_folder
+                            else event_path.as_posix() + "/"
+                        ),
+                        type="file" if not is_bluray_folder else "dir",
                         name=event_path.name,
                         basename=event_path.stem,
                         extension=event_path.suffix[1:],

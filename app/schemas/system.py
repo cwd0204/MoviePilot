@@ -9,6 +9,7 @@ class ServiceInfo:
     """
     封装服务相关信息的数据类
     """
+
     # 名称
     name: Optional[str] = None
     # 实例
@@ -25,9 +26,10 @@ class MediaServerConf(BaseModel):
     """
     媒体服务器配置
     """
+
     # 名称
     name: Optional[str] = None
-    # 类型 emby/jellyfin/plex
+    # 类型 emby/zspace/jellyfin/plex/trimemedia/ugreen
     type: Optional[str] = None
     # 配置
     config: Optional[dict] = Field(default_factory=dict)
@@ -41,9 +43,10 @@ class DownloaderConf(BaseModel):
     """
     下载器配置
     """
+
     # 名称
     name: Optional[str] = None
-    # 类型 qbittorrent/transmission
+    # 类型 qbittorrent/transmission/rtorrent
     type: Optional[str] = None
     # 是否默认
     default: Optional[bool] = False
@@ -51,15 +54,18 @@ class DownloaderConf(BaseModel):
     config: Optional[dict] = Field(default_factory=dict)
     # 是否启用
     enabled: Optional[bool] = False
+    # 路径映射
+    path_mapping: Optional[list[tuple[str, str]]] = Field(default_factory=list)
 
 
 class NotificationConf(BaseModel):
     """
     通知配置
     """
+
     # 名称
     name: Optional[str] = None
-    # 类型 telegram/wechat/vocechat/synologychat/slack/webpush
+    # 类型 telegram/wechat/feishu/vocechat/synologychat/slack/webpush/qqbot
     type: Optional[str] = None
     # 配置
     config: Optional[dict] = Field(default_factory=dict)
@@ -73,16 +79,18 @@ class NotificationSwitchConf(BaseModel):
     """
     通知场景开关配置
     """
+
     # 场景名称
     type: str = None
     # 通知范围 all/user/admin
-    action: Optional[str] = 'all'
+    action: Optional[str] = "all"
 
 
 class StorageConf(BaseModel):
     """
     存储配置
     """
+
     # 类型 local/alipan/u115/rclone/alist
     type: Optional[str] = None
     # 名称
@@ -95,6 +103,7 @@ class TransferDirectoryConf(BaseModel):
     """
     文件整理目录配置
     """
+
     # 名称
     name: Optional[str] = None
     # 优先级
@@ -114,7 +123,7 @@ class TransferDirectoryConf(BaseModel):
     # 监控方式 downloader/monitor，None为不监控
     monitor_type: Optional[str] = None
     # 监控模式 fast / compatibility
-    monitor_mode: Optional[str] = 'fast'
+    monitor_mode: Optional[str] = "fast"
     # 整理方式 move/copy/link/softlink
     transfer_type: Optional[str] = None
     # 文件覆盖模式 always/size/never/latest

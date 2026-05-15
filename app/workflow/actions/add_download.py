@@ -16,7 +16,7 @@ class AddDownloadParams(ActionParams):
     添加下载资源参数
     """
     downloader: Optional[str] = Field(default=None, description="下载器")
-    save_path: Optional[str] = Field(default=None, description="保存路径")
+    save_path: Optional[str] = Field(default=None, description="保存路径, 支持<storage>:<path>, 如rclone:/MP, smb:/server/share/Movies等")
     labels: Optional[str] = Field(default=None, description="标签（,分隔）")
     only_lack: Optional[bool] = Field(default=False, description="仅下载缺失的资源")
 
@@ -67,7 +67,10 @@ class AddDownloadAction(BaseAction):
             if not t.meta_info:
                 t.meta_info = MetaInfo(title=t.torrent_info.title, subtitle=t.torrent_info.description)
             if not t.media_info:
-                t.media_info = MediaChain().recognize_media(meta=t.meta_info)
+                t.media_info = MediaChain().recognize_by_meta(
+                    t.meta_info,
+                    obtain_images=False,
+                )
             if not t.media_info:
                 self._has_error = True
                 logger.warning(f"{t.torrent_info.title} 未识别到媒体信息，无法下载")

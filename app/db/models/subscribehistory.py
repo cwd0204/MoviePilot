@@ -1,6 +1,6 @@
 from typing import Optional
 
-from sqlalchemy import Column, Integer, String, Float, JSON, select
+from sqlalchemy import Column, Integer, String, Float, JSON, Index, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import Session
 
@@ -60,6 +60,10 @@ class SubscribeHistory(Base):
     sites = Column(JSON)
     # 是否洗版
     best_version = Column(Integer, default=0)
+    # 是否只洗全集整包，开启后电视剧洗版不按单集下载
+    best_version_full = Column(Integer, default=0)
+    # 洗版时已下载剧集的优先级状态，格式：{"1": 90, "2": 100}
+    episode_priority = Column(JSON)
     # 保存路径
     save_path = Column(String)
     # 是否使用 imdbid 搜索
@@ -72,6 +76,10 @@ class SubscribeHistory(Base):
     filter_groups = Column(JSON, default=list)
     # 剧集组
     episode_group = Column(String)
+
+    __table_args__ = (
+        Index('ix_subscribehistory_type_date', 'type', 'date'),
+    )
 
     @classmethod
     @db_query
@@ -99,7 +107,7 @@ class SubscribeHistory(Base):
     def exists(cls, db: Session, tmdbid: Optional[int] = None, doubanid: Optional[str] = None,
                season: Optional[int] = None):
         if tmdbid:
-            if season:
+            if season is not None:
                 return db.query(cls).filter(cls.tmdbid == tmdbid,
                                             cls.season == season).first()
             return db.query(cls).filter(cls.tmdbid == tmdbid).first()
@@ -112,7 +120,7 @@ class SubscribeHistory(Base):
     async def async_exists(cls, db: AsyncSession, tmdbid: Optional[int] = None, doubanid: Optional[str] = None,
                            season: Optional[int] = None):
         if tmdbid:
-            if season:
+            if season is not None:
                 result = await db.execute(
                     select(cls).filter(cls.tmdbid == tmdbid, cls.season == season)
                 )

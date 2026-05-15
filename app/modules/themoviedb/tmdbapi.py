@@ -167,7 +167,7 @@ class TmdbApi:
         """
         记录匹配调试日志
         """
-        if season_number and season_year:
+        if season_number is not None and season_year:
             logger.debug(f"正在识别{mtype.value}：{name}, 季集={season_number}, 季集年份={season_year} ...")
         else:
             logger.debug(f"正在识别{mtype.value}：{name}, 年份={year} ...")
@@ -473,7 +473,7 @@ class TmdbApi:
             info = self._set_media_type(info, MediaType.MOVIE)
         else:
             # 有当前季和当前季集年份，使用精确匹配
-            if season_year and season_number:
+            if season_year and season_number is not None:
                 self._log_match_debug(mtype, name, season_year, season_number, season_year)
                 info = self.__search_tv_by_season(name,
                                                   season_year,
@@ -643,17 +643,23 @@ class TmdbApi:
                 reverse=True
             )
             for tv in tvs:
-                # 年份
+                # 使用年份、名称匹配
                 tv_year = tv.get('first_air_date')[0:4] if tv.get('first_air_date') else None
                 if (self.__compare_names(name, tv.get('name'))
                     or self.__compare_names(name, tv.get('original_name'))) \
                         and (tv_year == str(season_year)):
                     return tv
-                # 匹配别名、译名
+                # 获取别名、译名重新匹配
                 if not tv.get("names"):
                     tv = self.get_info(mtype=MediaType.TV, tmdbid=tv.get("id"))
-                if not tv or not self.__compare_names(name, tv.get("names")):
+                if not tv or not (
+                    self.__compare_names(name, tv.get("name"))
+                    or self.__compare_names(name, tv.get("original_name"))
+                    or self.__compare_names(name, tv.get("names"))):
                     continue
+                if tv_year == str(season_year):
+                    return tv
+                # 季年份匹配
                 if __season_match(tv_info=tv, _season_year=season_year):
                     return tv
         return {}
@@ -691,7 +697,7 @@ class TmdbApi:
             return {}
         ret_seasons = {}
         for season_info in tv_info.get("seasons") or []:
-            if not season_info.get("season_number"):
+            if season_info.get("season_number") is None:
                 continue
             ret_seasons[season_info.get("season_number")] = season_info
         return ret_seasons
@@ -744,11 +750,11 @@ class TmdbApi:
         if validation_result is not None:
             return validation_result
 
-        logger.info("正在从TheDbMovie网站查询：%s ..." % name)
+        logger.info("正在从TheMovieDb网站查询：%s ..." % name)
         tmdb_url = self._build_tmdb_search_url(name)
         res = RequestUtils(timeout=5, ua=settings.NORMAL_USER_AGENT, proxies=settings.PROXY).get_res(url=tmdb_url)
         if res is None:
-            logger.error("无法连接TheDbMovie")
+            logger.error("无法连接TheMovieDb")
             return None
 
         # 响应验证
@@ -820,7 +826,7 @@ class TmdbApi:
             # 转换多语种标题
             self.__update_tmdbinfo_extra_title(tmdb_info)
             # 转换中文标题
-            if settings.TMDB_LOCALE == "zh":
+            if self.tmdb.language in ("zh", "zh-CN"):
                 self.__update_tmdbinfo_cn_title(tmdb_info)
 
         return tmdb_info
@@ -1619,6 +1625,9 @@ class TmdbApi:
         """
         清除缓存
         """
+        self.match_web.cache_clear()
+        self.discover.discover_movies.cache_clear()
+        self.discover.discover_tv_shows.cache_clear()
         self.tmdb.cache_clear()
 
     # 私有异步方法
@@ -2022,7 +2031,7 @@ class TmdbApi:
             info = self._set_media_type(info, MediaType.MOVIE)
         else:
             # 有当前季和当前季集年份，使用精确匹配
-            if season_year and season_number:
+            if season_year and season_number is not None:
                 self._log_match_debug(mtype, name, season_year, season_number, season_year)
                 info = await self.__async_search_tv_by_season(name,
                                                               season_year,
@@ -2128,7 +2137,7 @@ class TmdbApi:
             # 转换多语种标题
             self.__update_tmdbinfo_extra_title(tmdb_info)
             # 转换中文标题
-            if settings.TMDB_LOCALE == "zh":
+            if self.tmdb.language in ("zh", "zh-CN"):
                 self.__update_tmdbinfo_cn_title(tmdb_info)
 
         return tmdb_info

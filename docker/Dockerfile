@@ -1,4 +1,4 @@
-FROM python:3.12.8-slim-bookworm AS base
+FROM python:3.12.13-slim-bookworm AS base
 
 
 # 准备软件包
@@ -27,14 +27,16 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
     wget \
     busybox \
-    dumb-init \
+    tini \
     jq \
     fuse3 \
     rsync \
     ffmpeg \
     nano \
+    libjemalloc2 \
     && dpkg-reconfigure --frontend noninteractive tzdata \
     && curl https://rclone.org/install.sh | bash \
+    && ln -s /usr/lib/*-linux-gnu/libjemalloc.so.2 /usr/local/lib/libjemalloc.so \
     && apt-get autoremove -y \
     && apt-get clean \
     && rm -rf \
@@ -64,10 +66,18 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # 安装 Python 构建依赖并创建虚拟环境
 WORKDIR /app
 COPY requirements.in requirements.in
+COPY scripts/uv-pip-compat.sh /usr/local/bin/uv-pip-compat
 RUN python3 -m venv ${VENV_PATH} \
-    && pip install --upgrade pip \
-    && pip install Cython pip-tools \
-    && pip-compile requirements.in \
+    && env UV_INSTALL_DIR=/usr/local/bin sh -c "$(curl -LsSf https://astral.sh/uv/install.sh)" \
+    && chmod +x /usr/local/bin/uv-pip-compat \
+    && ln -sf /usr/local/bin/uv ${VENV_PATH}/bin/uv \
+    && ln -sf /usr/local/bin/uv-pip-compat ${VENV_PATH}/bin/pip \
+    && ln -sf /usr/local/bin/uv-pip-compat ${VENV_PATH}/bin/pip3 \
+    && ln -sf /usr/local/bin/uv-pip-compat ${VENV_PATH}/bin/pip3.12 \
+    && ln -sf /usr/local/bin/uv-pip-compat ${VENV_PATH}/bin/pip-compile \
+    && ln -sf /usr/local/bin/uv-pip-compat ${VENV_PATH}/bin/pip-sync \
+    && pip install "Cython~=3.1.2" \
+    && pip-compile requirements.in -o requirements.txt \
     && pip install -r requirements.txt
 
 # 下载准备代码
@@ -83,17 +93,25 @@ RUN FRONTEND_VERSION=$(sed -n "s/^FRONTEND_VERSION\s*=\s*'\([^']*\)'/\1/p" /app/
     && mv -f /tmp/MoviePilot-Plugins-main/plugins.v2/* /app/app/plugins/ \
     && cat /tmp/MoviePilot-Plugins-main/package.json | jq -r 'to_entries[] | select(.value.v2 == true) | .key' | awk '{print tolower($0)}' | \
     while read -r i; do if [ ! -d "/app/app/plugins/$i" ]; then mv "/tmp/MoviePilot-Plugins-main/plugins/$i" "/app/app/plugins/"; else echo "跳过 $i"; fi; done \
-    && curl -sL "https://github.com/jxxghp/MoviePilot-Resources/archive/refs/heads/main.zip" | busybox unzip -d /tmp - \
-    && mv -f /tmp/MoviePilot-Resources-main/resources.v2/* /app/app/helper/
+    && curl -sL "https://raw.githubusercontent.com/jxxghp/MoviePilot-Resources/main/resources.v2/user.sites.v2.bin" -o /app/app/helper/user.sites.v2.bin \
+    && python_ver=$(python3 -c 'import sys; print(f"cpython-{sys.version_info.major}{sys.version_info.minor}")') \
+    && ARCH=$(uname -m) \
+    && if [ "$ARCH" = "aarch64" ]; then SUFFIX="aarch64-linux-gnu"; else SUFFIX="x86_64-linux-gnu"; fi \
+    && curl -sL "https://raw.githubusercontent.com/jxxghp/MoviePilot-Resources/main/resources.v2/sites.${python_ver}-${SUFFIX}.so" -o "/app/app/helper/sites.${python_ver}-${SUFFIX}.so"
 
 # final 阶段: 安装运行时依赖和配置最终镜像
 FROM prepare_package AS final
 
+ENV LD_PRELOAD="/usr/local/lib/libjemalloc.so"
+
 # python 环境
 COPY --from=prepare_venv --chmod=777 ${VENV_PATH} ${VENV_PATH}
+COPY --from=prepare_venv /usr/local/bin/uv /usr/local/bin/uv
+COPY --from=prepare_venv /usr/local/bin/uv-pip-compat /usr/local/bin/uv-pip-compat
 
 # playwright 环境
 RUN playwright install-deps chromium \
+    && playwright install-deps firefox \
     && apt-get autoremove -y \
     && apt-get clean \
     && rm -rf \
@@ -120,8 +138,9 @@ RUN cp -f /app/docker/nginx.common.conf /etc/nginx/common.conf \
     && echo "/app/" > ${VENV_PATH}/lib/python${python_ver%.*}/site-packages/app.pth \
     && echo 'fs.inotify.max_user_watches=5242880' >> /etc/sysctl.conf \
     && echo 'fs.inotify.max_user_instances=5242880' >> /etc/sysctl.conf \
+    && echo "zh_CN.UTF-8 UTF-8" >> /etc/locale.gen \
     && locale-gen zh_CN.UTF-8
 
 EXPOSE 3000
 VOLUME [ "${CONFIG_DIR}" ]
-ENTRYPOINT [ "/entrypoint.sh" ]
+ENTRYPOINT [ "/usr/bin/tini", "-g", "--", "/entrypoint.sh" ]

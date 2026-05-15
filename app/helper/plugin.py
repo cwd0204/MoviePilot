@@ -1,21 +1,28 @@
+import asyncio
+from collections import deque
 import importlib
 import io
 import json
 import shutil
 import site
 import sys
+import tempfile
+import threading
 import traceback
 import zipfile
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Set, Callable, Awaitable
+from urllib.parse import parse_qs, quote, unquote, urlsplit
 
 import aiofiles
 import aioshutil
 import httpx
 from anyio import Path as AsyncPath
+from packaging.markers import default_environment
+from packaging.requirements import Requirement
 from packaging.specifiers import SpecifierSet, InvalidSpecifier
 from packaging.version import Version, InvalidVersion
-from pkg_resources import Requirement, working_set
+from importlib.metadata import distributions
 from requests import Response
 
 from app.core.cache import cached
@@ -25,10 +32,12 @@ from app.log import logger
 from app.schemas.types import SystemConfigKey
 from app.utils.http import RequestUtils, AsyncRequestUtils
 from app.utils.singleton import WeakSingleton
+from app.utils.string import StringUtils
 from app.utils.system import SystemUtils
 from app.utils.url import UrlUtils
 
 PLUGIN_DIR = Path(settings.ROOT_PATH) / "app" / "plugins"
+LOCAL_REPO_PREFIX = "local://"
 
 
 class PluginHelper(metaclass=WeakSingleton):
@@ -40,6 +49,23 @@ class PluginHelper(metaclass=WeakSingleton):
     _install_reg = f"{settings.MP_SERVER_HOST}/plugin/install/{{pid}}"
     _install_report = f"{settings.MP_SERVER_HOST}/plugin/install"
     _install_statistic = f"{settings.MP_SERVER_HOST}/plugin/statistic"
+    # 串行化运行期依赖安装，避免多个 pip 子进程和导入缓存刷新互相踩踏。
+    _pip_install_lock = threading.Lock()
+    # 这些包一旦被插件覆盖，最容易直接拖垮主程序启动，因此冲突提示需要单独高亮。
+    _protected_runtime_packages = frozenset({
+        "alembic",
+        "fastapi",
+        "pydantic",
+        "pydantic_core",
+        "pydantic_settings",
+        "sqlalchemy",
+        "starlette",
+        "uvicorn",
+    })
+    _runtime_import_probe = (
+        "import alembic, fastapi, pydantic, pydantic_core, pydantic_settings, "
+        "sqlalchemy, starlette, uvicorn; from pydantic import BaseModel, Field"
+    )
 
     def __init__(self):
         self.systemconfig = SystemConfigOper()
@@ -48,9 +74,283 @@ class PluginHelper(metaclass=WeakSingleton):
                 if self.install_report():
                     self.systemconfig.set(SystemConfigKey.PluginInstallReport, "1")
 
+    @staticmethod
+    def is_local_repo_url(repo_url: Optional[str]) -> bool:
+        """
+        判断是否为本地插件来源标识
+        """
+        return bool(repo_url and repo_url.startswith(LOCAL_REPO_PREFIX))
+
+    @staticmethod
+    def make_local_repo_url(pid: str, repo_path: Optional[Path] = None,
+                            package_version: Optional[str] = None) -> str:
+        """
+        生成本地插件安装来源标识
+        """
+        repo_url = f"{LOCAL_REPO_PREFIX}{quote(pid, safe='')}"
+        params = []
+        if repo_path:
+            params.append(f"path={quote(str(repo_path), safe='/:~')}")
+        if package_version:
+            params.append(f"version={quote(package_version, safe='')}")
+        if params:
+            repo_url = f"{repo_url}?{'&'.join(params)}"
+        return repo_url
+
+    @staticmethod
+    def parse_local_repo_url(repo_url: str) -> Optional[str]:
+        """
+        从本地插件来源标识中解析插件ID
+        """
+        if not PluginHelper.is_local_repo_url(repo_url):
+            return None
+        try:
+            parts = urlsplit(repo_url)
+            pid = unquote(parts.netloc or parts.path.strip("/"))
+        except Exception:
+            pid = repo_url[len(LOCAL_REPO_PREFIX):].split("?", 1)[0].strip("/")
+        return pid or None
+
+    @staticmethod
+    def parse_local_repo_path(repo_url: str) -> Optional[Path]:
+        """
+        从本地插件来源标识中解析仓库路径
+        """
+        if not PluginHelper.is_local_repo_url(repo_url):
+            return None
+        try:
+            values = parse_qs(urlsplit(repo_url).query).get("path")
+            if not values:
+                return None
+            path = Path(values[0]).expanduser()
+            if not path.is_absolute():
+                path = settings.ROOT_PATH / path
+            return path.resolve()
+        except Exception:
+            return None
+
+    @staticmethod
+    def parse_local_repo_package_version(repo_url: str) -> Optional[str]:
+        """
+        从本地插件来源标识中解析 package 版本
+        """
+        if not PluginHelper.is_local_repo_url(repo_url):
+            return None
+        try:
+            values = parse_qs(urlsplit(repo_url).query).get("version")
+            if not values:
+                return None
+            return values[0]
+        except Exception:
+            return None
+
+    @staticmethod
+    def sanitize_repo_url_for_statistic(repo_url: Optional[str]) -> Optional[str]:
+        """
+        统计上报前脱敏 repo_url，避免泄露本地仓库绝对路径
+        """
+        if not repo_url:
+            return repo_url
+        if not PluginHelper.is_local_repo_url(repo_url):
+            return repo_url
+
+        pid = PluginHelper.parse_local_repo_url(repo_url)
+        if not pid:
+            return LOCAL_REPO_PREFIX.rstrip("/")
+
+        return PluginHelper.make_local_repo_url(
+            pid=pid,
+            package_version=PluginHelper.parse_local_repo_package_version(repo_url)
+        )
+
+    @staticmethod
+    def get_local_repo_paths() -> List[Path]:
+        """
+        获取本地插件仓库目录列表
+        """
+        if not settings.PLUGIN_LOCAL_REPO_PATHS:
+            return []
+        paths = []
+        for item in settings.PLUGIN_LOCAL_REPO_PATHS.split(","):
+            local_repo_path = item.strip()
+            if not local_repo_path:
+                continue
+            path = Path(local_repo_path).expanduser()
+            if not path.is_absolute():
+                path = settings.ROOT_PATH / path
+            paths.append(path.resolve())
+        return paths
+
+    @staticmethod
+    def __get_local_package(repo_path: Path, package_version: Optional[str] = None) -> Optional[Dict[str, dict]]:
+        """
+        从本地插件仓库读取 package.json 或 package.{version}.json
+        """
+        package_file = repo_path / (
+            f"package.{package_version}.json" if package_version else "package.json"
+        )
+        if not package_file.exists():
+            return {}
+        try:
+            content = package_file.read_text(encoding="utf-8")
+            payload = json.loads(content)
+        except Exception as e:
+            logger.warn(f"读取本地插件包 {package_file} 失败：{e}")
+            return None
+        if not isinstance(payload, dict):
+            logger.warn(f"本地插件包 {package_file} 格式不正确")
+            return None
+        return payload
+
+    @staticmethod
+    def __get_local_plugin_dir(repo_path: Path, pid: str, package_version: Optional[str]) -> Path:
+        plugin_root = f"plugins.{package_version}" if package_version else "plugins"
+        return repo_path / plugin_root / pid.lower()
+
+    def get_local_plugin_candidates(self) -> Dict[str, dict]:
+        """
+        扫描本地插件仓库，按插件ID保留版本号最高的候选
+        """
+        candidates: Dict[str, dict] = {}
+        for repo_order, repo_path in enumerate(self.get_local_repo_paths()):
+            if not repo_path.exists() or not repo_path.is_dir():
+                logger.warn(f"本地插件仓库目录不存在或不可读：{repo_path}")
+                continue
+
+            package_candidates = []
+            if settings.VERSION_FLAG:
+                package_candidates.append((settings.VERSION_FLAG, self.__get_local_package(repo_path,
+                                                                                           settings.VERSION_FLAG)))
+            package_candidates.append(("", self.__get_local_package(repo_path)))
+
+            for package_version, local_plugins in package_candidates:
+                if local_plugins is None:
+                    continue
+                for pid, plugin_info in local_plugins.items():
+                    if not isinstance(plugin_info, dict):
+                        continue
+                    # package.json 中的旧结构需要声明兼容当前版本。
+                    if (
+                            not package_version
+                            and settings.VERSION_FLAG
+                            and plugin_info.get(settings.VERSION_FLAG) is not True
+                    ):
+                        continue
+
+                    plugin_dir = self.__get_local_plugin_dir(repo_path, pid, package_version)
+                    if not plugin_dir.is_dir():
+                        logger.debug(f"跳过本地插件 {pid}：插件目录不存在 {plugin_dir}")
+                        continue
+
+                    candidate = plugin_info.copy()
+                    candidate["id"] = pid
+                    candidate["package_version"] = package_version
+                    candidate["repo_order"] = repo_order
+                    candidate["repo_path"] = repo_path
+                    candidate["path"] = plugin_dir
+                    candidate_version = str(candidate.get("version") or "0")
+
+                    existing = candidates.get(pid)
+                    if not existing:
+                        candidates[pid] = candidate
+                        continue
+
+                    existing_version = str(existing.get("version") or "0")
+                    if StringUtils.compare_version(candidate_version, ">", existing_version):
+                        candidates[pid] = candidate
+                    elif (
+                        candidate_version == existing_version
+                        and repo_order < int(existing.get("repo_order", repo_order))
+                    ):
+                        logger.info(f"本地插件 {pid} 存在同版本来源，使用靠前目录：{repo_path}")
+                        candidates[pid] = candidate
+
+        return candidates
+
+    def get_local_plugin_candidate(self, pid: str, package_version: Optional[str] = None,
+                                   repo_path: Optional[Path] = None,
+                                   strict_compat: bool = True) -> Optional[dict]:
+        """
+        获取指定插件ID的本地插件候选
+        """
+        if not pid:
+            return None
+        if package_version is not None or repo_path is not None:
+            repo_paths = [repo_path.resolve()] if repo_path else self.get_local_repo_paths()
+            package_versions = [package_version] if package_version is not None else []
+            if package_version is None:
+                if settings.VERSION_FLAG:
+                    package_versions.append(settings.VERSION_FLAG)
+                package_versions.append("")
+            selected_candidate = None
+            for repo_order, local_repo_path in enumerate(self.get_local_repo_paths()):
+                if local_repo_path not in repo_paths:
+                    continue
+                for current_package_version in package_versions:
+                    local_plugins = self.__get_local_package(local_repo_path, current_package_version or "")
+                    if not local_plugins:
+                        continue
+                    for candidate_pid, plugin_info in local_plugins.items():
+                        if candidate_pid.lower() != pid.lower() or not isinstance(plugin_info, dict):
+                            continue
+                        is_compatible = not (
+                                not current_package_version
+                                and settings.VERSION_FLAG
+                                and plugin_info.get(settings.VERSION_FLAG) is not True
+                        )
+                        if not is_compatible and strict_compat:
+                            continue
+                        plugin_dir = self.__get_local_plugin_dir(local_repo_path, candidate_pid,
+                                                                 current_package_version or "")
+                        if not plugin_dir.is_dir():
+                            continue
+                        candidate = plugin_info.copy()
+                        candidate["id"] = candidate_pid
+                        candidate["package_version"] = current_package_version or ""
+                        candidate["repo_order"] = repo_order
+                        candidate["repo_path"] = local_repo_path
+                        candidate["path"] = plugin_dir
+                        if not is_compatible:
+                            candidate["compatible"] = False
+                            candidate["skip_reason"] = f"package.json 未声明 {settings.VERSION_FLAG} 兼容"
+                        if package_version is not None:
+                            return candidate
+                        if not selected_candidate:
+                            selected_candidate = candidate
+                            continue
+                        selected_version = str(selected_candidate.get("version") or "0")
+                        candidate_version = str(candidate.get("version") or "0")
+                        if StringUtils.compare_version(candidate_version, ">", selected_version):
+                            selected_candidate = candidate
+            return selected_candidate
+
+        candidates = self.get_local_plugin_candidates()
+        for candidate_pid, candidate in candidates.items():
+            if candidate_pid.lower() == pid.lower():
+                return candidate
+        return None
+
+    @staticmethod
+    def __parse_plugin_index_response(content: str) -> Optional[Dict[str, dict]]:
+        """
+        解析插件索引响应，仅缓存成功解析出的字典结果。
+        """
+        try:
+            payload = json.loads(content)
+        except json.JSONDecodeError:
+            if "404: Not Found" not in content:
+                logger.warn(f"插件包数据解析失败：{content}")
+            return None
+
+        if not isinstance(payload, dict):
+            logger.warn(f"插件包数据格式不正确，期望 dict，实际为 {type(payload).__name__}")
+            return None
+
+        return payload
+
     @cached(maxsize=128, ttl=1800)
     def get_plugins(self, repo_url: str,
-                         package_version: Optional[str] = None) -> Optional[Dict[str, dict]]:
+                    package_version: Optional[str] = None) -> Optional[Dict[str, dict]]:
         """
         获取Github所有最新插件列表
         :param repo_url: Github仓库地址
@@ -69,15 +369,11 @@ class PluginHelper(metaclass=WeakSingleton):
         res = self.__request_with_fallback(package_url, headers=settings.REPO_GITHUB_HEADERS(repo=f"{user}/{repo}"))
         if res is None:
             return None
-        if res:
-            content = res.text
-            try:
-                return json.loads(content)
-            except json.JSONDecodeError:
-                if "404: Not Found" not in content:
-                    logger.warn(f"插件包数据解析失败：{content}")
-                    return None
-        return {}
+        if res.status_code == 404:
+            return {}
+        if res.status_code != 200:
+            return None
+        return self.__parse_plugin_index_response(res.text)
 
     def get_plugin_package_version(self, pid: str, repo_url: str,
                                    package_version: Optional[str] = None) -> Optional[str]:
@@ -135,7 +431,7 @@ class PluginHelper(metaclass=WeakSingleton):
         if not settings.PLUGIN_STATISTIC_SHARE:
             return {}
         res = RequestUtils(proxies=settings.PROXY, timeout=10).get_res(self._install_statistic)
-        if res and res.status_code == 200:
+        if res is not None and res.status_code == 200:
             return res.json()
         return {}
 
@@ -154,9 +450,9 @@ class PluginHelper(metaclass=WeakSingleton):
             timeout=5
         ).post(install_reg_url, json={
             "plugin_id": pid,
-            "repo_url": repo_url
+            "repo_url": self.sanitize_repo_url_for_statistic(repo_url)
         })
-        if res and res.status_code == 200:
+        if res is not None and res.status_code == 200:
             return True
         return False
 
@@ -171,7 +467,10 @@ class PluginHelper(metaclass=WeakSingleton):
         if items:
             for pid, repo_url in items:
                 if pid:
-                    payload_plugins.append({"plugin_id": pid, "repo_url": repo_url})
+                    payload_plugins.append({
+                        "plugin_id": pid,
+                        "repo_url": self.sanitize_repo_url_for_statistic(repo_url)
+                    })
         else:
             plugins = self.systemconfig.get(SystemConfigKey.UserInstalledPlugins)
             if not plugins:
@@ -181,7 +480,7 @@ class PluginHelper(metaclass=WeakSingleton):
                            content_type="application/json",
                            timeout=5).post(self._install_report,
                                            json={"plugins": payload_plugins})
-        return True if res else False
+        return bool(res is not None and res.status_code == 200)
 
     def install(self, pid: str, repo_url: str, package_version: Optional[str] = None, force_install: bool = False) \
             -> Tuple[bool, str]:
@@ -199,6 +498,9 @@ class PluginHelper(metaclass=WeakSingleton):
         :param force_install: 是否强制安装插件，默认不启用，启用时不进行备份和恢复操作
         :return: (是否成功, 错误信息)
         """
+        if self.is_local_repo_url(repo_url):
+            return self.install_local(pid=pid, repo_url=repo_url, force_install=force_install)
+
         if SystemUtils.is_frozen():
             return False, "可执行文件模式下，只能安装本地插件"
 
@@ -255,6 +557,56 @@ class PluginHelper(metaclass=WeakSingleton):
                 return self.__prepare_content_via_filelist_sync(pid.lower(), user_repo, package_version)
 
             return self.__install_flow_sync(pid, force_install, prepare_filelist, repo_url)
+
+    def install_local(self, pid: str, repo_url: str = "", force_install: bool = False) -> Tuple[bool, str]:
+        """
+        从本地插件仓库目录安装插件
+        """
+        local_pid = self.parse_local_repo_url(repo_url) if repo_url else pid
+        if not local_pid or local_pid.lower() != pid.lower():
+            return False, "本地插件来源与插件ID不匹配"
+
+        repo_path = self.parse_local_repo_path(repo_url) if repo_url else None
+        package_version = self.parse_local_repo_package_version(repo_url) if repo_url else None
+        candidate = self.get_local_plugin_candidate(
+            pid,
+            package_version=package_version,
+            repo_path=repo_path
+        )
+        if not candidate:
+            return False, f"未找到本地插件：{pid}"
+
+        source_dir = Path(candidate.get("path"))
+        dest_dir = PLUGIN_DIR / pid.lower()
+        try:
+            if source_dir.resolve() == dest_dir.resolve():
+                return False, "本地插件来源不能与运行目录相同"
+        except Exception:
+            return False, "本地插件来源路径无效"
+
+        def prepare_local() -> Tuple[bool, str]:
+            try:
+                shutil.copytree(
+                    source_dir,
+                    dest_dir,
+                    dirs_exist_ok=True,
+                    ignore=shutil.ignore_patterns("__pycache__", "*.pyc", ".DS_Store")
+                )
+                return True, ""
+            except Exception as e:
+                logger.error(f"复制本地插件 {pid} 失败：{e}")
+                return False, f"复制本地插件失败：{e}"
+
+        return self.__install_flow_sync(
+            pid=pid,
+            force_install=force_install,
+            prepare_content=prepare_local,
+            repo_url=repo_url or self.make_local_repo_url(
+                pid,
+                candidate.get("repo_path"),
+                candidate.get("package_version")
+            )
+        )
 
     def __get_file_list(self, pid: str, user_repo: str, package_version: Optional[str] = None) -> \
             Tuple[Optional[list], Optional[str]]:
@@ -444,57 +796,582 @@ class PluginHelper(metaclass=WeakSingleton):
             shutil.rmtree(plugin_dir, ignore_errors=True)
 
     @staticmethod
-    def pip_install_with_fallback(requirements_file: Path) -> Tuple[bool, str]:
+    def refresh_persistent_plugin_backup(pid: str) -> bool:
         """
-        使用自动降级策略安装依赖，并确保新安装的包可被动态导入
-        :param requirements_file: 依赖的 requirements.txt 文件路径
-        :return: (是否成功, 错误信息)
+        刷新插件持久化备份目录，供 docker 重置后恢复使用
         """
-        wheels_dir = requirements_file.parent / "wheels"
+        if not SystemUtils.is_docker():
+            return True
 
-        find_links_option = []
-        if wheels_dir.is_dir():
-            # 如果目录存在，增加 --find-links 选项
-            logger.debug(f"[PIP] 发现插件内嵌的 wheels 目录: {wheels_dir}，将优先从本地安装。")
-            find_links_option = ["--find-links", str(wheels_dir)]
-        else:
-            # 如果不存在，选项为空列表，对后续命令无影响
-            logger.debug(f"[PIP] 未发现插件内嵌的 wheels 目录，将仅使用在线源。")
+        plugin_dir = PLUGIN_DIR / pid.lower()
+        if not plugin_dir.exists():
+            logger.warn(f"{pid} 插件目录不存在，跳过刷新插件备份")
+            return False
 
-        base_cmd = [sys.executable, "-m", "pip", "install"] + find_links_option + ["-r", str(requirements_file)]
+        backup_root = settings.CONFIG_PATH / "plugins_backup"
+        backup_dir = backup_root / pid.lower()
+        try:
+            backup_root.mkdir(parents=True, exist_ok=True)
+            if backup_dir.exists():
+                shutil.rmtree(backup_dir, ignore_errors=True)
+            shutil.copytree(
+                plugin_dir,
+                backup_dir,
+                dirs_exist_ok=True,
+                ignore=shutil.ignore_patterns("__pycache__", "*.pyc", ".DS_Store")
+            )
+            logger.info(f"已刷新插件备份: {pid}")
+            return True
+        except Exception as e:
+            logger.error(f"刷新插件备份失败: {pid} - {e}")
+            return False
+
+    def __collect_plugin_wheels_dirs(self) -> List[Path]:
+        """
+        收集已安装插件目录下可用的 wheels 目录，供批量依赖安装时复用。
+        """
+        wheels_dirs = []
+        try:
+            install_plugins = {
+                plugin_id.lower()
+                for plugin_id in self.systemconfig.get(SystemConfigKey.UserInstalledPlugins) or []
+            }
+            for plugin_id in install_plugins:
+                wheels_dir = PLUGIN_DIR / plugin_id / "wheels"
+                if wheels_dir.is_dir():
+                    wheels_dirs.append(wheels_dir)
+        except Exception as e:
+            logger.error(f"收集插件 wheels 目录时发生错误：{e}")
+            return []
+
+        # 去重并保持稳定顺序，避免重复传递相同目录
+        return list(dict.fromkeys(wheels_dirs))
+
+    @staticmethod
+    def __build_pip_install_strategies(base_cmd: List[str]) -> List[Tuple[str, List[str]]]:
+        """
+        为 pip 命令构建统一的网络降级策略，避免不同安装路径各自拼接参数。
+        """
         strategies = []
-
-        # 添加策略到列表中
         if settings.PIP_PROXY:
             strategies.append(("镜像站", base_cmd + ["-i", settings.PIP_PROXY]))
         if settings.PROXY_HOST:
             strategies.append(("代理", base_cmd + ["--proxy", settings.PROXY_HOST]))
         strategies.append(("直连", base_cmd))
+        return strategies
 
-        # 记录当前已安装的包，以便后续刷新
-        before_installation = set(sys.modules.keys())
+    @staticmethod
+    def __build_runtime_pip_command(*args: str) -> List[str]:
+        """
+        优先使用当前解释器同目录的 pip 入口，以便 uv-pip-compat 能接管兼容命令。
+        """
+        pip_name = "pip.exe" if sys.platform == "win32" else "pip"
+        pip_bin = Path(sys.executable).with_name(pip_name)
+        if pip_bin.exists():
+            return [str(pip_bin), *args]
+        return [sys.executable, "-m", "pip", *args]
 
-        # 遍历策略进行安装
-        for strategy_name, pip_command in strategies:
-            logger.debug(f"[PIP] 尝试使用策略：{strategy_name} 安装依赖，命令：{' '.join(pip_command)}")
+    @staticmethod
+    def __format_pkg_name_for_pip(name: str) -> str:
+        """
+        将内部统一使用的下划线包名转回 pip 更常见的连字符写法，便于日志和约束文件阅读。
+        """
+        return name.replace("_", "-")
+
+    @staticmethod
+    def __marker_matches(marker, extra: str = "") -> bool:
+        """
+        使用当前运行环境和可选 extra 上下文判断 marker 是否生效。
+        """
+        if not marker:
+            return True
+        try:
+            env = default_environment()
+            env["extra"] = extra
+            return marker.evaluate(env)
+        except Exception as err:
+            logger.debug(f"依赖 marker 计算失败，按不匹配处理：{err}")
+            return False
+
+    @classmethod
+    def __parse_project_requirement_roots(
+            cls,
+            requirements_file: Path,
+            visited_files: Optional[Set[Path]] = None
+    ) -> Dict[str, Set[str]]:
+        """
+        解析主项目 requirements 文件，收集根依赖及其启用的 extras。
+        支持递归处理 -r/--requirement，忽略索引、约束等 pip 选项。
+        """
+        roots = {}
+        if visited_files is None:
+            visited_files = set()
+
+        try:
+            requirements_file = requirements_file.resolve()
+        except Exception:
+            requirements_file = Path(requirements_file)
+
+        if requirements_file in visited_files:
+            return roots
+        visited_files.add(requirements_file)
+
+        if not requirements_file.exists():
+            logger.warning(f"主项目依赖文件不存在：{requirements_file}")
+            return roots
+
+        try:
+            with open(requirements_file, "r", encoding="utf-8") as f:
+                for raw_line in f:
+                    line = raw_line.strip()
+                    if not line or line.startswith("#"):
+                        continue
+
+                    include_path = None
+                    if line.startswith("-r"):
+                        include_path = line[2:].strip() if line != "-r" else ""
+                    elif line.startswith("--requirement"):
+                        include_path = line[len("--requirement"):].strip()
+
+                    if include_path is not None:
+                        if include_path.startswith("="):
+                            include_path = include_path[1:].strip()
+                        if not include_path:
+                            logger.debug(f"忽略无法识别的 requirements 引用：{line}")
+                            continue
+                        included_roots = cls.__parse_project_requirement_roots(
+                            requirements_file.parent / include_path,
+                            visited_files
+                        )
+                        for package_name, extras in included_roots.items():
+                            roots.setdefault(package_name, set()).update(extras)
+                        continue
+
+                    if line.startswith((
+                            "-c", "--constraint", "-i", "--index-url", "--extra-index-url",
+                            "-f", "--find-links", "--trusted-host", "--no-index"
+                    )):
+                        continue
+
+                    try:
+                        requirement = Requirement(line)
+                    except Exception as err:
+                        logger.debug(f"无法解析主项目依赖项 '{line}'：{err}")
+                        continue
+
+                    if not cls.__marker_matches(requirement.marker):
+                        continue
+
+                    package_name = cls.__standardize_pkg_name(requirement.name)
+                    roots.setdefault(package_name, set()).update(
+                        extra.lower() for extra in requirement.extras
+                    )
+            return roots
+        except Exception as e:
+            logger.error(f"解析主项目依赖文件失败：{requirements_file} - {e}")
+            return {}
+
+    @classmethod
+    def __get_installed_distribution_requirements(cls) -> Dict[str, Tuple[Version, List[Requirement]]]:
+        """
+        获取当前环境中每个已安装包的依赖声明，用于展开主程序依赖图。
+        """
+        requirement_graph = {}
+        try:
+            for dist in distributions():
+                name = dist.metadata.get("Name")
+                if not name:
+                    continue
+
+                package_name = cls.__standardize_pkg_name(name)
+                version_str = dist.metadata.get("Version") or getattr(dist, "version", None)
+                if not version_str:
+                    continue
+
+                try:
+                    version = Version(version_str)
+                except InvalidVersion:
+                    logger.debug(f"无法解析已安装包 '{package_name}' 的版本：{version_str}")
+                    continue
+
+                requirements = []
+                for raw_requirement in dist.requires or []:
+                    try:
+                        requirements.append(Requirement(raw_requirement))
+                    except Exception as err:
+                        logger.debug(f"无法解析已安装包 '{package_name}' 的依赖项 '{raw_requirement}'：{err}")
+
+                if package_name not in requirement_graph or version > requirement_graph[package_name][0]:
+                    requirement_graph[package_name] = (version, requirements)
+            return requirement_graph
+        except Exception as e:
+            logger.error(f"收集已安装包依赖图时发生错误：{e}")
+            return {}
+
+    @classmethod
+    def __get_protected_runtime_packages(
+            cls,
+            installed_packages: Optional[Dict[str, Version]] = None
+    ) -> Dict[str, Version]:
+        """
+        仅收集主程序依赖图中的已安装包版本。
+
+        主项目 requirements 中声明的根依赖及其当前已安装的传递依赖都会被冻结，
+        未被主程序依赖图引用的插件自带包允许后续插件按需升级或降级。
+        """
+        if installed_packages is None:
+            installed_packages = cls.__get_installed_packages()
+        protected_packages = {
+            package_name: version
+            for package_name, version in installed_packages.items()
+            if package_name in cls._protected_runtime_packages
+        }
+
+        root_requirements_file = settings.ROOT_PATH / "requirements.txt"
+        if not root_requirements_file.exists():
+            root_requirements_file = settings.ROOT_PATH / "requirements.in"
+
+        root_requirements = cls.__parse_project_requirement_roots(root_requirements_file)
+        if not root_requirements:
+            return protected_packages
+
+        requirement_graph = cls.__get_installed_distribution_requirements()
+        active_extras = {
+            package_name: set(extras)
+            for package_name, extras in root_requirements.items()
+        }
+        pending_packages = deque(active_extras.keys())
+        processed_extras: Dict[str, Set[str]] = {}
+
+        while pending_packages:
+            package_name = pending_packages.popleft()
+            selected_extras = active_extras.get(package_name, set())
+            previous_extras = processed_extras.get(package_name)
+            if previous_extras is not None and selected_extras.issubset(previous_extras):
+                continue
+
+            processed_extras[package_name] = set(selected_extras)
+            if package_name in installed_packages:
+                protected_packages[package_name] = installed_packages[package_name]
+
+            _, requirements = requirement_graph.get(package_name, (None, []))
+            if not requirements:
+                continue
+
+            active_extra_values = [""] + sorted(selected_extras)
+            for requirement in requirements:
+                if requirement.marker and not any(
+                        cls.__marker_matches(requirement.marker, extra)
+                        for extra in active_extra_values
+                ):
+                    continue
+
+                dep_name = cls.__standardize_pkg_name(requirement.name)
+                known_extras = active_extras.setdefault(dep_name, set())
+                before_len = len(known_extras)
+                known_extras.update(extra.lower() for extra in requirement.extras)
+                if dep_name not in processed_extras or len(known_extras) != before_len:
+                    pending_packages.append(dep_name)
+
+        return protected_packages
+
+    @staticmethod
+    def __is_upgrade_only_conflict(specifier_set: SpecifierSet, installed_version: Version) -> bool:
+        """
+        判断版本冲突是否只能通过升级来解决（specifier 允许的所有版本都严格高于已安装版本）。
+        返回 True 表示纯升级冲突；返回 False 表示可能需要降级或无法确定方向。
+        """
+        has_lower_bound = False
+        for spec in specifier_set:
+            op = spec.operator
+            ver_str = spec.version.rstrip("*").rstrip(".") or "0"
+            try:
+                ver = Version(ver_str)
+            except InvalidVersion:
+                return False
+
+            if op in ("<", "<="):
+                upper = ver if op == "<" else Version(f"{ver}.post0")
+                if upper <= installed_version:
+                    return False
+            elif op == "==":
+                if ver <= installed_version:
+                    return False
+            elif op == "~=":
+                # ~=X.Y.Z 等价于 >=X.Y.Z, <X.(Y+1)；若 X.Y.Z <= 已安装版本说明需降级
+                if ver <= installed_version:
+                    return False
+                has_lower_bound = True
+            elif op in (">=", ">"):
+                has_lower_bound = True
+            # != 操作符：单独出现时可能允许低版本，需结合其他约束判断
+
+        # 若没有任何明确的下限约束（仅 != 等），保守地视为不确定 → 返回 False
+        return has_lower_bound
+
+    @classmethod
+    def __validate_runtime_dependency_conflicts(
+            cls,
+            requirements_file: Path,
+            protected_packages: Dict[str, Version]
+    ) -> Tuple[bool, str]:
+        """
+        在真正执行 pip 前，先拦截插件对主程序依赖的显式覆盖请求。
+
+        共享 venv 场景下，仅冻结主程序依赖；插件新增依赖、以及插件之间共享的额外依赖，
+        允许后续安装继续调整版本。
+        """
+        conflicts = []
+        try:
+            with open(requirements_file, "r", encoding="utf-8") as f:
+                for raw_line in f:
+                    line = raw_line.strip()
+                    if not line or line.startswith("#"):
+                        continue
+                    try:
+                        requirement = Requirement(line)
+                    except Exception as err:
+                        logger.debug(f"无法解析依赖项 '{line}'，跳过运行环境冲突预检：{err}")
+                        continue
+
+                    if not cls.__marker_matches(requirement.marker):
+                        continue
+
+                    package_name = cls.__standardize_pkg_name(requirement.name)
+                    installed_version = protected_packages.get(package_name)
+                    if installed_version is None:
+                        continue
+
+                    if requirement.url:
+                        conflicts.append((
+                            package_name,
+                            str(installed_version),
+                            f"来自 {requirement.url} 的同名包",
+                            package_name in cls._protected_runtime_packages,
+                        ))
+                        continue
+
+                    if requirement.specifier and not requirement.specifier.contains(
+                            installed_version,
+                            prereleases=True
+                    ):
+                        is_core = package_name in cls._protected_runtime_packages
+                        # 非核心包的纯升级冲突（插件要求更新版本）允许放行，由 pip 约束文件控制实际安装
+                        if is_core or not cls.__is_upgrade_only_conflict(
+                                requirement.specifier, installed_version):
+                            conflicts.append((
+                                package_name,
+                                str(installed_version),
+                                str(requirement.specifier),
+                                is_core,
+                            ))
+        except Exception as e:
+            logger.error(f"执行运行环境依赖冲突预检时发生错误：{e}")
+            return False, f"插件依赖预检失败：{e}"
+
+        if not conflicts:
+            return True, ""
+
+        def sort_key(item: Tuple[str, str, str, bool]) -> Tuple[int, str]:
+            return 0 if item[3] else 1, item[0]
+
+        details = []
+        for package_name, installed_version, expected, _is_protected in sorted(conflicts, key=sort_key)[:5]:
+            details.append(
+                f"{cls.__format_pkg_name_for_pip(package_name)} 当前为 {installed_version}，"
+                f"插件要求 {expected}"
+            )
+        if len(conflicts) > 5:
+            details.append(f"其余 {len(conflicts) - 5} 项冲突已省略")
+
+        scope = "主程序核心依赖" if any(item[3] for item in conflicts) else "主程序依赖"
+        return False, (
+            f"插件依赖与当前运行环境的{scope}冲突：{'；'.join(details)}。"
+            f"为避免共享运行环境被污染，已拒绝安装。"
+        )
+
+    @classmethod
+    def __create_runtime_constraints_file(cls, protected_packages: Dict[str, Version]) -> Path:
+        """
+        以主程序依赖的当前已安装版本生成临时约束文件，确保插件安装不会改写主程序依赖。
+        """
+        temp_dir = Path(settings.TEMP_PATH) / "plugin_dependencies"
+        temp_dir.mkdir(parents=True, exist_ok=True)
+        with tempfile.NamedTemporaryFile(
+                mode="w",
+                encoding="utf-8",
+                dir=temp_dir,
+                prefix="runtime-constraints-",
+                suffix=".txt",
+                delete=False
+        ) as temp_file:
+            for package_name, version in sorted(protected_packages.items()):
+                if package_name in cls._protected_runtime_packages:
+                    # 核心包严格锁定，插件不得改写
+                    temp_file.write(f"{cls.__format_pkg_name_for_pip(package_name)}=={version}\n")
+                else:
+                    # 非核心主程序依赖：允许升级，但禁止降级
+                    temp_file.write(f"{cls.__format_pkg_name_for_pip(package_name)}>={version}\n")
+        return Path(temp_file.name)
+
+    @staticmethod
+    def __refresh_import_system():
+        """
+        依赖安装或修复后刷新当前解释器的导入缓存，保证后续动态导入能看到新状态。
+        """
+        importlib.reload(site)
+        importlib.invalidate_caches()
+
+    @classmethod
+    def __run_runtime_healthcheck(cls) -> Tuple[bool, str]:
+        """
+        安装完成后立即执行运行环境自检，尽量在插件加载前发现依赖图已被污染。
+        """
+        checks = [
+            ("pip check", cls.__build_runtime_pip_command("check")),
+            ("核心依赖导入检查", [sys.executable, "-c", cls._runtime_import_probe]),
+        ]
+        for check_name, command in checks:
+            success, message = SystemUtils.execute_with_subprocess(command)
+            if not success:
+                return False, f"{check_name}失败：{message}"
+        return True, ""
+
+    @classmethod
+    def __repair_main_runtime_dependencies(cls, snapshot_file: Optional[Path] = None) -> Tuple[bool, str]:
+        """
+        依赖安装后如果发现主运行环境已异常，优先恢复主程序依赖快照；
+        若快照不可用，再按主项目依赖重新安装进行自愈。
+        """
+        repair_target = snapshot_file
+        repair_desc = "主程序依赖快照"
+        if repair_target and not repair_target.exists():
+            repair_target = None
+        if repair_target is None:
+            repair_target = settings.ROOT_PATH / "requirements.txt"
+            repair_desc = "主程序 requirements.txt"
+        if not repair_target.exists():
+            return False, f"恢复依赖文件不存在：{repair_target}"
+
+        last_error = ""
+        base_cmd = [sys.executable, "-m", "pip", "install", "-r", str(repair_target)]
+        for strategy_name, pip_command in cls.__build_pip_install_strategies(base_cmd):
+            logger.warning(f"[PIP] 运行环境异常，尝试使用策略：{strategy_name} 恢复{repair_desc}")
             success, message = SystemUtils.execute_with_subprocess(pip_command)
             if success:
-                logger.debug(f"[PIP] 策略：{strategy_name} 安装依赖成功，输出：{message}")
-                # 安装成功后刷新Python的模块系统
-                importlib.reload(site)
-                # 获取新安装的模块
-                current_modules = set(sys.modules.keys())
-                new_modules = current_modules - before_installation
-                # 重新加载新安装的模块
-                for module in new_modules:
-                    if module in sys.modules:
-                        del sys.modules[module]
-                logger.debug(f"[PIP] 已刷新导入系统，新加载的模块: {new_modules}")
+                cls.__refresh_import_system()
                 return True, message
-            else:
-                logger.error(f"[PIP] 策略：{strategy_name} 安装依赖失败，错误信息：{message}")
+            last_error = message
+            logger.error(f"[PIP] 使用策略：{strategy_name} 恢复{repair_desc}失败：{message}")
+        return False, last_error or f"恢复{repair_desc}失败"
 
-        return False, "[PIP] 所有策略均安装依赖失败，请检查网络连接或 PIP 配置"
+    @classmethod
+    def pip_install_with_fallback(cls,
+                                  requirements_file: Path,
+                                  find_links_dirs: Optional[List[Path]] = None) -> Tuple[bool, str]:
+        """
+        使用自动降级策略安装依赖，并确保新安装的包可被动态导入
+        :param requirements_file: 依赖的 requirements.txt 文件路径
+        :param find_links_dirs: 额外的本地 wheels 目录列表
+        :return: (是否成功, 错误信息)
+        """
+        wheels_dir = requirements_file.parent / "wheels"
+        candidate_dirs = []
+        if wheels_dir.is_dir():
+            candidate_dirs.append(wheels_dir)
+        if find_links_dirs:
+            candidate_dirs.extend(find_links_dirs)
+
+        # 去重并保持传入顺序
+        resolved_dirs = []
+        seen_dirs = set()
+        for candidate_dir in candidate_dirs:
+            candidate_path = Path(candidate_dir)
+            if not candidate_path.is_dir():
+                continue
+            candidate_key = str(candidate_path.resolve())
+            if candidate_key in seen_dirs:
+                continue
+            seen_dirs.add(candidate_key)
+            resolved_dirs.append(candidate_path)
+
+        find_links_option = []
+        if resolved_dirs:
+            for local_wheels_dir in resolved_dirs:
+                logger.debug(f"[PIP] 发现可用的 wheels 目录: {local_wheels_dir}，将优先从本地安装。")
+                find_links_option.extend(["--find-links", str(local_wheels_dir)])
+        else:
+            logger.debug(f"[PIP] 未发现可用的 wheels 目录，将仅使用在线源。")
+
+        installed_packages = cls.__get_installed_packages()
+        protected_packages = cls.__get_protected_runtime_packages(installed_packages)
+        check_ok, check_message = cls.__validate_runtime_dependency_conflicts(requirements_file, protected_packages)
+        if not check_ok:
+            logger.error(f"[PIP] 运行环境冲突预检失败：{check_message}")
+            return False, check_message
+
+        constraints_file = None
+        if protected_packages:
+            try:
+                constraints_file = cls.__create_runtime_constraints_file(protected_packages)
+            except Exception as e:
+                logger.error(f"[PIP] 创建运行环境约束文件失败：{e}")
+                return False, f"创建运行环境约束文件失败：{e}"
+
+        base_cmd = [sys.executable, "-m", "pip", "install"] + find_links_option
+        if constraints_file:
+            # 这里固定约束到主程序依赖的当前版本，避免共享 venv 被插件改写核心运行环境。
+            base_cmd.extend(["-c", str(constraints_file)])
+        base_cmd.extend(["-r", str(requirements_file)])
+        strategies = cls.__build_pip_install_strategies(base_cmd)
+
+        try:
+            # pip 会修改当前解释器的 site-packages，安装与缓存刷新必须串行，避免运行态模块被并发安装窗口污染。
+            with cls._pip_install_lock:
+                loaded_modules_before_install = set(sys.modules.keys())
+                # 遍历策略进行安装
+                for strategy_name, pip_command in strategies:
+                    logger.debug(f"[PIP] 尝试使用策略：{strategy_name} 安装依赖，命令：{' '.join(pip_command)}")
+                    success, message = SystemUtils.execute_with_subprocess(pip_command)
+                    if success:
+                        logger.debug(f"[PIP] 策略：{strategy_name} 安装依赖成功，输出：{message}")
+                        health_ok, health_message = cls.__run_runtime_healthcheck()
+                        if not health_ok:
+                            logger.error(f"[PIP] 依赖安装后运行环境自检失败：{health_message}")
+                            repair_ok, repair_message = cls.__repair_main_runtime_dependencies(
+                                constraints_file if protected_packages else None
+                            )
+                            if repair_ok:
+                                health_restored, restored_message = cls.__run_runtime_healthcheck()
+                                if health_restored:
+                                    cls.__refresh_import_system()
+                                    return False, (
+                                        f"依赖安装后运行环境自检失败，已自动恢复主程序依赖：{health_message}"
+                                    )
+                                logger.error(
+                                    f"[PIP] 主程序依赖恢复后仍未通过健康检查：{restored_message}"
+                                )
+                                return False, (
+                                    f"依赖安装后运行环境自检失败，恢复主程序依赖后仍异常："
+                                    f"{restored_message}"
+                                )
+                            return False, (
+                                f"依赖安装后运行环境自检失败，且自动恢复主程序依赖失败："
+                                f"{repair_message}"
+                            )
+
+                        cls.__refresh_import_system()
+                        loaded_modules_after_install = set(sys.modules.keys())
+                        loaded_modules_during_install = loaded_modules_after_install - loaded_modules_before_install
+                        logger.debug(f"[PIP] 已刷新导入系统，新加载的模块: {loaded_modules_during_install}")
+                        return True, message
+
+                    logger.error(f"[PIP] 策略：{strategy_name} 安装依赖失败，错误信息：{message}")
+        finally:
+            if constraints_file:
+                constraints_file.unlink(missing_ok=True)
+
+        return False, "[PIP] 所有策略均安装依赖失败，请检查网络连接、PIP 配置或插件依赖约束"
 
     @staticmethod
     def __request_with_fallback(url: str,
@@ -568,10 +1445,10 @@ class PluginHelper(metaclass=WeakSingleton):
             logger.error(f"{pid} 准备插件内容失败：{message}")
             if backup_dir:
                 self.__restore_plugin(pid, backup_dir)
-                logger.warning(f"{pid} 插件安装失败，已还原备份插件")
+                logger.warn(f"{pid} 插件安装失败，已还原备份插件")
             else:
                 self.__remove_old_plugin(pid)
-                logger.warning(f"{pid} 已清理对应插件目录，请尝试重新安装")
+                logger.warn(f"{pid} 已清理对应插件目录，请尝试重新安装")
             return False, message
 
         dependencies_exist, dep_ok, dep_msg = self.__install_dependencies_if_required(pid)
@@ -579,13 +1456,14 @@ class PluginHelper(metaclass=WeakSingleton):
             logger.error(f"{pid} 依赖安装失败：{dep_msg}")
             if backup_dir:
                 self.__restore_plugin(pid, backup_dir)
-                logger.warning(f"{pid} 插件安装失败，已还原备份插件")
+                logger.warn(f"{pid} 插件安装失败，已还原备份插件")
             else:
                 self.__remove_old_plugin(pid)
-                logger.warning(f"{pid} 已清理对应插件目录，请尝试重新安装")
+                logger.warn(f"{pid} 已清理对应插件目录，请尝试重新安装")
             return False, dep_msg
 
         self.install_reg(pid, repo_url)
+        self.refresh_persistent_plugin_backup(pid)
         return True, ""
 
     def __install_from_release(self, pid: str, user_repo: str, release_tag: str) -> Tuple[bool, str]:
@@ -718,7 +1596,8 @@ class PluginHelper(metaclass=WeakSingleton):
                     f.write(dep + "\n")
             try:
                 # 使用自动降级策略安装依赖
-                return self.pip_install_with_fallback(requirements_temp_file)
+                wheels_dirs = self.__collect_plugin_wheels_dirs()
+                return self.pip_install_with_fallback(requirements_temp_file, wheels_dirs)
             finally:
                 # 删除临时文件
                 requirements_temp_file.unlink()
@@ -726,21 +1605,30 @@ class PluginHelper(metaclass=WeakSingleton):
             logger.error(f"安装依赖项时发生错误：{e}")
             return False, f"安装依赖项时发生错误：{e}"
 
-    def __get_installed_packages(self) -> Dict[str, Version]:
+    @classmethod
+    def __get_installed_packages(cls) -> Dict[str, Version]:
         """
         获取已安装的包及其版本
-        使用 pkg_resources 获取当前环境中已安装的包，标准化包名并转换版本信息
+        使用 importlib.metadata 获取当前环境中已安装的包，标准化包名并转换版本信息
         对于无法解析的版本，记录警告日志并跳过
         :return: 已安装包的字典，格式为 {package_name: Version}
         """
         installed_packages = {}
         try:
-            for dist in working_set:
-                pkg_name = self.__standardize_pkg_name(dist.project_name)
+            for dist in distributions():
+                name = dist.metadata.get("Name")
+                if not name:
+                    continue
+                pkg_name = cls.__standardize_pkg_name(name)
+                version_str = dist.metadata.get("Version") or getattr(dist, "version", None)
+                if not version_str:
+                    continue
                 try:
-                    installed_packages[pkg_name] = Version(dist.version)
+                    v = Version(version_str)
+                    if pkg_name not in installed_packages or v > installed_packages[pkg_name]:
+                        installed_packages[pkg_name] = v
                 except InvalidVersion:
-                    logger.debug(f"无法解析已安装包 '{pkg_name}' 的版本：{dist.version}")
+                    logger.debug(f"无法解析已安装包 '{pkg_name}' 的版本：{version_str}")
                     continue
             return installed_packages
         except Exception as e:
@@ -844,12 +1732,14 @@ class PluginHelper(metaclass=WeakSingleton):
     @staticmethod
     def __standardize_pkg_name(name: str) -> str:
         """
-        标准化包名，将包名转换为小写并将连字符替换为下划线
+        标准化包名，将包名转换为小写，连字符与点替换为下划线（与 PEP 503 归一化风格一致）
 
         :param name: 原始包名
         :return: 标准化后的包名
         """
-        return name.lower().replace("-", "_") if name else name
+        if not name:
+            return name
+        return name.lower().replace("-", "_").replace(".", "_")
 
     async def async_get_plugin_package_version(self, pid: str, repo_url: str,
                                                package_version: Optional[str] = None) -> Optional[str]:
@@ -911,7 +1801,7 @@ class PluginHelper(metaclass=WeakSingleton):
 
     @cached(maxsize=128, ttl=1800)
     async def async_get_plugins(self, repo_url: str,
-                                     package_version: Optional[str] = None) -> Optional[Dict[str, dict]]:
+                                package_version: Optional[str] = None) -> Optional[Dict[str, dict]]:
         """
         异步获取Github所有最新插件列表
         :param repo_url: Github仓库地址
@@ -931,15 +1821,11 @@ class PluginHelper(metaclass=WeakSingleton):
                                                        headers=settings.REPO_GITHUB_HEADERS(repo=f"{user}/{repo}"))
         if res is None:
             return None
-        if res:
-            content = res.text
-            try:
-                return json.loads(content)
-            except json.JSONDecodeError:
-                if "404: Not Found" not in content:
-                    logger.warn(f"插件包数据解析失败：{content}")
-                    return None
-        return {}
+        if res.status_code == 404:
+            return {}
+        if res.status_code != 200:
+            return None
+        return self.__parse_plugin_index_response(res.text)
 
     async def async_get_statistic(self) -> Dict:
         """
@@ -948,7 +1834,7 @@ class PluginHelper(metaclass=WeakSingleton):
         if not settings.PLUGIN_STATISTIC_SHARE:
             return {}
         res = await AsyncRequestUtils(proxies=settings.PROXY, timeout=10).get_res(self._install_statistic)
-        if res and res.status_code == 200:
+        if res is not None and res.status_code == 200:
             return res.json()
         return {}
 
@@ -967,9 +1853,9 @@ class PluginHelper(metaclass=WeakSingleton):
             timeout=5
         ).post(install_reg_url, json={
             "plugin_id": pid,
-            "repo_url": repo_url
+            "repo_url": self.sanitize_repo_url_for_statistic(repo_url)
         })
-        if res and res.status_code == 200:
+        if res is not None and res.status_code == 200:
             return True
         return False
 
@@ -984,7 +1870,10 @@ class PluginHelper(metaclass=WeakSingleton):
         if items:
             for pid, repo_url in items:
                 if pid:
-                    payload_plugins.append({"plugin_id": pid, "repo_url": repo_url})
+                    payload_plugins.append({
+                        "plugin_id": pid,
+                        "repo_url": self.sanitize_repo_url_for_statistic(repo_url)
+                    })
         else:
             plugins = self.systemconfig.get(SystemConfigKey.UserInstalledPlugins)
             if not plugins:
@@ -994,7 +1883,7 @@ class PluginHelper(metaclass=WeakSingleton):
                                       content_type="application/json",
                                       timeout=5).post(self._install_report,
                                                       json={"plugins": payload_plugins})
-        return True if res else False
+        return bool(res is not None and res.status_code == 200)
 
     async def __async_get_file_list(self, pid: str, user_repo: str, package_version: Optional[str] = None) -> \
             Tuple[Optional[list], Optional[str]]:
@@ -1226,7 +2115,8 @@ class PluginHelper(metaclass=WeakSingleton):
 
             try:
                 # 使用自动降级策略安装依赖
-                return self.pip_install_with_fallback(Path(requirements_temp_file))
+                wheels_dirs = self.__collect_plugin_wheels_dirs()
+                return self.pip_install_with_fallback(Path(requirements_temp_file), wheels_dirs)
             finally:
                 # 删除临时文件
                 await requirements_temp_file.unlink()
@@ -1355,6 +2245,9 @@ class PluginHelper(metaclass=WeakSingleton):
         :param force_install: 是否强制安装插件，默认不启用，启用时不进行备份和恢复操作
         :return: (是否成功, 错误信息)
         """
+        if self.is_local_repo_url(repo_url):
+            return await asyncio.to_thread(self.install_local, pid, repo_url, force_install)
+
         if SystemUtils.is_frozen():
             return False, "可执行文件模式下，只能安装本地插件"
 
@@ -1442,10 +2335,10 @@ class PluginHelper(metaclass=WeakSingleton):
             logger.error(f"{pid} 准备插件内容失败：{message}")
             if backup_dir:
                 await self.__async_restore_plugin(pid, backup_dir)
-                logger.warning(f"{pid} 插件安装失败，已还原备份插件")
+                logger.warn(f"{pid} 插件安装失败，已还原备份插件")
             else:
                 await self.__async_remove_old_plugin(pid)
-                logger.warning(f"{pid} 已清理对应插件目录，请尝试重新安装")
+                logger.warn(f"{pid} 已清理对应插件目录，请尝试重新安装")
             return False, message
 
         dependencies_exist, dep_ok, dep_msg = await self.__async_install_dependencies_if_required(pid)
@@ -1453,13 +2346,14 @@ class PluginHelper(metaclass=WeakSingleton):
             logger.error(f"{pid} 依赖安装失败：{dep_msg}")
             if backup_dir:
                 await self.__async_restore_plugin(pid, backup_dir)
-                logger.warning(f"{pid} 插件安装失败，已还原备份插件")
+                logger.warn(f"{pid} 插件安装失败，已还原备份插件")
             else:
                 await self.__async_remove_old_plugin(pid)
-                logger.warning(f"{pid} 已清理对应插件目录，请尝试重新安装")
+                logger.warn(f"{pid} 已清理对应插件目录，请尝试重新安装")
             return False, dep_msg
 
         await self.async_install_reg(pid, repo_url)
+        await asyncio.to_thread(self.refresh_persistent_plugin_backup, pid)
         return True, ""
 
     def __prepare_content_via_filelist_sync(self, pid: str, user_repo: str,

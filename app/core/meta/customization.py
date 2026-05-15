@@ -14,6 +14,18 @@ class CustomizationMatcher(metaclass=Singleton):
         self.systemconfig = SystemConfigOper()
         self.customization = None
         self.custom_separator = None
+        self._customization_re_cache = {}
+
+    @staticmethod
+    def _normalize_customization(customization):
+        """
+        规范化自定义占位符配置，兼容历史字符串与列表两种保存格式。
+        """
+        if isinstance(customization, str):
+            customization = customization.replace("\n", ";").replace("|", ";").strip(";").split(";")
+        if not customization:
+            return []
+        return list(filter(None, customization))
 
     def match(self, title=None):
         """
@@ -22,19 +34,23 @@ class CustomizationMatcher(metaclass=Singleton):
         """
         if not title:
             return ""
-        if not self.customization:
-            # 自定义占位符
-            customization = self.systemconfig.get(SystemConfigKey.Customization)
-            if not customization:
-                return ""
-            if isinstance(customization, str):
-                customization = customization.replace("\n", ";").replace("|", ";").strip(";").split(";")
-            self.customization = "|".join([f"({item})" for item in customization])
+        # 自定义占位符需要跟随系统配置实时生效，避免单例缓存导致保存后仍沿用旧规则。
+        customization = self._normalize_customization(
+            self.systemconfig.get(SystemConfigKey.Customization)
+        )
+        if not customization:
+            self.customization = None
+            return ""
+        self.customization = "|".join([f"({item})" for item in customization])
 
-        customization_re = re.compile(r"%s" % self.customization)
+        customization_re = self._customization_re_cache.get(self.customization)
+        if not customization_re:
+            # 配置每次读取、编译结果按规则缓存，兼顾实时生效和高频识别性能。
+            customization_re = re.compile(r"%s" % self.customization)
+            self._customization_re_cache[self.customization] = customization_re
         # 处理重复多次的情况，保留先后顺序（按添加自定义占位符的顺序）
         unique_customization = {}
-        for item in re.findall(customization_re, title):
+        for item in customization_re.findall(title):
             if not isinstance(item, tuple):
                 item = (item,)
             for i in range(len(item)):

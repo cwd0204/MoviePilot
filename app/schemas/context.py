@@ -158,6 +158,8 @@ class MediaInfo(BaseModel):
     production_countries: Optional[list] = Field(default_factory=list)
     # 语种
     spoken_languages: Optional[list] = Field(default_factory=list)
+    # 所有发行日期
+    release_dates: list = Field(default_factory=list)
     # 状态
     status: Optional[str] = None
     # 标签
@@ -246,6 +248,14 @@ class Context(BaseModel):
     media_info: Optional[Union[MediaInfo, Any]] = None
     # 种子信息
     torrent_info: Optional[TorrentInfo] = None
+    # 候选资源来源：rss、spider、search、unknown
+    resource_source: Optional[str] = "unknown"
+    # 候选匹配来源：tmdbid、doubanid、imdbid、title、plugin、unknown
+    match_source: Optional[str] = "unknown"
+    # 候选自身是否已经识别出有效媒体 ID
+    candidate_recognized: Optional[bool] = False
+    # 当前 media_info 是否为目标媒体回填
+    media_info_is_target: Optional[bool] = False
 
 
 class MediaSeason(BaseModel):

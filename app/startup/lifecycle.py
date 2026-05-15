@@ -4,6 +4,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 
 from app.chain.system import SystemChain
+from app.core.config import global_vars
 from app.helper.system import SystemHelper
 from app.startup.command_initializer import init_command, stop_command, restart_command
 from app.startup.modules_initializer import init_modules, stop_modules
@@ -12,6 +13,7 @@ from app.startup.plugins_initializer import init_plugins, stop_plugins, sync_plu
 from app.startup.routers_initializer import init_routers
 from app.startup.scheduler_initializer import stop_scheduler, init_scheduler, init_plugin_scheduler
 from app.startup.workflow_initializer import init_workflow, stop_workflow
+from app.utils.http import aclose_shared_async_transports
 
 
 async def init_extra():
@@ -35,6 +37,8 @@ async def lifespan(app: FastAPI):
     定义应用的生命周期事件
     """
     print("Starting up...")
+    # 存储当前循环
+    global_vars.set_loop(asyncio.get_event_loop())
     # 初始化路由
     init_routers(app)
     # 初始化模块
@@ -80,3 +84,5 @@ async def lifespan(app: FastAPI):
         stop_plugins()
         # 停止模块
         await stop_modules()
+        # 关闭共享的异步 HTTP 连接池，释放底层连接资源
+        await aclose_shared_async_transports()

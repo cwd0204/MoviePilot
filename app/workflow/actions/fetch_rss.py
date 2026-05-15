@@ -2,7 +2,8 @@ from typing import Optional
 
 from pydantic import Field
 
-from app.workflow.actions import BaseAction, ActionChain
+from app.workflow.actions import BaseAction
+from app.chain.media import MediaChain
 from app.core.config import settings, global_vars
 from app.core.context import Context
 from app.core.metainfo import MetaInfo
@@ -21,7 +22,7 @@ class FetchRssParams(ActionParams):
     content_type: Optional[str] = Field(default=None, description="Content-Type")
     referer: Optional[str] = Field(default=None, description="Referer")
     ua: Optional[str] = Field(default=None, description="User-Agent")
-    match_media: Optional[str] = Field(default=None, description="匹配媒体信息")
+    match_media: Optional[bool] = Field(default=False, description="匹配媒体信息")
 
 
 class FetchRssAction(BaseAction):
@@ -98,7 +99,10 @@ class FetchRssAction(BaseAction):
             meta = MetaInfo(title=torrentinfo.title, subtitle=torrentinfo.description)
             mediainfo = None
             if params.match_media:
-                mediainfo = ActionChain().recognize_media(meta)
+                mediainfo = MediaChain().recognize_by_meta(
+                    meta,
+                    obtain_images=False,
+                )
                 if not mediainfo:
                     logger.warning(f"{torrentinfo.title} 未识别到媒体信息")
                     continue

@@ -8,7 +8,7 @@ from pydantic import BaseModel, Field
 from app.agent.tools.base import MoviePilotTool
 from app.chain.media import MediaChain
 from app.log import logger
-from app.schemas.types import MediaType
+from app.schemas.types import MediaType, media_type_to_agent
 
 
 class SearchMediaInput(BaseModel):
@@ -17,71 +17,93 @@ class SearchMediaInput(BaseModel):
     title: str = Field(..., description="The title of the media to search for (e.g., 'The Matrix', 'Breaking Bad')")
     year: Optional[str] = Field(None, description="Release year of the media (optional, helps narrow down results)")
     media_type: Optional[str] = Field(None,
-                                      description="Type of media content: '电影' for films, '电视剧' for television series or anime series")
+                                      description="Allowed values: movie, tv")
     season: Optional[int] = Field(None,
                                   description="Season number for TV shows and anime (optional, only applicable for series)")
 
 
 class SearchMediaTool(MoviePilotTool):
     name: str = "search_media"
-    description: str = "Search for media resources including movies, TV shows, anime, etc. Supports searching by title, year, type, and other criteria. Returns detailed media information from TMDB database."
+    description: str = "Search TMDB database for media resources (movies, TV shows, anime, etc.) by title, year, type, and other criteria. Returns detailed media information from TMDB. Use 'recognize_media' to extract info from torrent titles/file paths, or 'scrape_metadata' to generate metadata files."
     args_schema: Type[BaseModel] = SearchMediaInput
+
+    def get_tool_message(self, **kwargs) -> Optional[str]:
+        """根据搜索参数生成友好的提示消息"""
+        title = kwargs.get("title", "")
+        year = kwargs.get("year")
+        media_type = kwargs.get("media_type")
+        season = kwargs.get("season")
+        
+        message = f"搜索媒体: {title}"
+        if year:
+            message += f" ({year})"
+        if media_type:
+            message += f" [{media_type}]"
+        if season:
+            message += f" 第{season}季"
+        
+        return message
 
     async def run(self, title: str, year: Optional[str] = None,
                   media_type: Optional[str] = None, season: Optional[int] = None, **kwargs) -> str:
         logger.info(
             f"执行工具: {self.name}, 参数: title={title}, year={year}, media_type={media_type}, season={season}")
 
-        # 发送工具执行说明
-        await self.send_tool_message(f"正在搜索媒体资源: {title}" + (f" ({year})" if year else ""), title="搜索中")
-
         try:
             media_chain = MediaChain()
-            # 构建搜索标题
-            search_title = title
-            if year:
-                search_title = f"{title} {year}"
-            if media_type:
-                search_title = f"{search_title} {media_type}"
-            if season:
-                search_title = f"{search_title} S{season:02d}"
-
             # 使用 MediaChain.search 方法
-            meta, results = media_chain.search(title=search_title)
+            meta, results = await media_chain.async_search(title=title)
 
             # 过滤结果
             if results:
+                media_type_enum = None
+                if media_type:
+                    media_type_enum = MediaType.from_agent(media_type)
+                    if not media_type_enum:
+                        return f"错误：无效的媒体类型 '{media_type}'，支持的类型：'movie', 'tv'"
+
                 filtered_results = []
                 for result in results:
                     if year and result.year != year:
                         continue
-                    if media_type:
-                        if result.type != MediaType(media_type):
-                            continue
-                    if season and result.season != season:
+                    if media_type_enum and result.type != media_type_enum:
+                        continue
+                    if season is not None and result.season != season:
                         continue
                     filtered_results.append(result)
 
                 if filtered_results:
-                    result_message = f"找到 {len(filtered_results)} 个相关媒体资源"
-                    await self.send_tool_message(result_message, title="搜索成功")
-
-                    # 发送详细结果
-                    for i, result in enumerate(filtered_results[:5]):  # 只显示前5个结果
-                        media_info = f"{i + 1}. {result.title} ({result.year}) - {result.type.value if result.type else '未知'}"
-                        await self.send_tool_message(media_info, title="搜索结果")
-
-                    return json.dumps([r.to_dict() for r in filtered_results], ensure_ascii=False, indent=2)
+                    # 搜索结果只返回前 30 条，后续可通过更精确的年份/类型条件缩小范围。
+                    total_count = len(filtered_results)
+                    limited_results = filtered_results[:30]
+                    # 精简字段，只保留关键信息
+                    simplified_results = []
+                    for r in limited_results:
+                        simplified = {
+                            "title": r.title,
+                            "en_title": r.en_title,
+                            "year": r.year,
+                            "type": media_type_to_agent(r.type),
+                            "season": r.season,
+                            "tmdb_id": r.tmdb_id,
+                            "imdb_id": r.imdb_id,
+                            "douban_id": r.douban_id,
+                            "overview": r.overview[:200] + "..." if r.overview and len(r.overview) > 200 else r.overview,
+                            "vote_average": r.vote_average,
+                            "poster_path": r.poster_path,
+                            "detail_link": r.detail_link
+                        }
+                        simplified_results.append(simplified)
+                    result_json = json.dumps(simplified_results, ensure_ascii=False, indent=2)
+                    # 如果结果被裁剪，添加提示信息
+                    if total_count > len(limited_results):
+                        return f"注意：搜索结果共找到 {total_count} 条，为节省上下文空间，仅显示前 {len(limited_results)} 条结果。\n\n{result_json}"
+                    return result_json
                 else:
-                    error_message = f"未找到符合条件的媒体资源: {title}"
-                    await self.send_tool_message(error_message, title="搜索完成")
-                    return error_message
+                    return f"未找到符合条件的媒体资源: {title}"
             else:
-                error_message = f"未找到相关媒体资源: {title}"
-                await self.send_tool_message(error_message, title="搜索完成")
-                return error_message
+                return f"未找到相关媒体资源: {title}"
         except Exception as e:
             error_message = f"搜索媒体失败: {str(e)}"
             logger.error(f"搜索媒体失败: {e}", exc_info=True)
-            await self.send_tool_message(error_message, title="搜索失败")
             return error_message

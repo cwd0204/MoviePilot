@@ -31,6 +31,12 @@ class StorageChain(ChainBase):
         """
         return self.run_module("generate_qrcode", storage=storage)
 
+    def generate_auth_url(self, storage: str) -> Optional[Tuple[dict, str]]:
+        """
+        生成 OAuth2 授权 URL
+        """
+        return self.run_module("generate_auth_url", storage=storage)
+
     def check_login(self, storage: str, **kwargs) -> Optional[Tuple[dict, str]]:
         """
         登录确认
@@ -54,6 +60,12 @@ class StorageChain(ChainBase):
         创建目录
         """
         return self.run_module("create_folder", fileitem=fileitem, name=name)
+
+    def get_folder(self, storage: str, path: Path) -> Optional[schemas.FileItem]:
+        """
+        获取目录，不存在则递归创建
+        """
+        return self.run_module("get_folder", storage=storage, path=path)
 
     def download_file(self, fileitem: schemas.FileItem, path: Path = None) -> Optional[Path]:
         """
@@ -133,30 +145,41 @@ class StorageChain(ChainBase):
         """
         return self.run_module("support_transtype", storage=storage)
 
+    def is_bluray_folder(self, fileitem: Optional[schemas.FileItem]) -> bool:
+        """
+        检查是否蓝光目录
+        """
+        if not fileitem or fileitem.type != "dir":
+            return False
+        if self.get_file_item(storage=fileitem.storage, path=Path(fileitem.path) / "BDMV"):
+            return True
+        if self.get_file_item(storage=fileitem.storage, path=Path(fileitem.path) / "CERTIFICATE"):
+            return True
+        return False
+
+    @staticmethod
+    def contains_bluray_subdirectories(fileitems: Optional[List[schemas.FileItem]]) -> bool:
+        """
+        判断是否包含蓝光必备的文件夹
+        """
+        required_files = {"BDMV", "CERTIFICATE"}
+        return any(
+            item.type == "dir" and item.name in required_files
+            for item in fileitems or []
+        )
+
     def delete_media_file(self, fileitem: schemas.FileItem, delete_self: bool = True) -> bool:
         """
         删除媒体文件，以及不含媒体文件的目录
         """
-
-        def __is_bluray_dir(_fileitem: schemas.FileItem) -> bool:
-            """
-            检查是否蓝光目录
-            """
-            _dir_files = self.list_files(fileitem=_fileitem, recursion=False)
-            if _dir_files:
-                for _f in _dir_files:
-                    if _f.type == "dir" and _f.name in ["BDMV", "CERTIFICATE"]:
-                        return True
-            return False
-
-        media_exts = settings.RMT_MEDIAEXT + settings.DOWNLOAD_TMPEXT
+        media_exts = settings.RMT_MEDIAEXT + settings.DOWNLOAD_TMPEXT + settings.RMT_SUBEXT + settings.RMT_AUDIOEXT
         fileitem_path = Path(fileitem.path) if fileitem.path else Path("")
         if len(fileitem_path.parts) <= 2:
             logger.warn(f"【{fileitem.storage}】{fileitem.path} 根目录或一级目录不允许删除")
             return False
         if fileitem.type == "dir":
             # 本身是目录
-            if __is_bluray_dir(fileitem):
+            if self.is_bluray_folder(fileitem):
                 logger.warn(f"正在删除蓝光原盘目录：【{fileitem.storage}】{fileitem.path}")
                 if not self.delete_file(fileitem):
                     logger.warn(f"【{fileitem.storage}】{fileitem.path} 删除失败")

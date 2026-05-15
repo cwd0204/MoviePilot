@@ -53,7 +53,7 @@ class MetaVideo(MetaBase):
     _resources_pix_re2 = r"(^[248]+K)"
     _video_encode_re = r"^(H26[45])$|^(x26[45])$|^AVC$|^HEVC$|^VC\d?$|^MPEG\d?$|^Xvid$|^DivX$|^AV1$|^HDR\d*$|^AVS(\+|[23])$"
     _audio_encode_re = r"^DTS\d?$|^DTSHD$|^DTSHDMA$|^Atmos$|^TrueHD\d?$|^AC3$|^\dAudios?$|^DDP\d?$|^DD\+\d?$|^DD\d?$|^LPCM\d?$|^AAC\d?$|^FLAC\d?$|^HD\d?$|^MA\d?$|^HR\d?$|^Opus\d?$|^Vorbis\d?$|^AV[3S]A$"
-
+    _fps_re = r"(\d{2,3})(?=FPS)"
     def __init__(self, title: str, subtitle: str = None, isfile: bool = False):
         """
         初始化
@@ -76,7 +76,7 @@ class MetaVideo(MetaBase):
             self.type = MediaType.TV
             return
         # 全名为Season xx 及 Sxx 直接返回
-        season_full_res = re.search(r"^Season\s+(\d{1,3})$|^S(\d{1,3})$", title)
+        season_full_res = re.search(r"^(?:Season\s+|S)(\d{1,3})$", title, re.IGNORECASE)
         if season_full_res:
             self.type = MediaType.TV
             season = season_full_res.group(1)
@@ -85,7 +85,16 @@ class MetaVideo(MetaBase):
                 self.total_season = 1
             return
         # 去掉名称中第1个[]的内容
-        title = re.sub(r'%s' % self._name_no_begin_re, "", title, count=1)
+        _first_bracket = re.match(r'^[\[【](.+?)[\]】]', title)
+        if _first_bracket:
+            _bracket_content = _first_bracket.group(1)
+            # 如果第一个括号内为点分隔的英文发布名格式（含年份+资源类型），保留内容去掉括号
+            if re.search(r'[A-Za-z]+\..+(?:19|20)\d{2}', _bracket_content) \
+                    and re.search(r'(?:2160|1080|720|480)[PIpi]|4K|UHD|Blu[\-.]?ray|REMUX|WEB[\-.]?DL|HDTV',
+                                  _bracket_content, re.IGNORECASE):
+                title = _bracket_content + title[_first_bracket.end():]
+            else:
+                title = title[_first_bracket.end():]
         # 把xxxx-xxxx年份换成前一个年份，常出现在季集上
         title = re.sub(r'([\s.]+)(\d{4})-(\d{4})', r'\1\2', title)
         # 把大小去掉
@@ -94,18 +103,18 @@ class MetaVideo(MetaBase):
         title = re.sub(r'\d{4}[\s._-]\d{1,2}[\s._-]\d{1,2}', "", title)
         # 拆分tokens
         tokens = Tokens(title)
-        self.tokens = tokens
         # 实例化StreamingPlatforms对象
         streaming_platforms = StreamingPlatforms()
+        media_exts = settings.RMT_MEDIAEXT + settings.RMT_SUBEXT + settings.RMT_AUDIOEXT
         # 解析名称、年份、季、集、资源类型、分辨率等
         token = tokens.get_next()
         while token:
             self._index += 1  # 更新当前处理的token索引
             # Part
-            self.__init_part(token)
+            self.__init_part(token, tokens)
             # 标题
             if self._continue_flag:
-                self.__init_name(token)
+                self.__init_name(token, media_exts)
             # 年份
             if self._continue_flag:
                 self.__init_year(token)
@@ -123,13 +132,16 @@ class MetaVideo(MetaBase):
                 self.__init_resource_type(token)
             # 流媒体平台
             if self._continue_flag:
-                self.__init_web_source(token, streaming_platforms)
+                self.__init_web_source(token, tokens, streaming_platforms)
             # 视频编码
             if self._continue_flag:
                 self.__init_video_encode(token)
             # 音频编码
             if self._continue_flag:
                 self.__init_audio_encode(token)
+            # 帧率
+            if self._continue_flag:
+                self.__init_fps(token)
             # 取下一个，直到没有为卡
             token = tokens.get_next()
             self._continue_flag = True
@@ -215,7 +227,7 @@ class MetaVideo(MetaBase):
                 name = None
         return name
 
-    def __init_name(self, token: Optional[str]):
+    def __init_name(self, token: Optional[str], media_exts: list):
         """
         识别名称
         """
@@ -245,9 +257,9 @@ class MetaVideo(MetaBase):
             if not self.cn_name:
                 self.cn_name = token
             elif not self._stop_cnname_flag:
-                if re.search("%s" % self._name_movie_words, token, flags=re.IGNORECASE) \
+                if re.search("|".join(self._name_movie_words), token, flags=re.IGNORECASE) \
                         or (not re.search("%s" % self._name_no_chinese_re, token, flags=re.IGNORECASE)
-                            and not re.search("%s" % self._name_se_words, token, flags=re.IGNORECASE)):
+                            and not any(w in token for w in self._name_se_words)):
                     self.cn_name = "%s %s" % (self.cn_name, token)
                 self._stop_cnname_flag = True
         else:
@@ -302,7 +314,7 @@ class MetaVideo(MetaBase):
                 return
             else:
                 # 后缀名不要
-                if ".%s".lower() % token in settings.RMT_MEDIAEXT:
+                if ".%s".lower() % token in media_exts:
                     return
                 # 英文或者英文+数字，拼装起来
                 if self.en_name:
@@ -311,7 +323,7 @@ class MetaVideo(MetaBase):
                     self.en_name = token
                 self._last_token_type = "enname"
 
-    def __init_part(self, token: str):
+    def __init_part(self, token: str, tokens: Tokens):
         """
         识别Part
         """
@@ -327,12 +339,12 @@ class MetaVideo(MetaBase):
         if re_res:
             if not self.part:
                 self.part = re_res.group(1)
-            nextv = self.tokens.cur()
+            nextv = tokens.cur()
             if nextv \
                     and ((nextv.isdigit() and (len(nextv) == 1 or len(nextv) == 2 and nextv.startswith('0')))
                          or nextv.upper() in ['A', 'B', 'C', 'I', 'II', 'III']):
                 self.part = "%s%s" % (self.part, nextv)
-                self.tokens.get_next()
+                tokens.get_next()
             self._last_token_type = "part"
             self._continue_flag = False
             # self._stop_name_flag = False
@@ -582,7 +594,7 @@ class MetaVideo(MetaBase):
                 self._effect.append(effect)
             self._last_token = effect.upper()
 
-    def __init_web_source(self, token: str, streaming_platforms: StreamingPlatforms):
+    def __init_web_source(self, token: str, tokens: Tokens, streaming_platforms: StreamingPlatforms):
         """
         识别流媒体平台
         """
@@ -594,10 +606,10 @@ class MetaVideo(MetaBase):
 
         prev_token = None
         prev_idx = self._index - 2
-        if 0 <= prev_idx < len(self.tokens.tokens):
-            prev_token = self.tokens.tokens[prev_idx]
+        if 0 <= prev_idx < len(tokens.tokens):
+            prev_token = tokens.tokens[prev_idx]
 
-        next_token = self.tokens.peek()
+        next_token = tokens.peek()
 
         if streaming_platforms.is_streaming_platform(token):
             platform_name = streaming_platforms.get_streaming_platform_name(token)
@@ -616,7 +628,7 @@ class MetaVideo(MetaBase):
                         platform_name = streaming_platforms.get_streaming_platform_name(combined_token)
                         query_range = 2
                         if is_next:
-                            self.tokens.get_next()
+                            tokens.get_next()
                         break
 
         if not platform_name:
@@ -626,8 +638,8 @@ class MetaVideo(MetaBase):
         match_start_idx = self._index - query_range
         match_end_idx = self._index - 1
         start_index = max(0, match_start_idx - query_range)
-        end_index = min(len(self.tokens.tokens), match_end_idx + 1 + query_range)
-        tokens_to_check = self.tokens.tokens[start_index:end_index]
+        end_index = min(len(tokens.tokens), match_end_idx + 1 + query_range)
+        tokens_to_check = tokens.tokens[start_index:end_index]
 
         if any(tok and tok.upper() in web_tokens for tok in tokens_to_check):
             self.web_source = platform_name
@@ -716,3 +728,25 @@ class MetaVideo(MetaBase):
                 else:
                     self.audio_encode = "%s %s" % (self.audio_encode, token)
             self._last_token = token
+
+    def __init_fps(self, token: str):
+        """
+        识别帧率
+        """
+        if not self.name:
+            return
+
+        re_res = re.search(rf"({self._fps_re})", token, re.IGNORECASE)
+        if re_res:
+            self._continue_flag = False
+            self._stop_name_flag = True
+            self._last_token_type = "fps"
+            # 提取帧率数值
+            fps_value = None
+            if re_res.group(1):  # FPS格式
+                fps_value = re_res.group(1)
+            
+            if fps_value and fps_value.isdigit():
+                # 只存储纯数值
+                self.fps = int(fps_value)
+                self._last_token = f"{self.fps}FPS"

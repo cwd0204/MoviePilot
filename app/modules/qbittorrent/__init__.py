@@ -7,13 +7,12 @@ from torrentool.torrent import Torrent
 from app import schemas
 from app.core.cache import FileCache
 from app.core.config import settings
-from app.core.event import eventmanager, Event
 from app.core.metainfo import MetaInfo
 from app.log import logger
 from app.modules import _ModuleBase, _DownloaderBase
 from app.modules.qbittorrent.qbittorrent import Qbittorrent
 from app.schemas import TransferTorrent, DownloadingTorrent
-from app.schemas.types import TorrentStatus, ModuleType, DownloaderType, SystemConfigKey, EventType
+from app.schemas.types import TorrentStatus, ModuleType, DownloaderType
 from app.utils.string import StringUtils
 
 
@@ -25,20 +24,6 @@ class QbittorrentModule(_ModuleBase, _DownloaderBase[Qbittorrent]):
         """
         super().init_service(service_name=Qbittorrent.__name__.lower(),
                              service_type=Qbittorrent)
-
-    @eventmanager.register(EventType.ConfigChanged)
-    def handle_config_changed(self, event: Event):
-        """
-        处理配置变更事件
-        :param event: 事件对象
-        """
-        if not event:
-            return
-        event_data: schemas.ConfigChangeEventData = event.event_data
-        if event_data.key not in [SystemConfigKey.Downloaders.value]:
-            return
-        logger.info("配置变更，重新加载Qbittorrent模块...")
-        self.init_module()
 
     @staticmethod
     def get_name() -> str:
@@ -139,12 +124,12 @@ class QbittorrentModule(_ModuleBase, _DownloaderBase[Qbittorrent]):
             return None, None, None, "下载内容为空"
 
         # 读取种子的名称
-        torrent, content = __get_torrent_info()
+        torrent_from_file, content = __get_torrent_info()
         # 检查是否为磁力链接
         is_magnet = isinstance(content, str) and content.startswith("magnet:") or isinstance(content,
                                                                                              bytes) and content.startswith(
             b"magnet:")
-        if not torrent and not is_magnet:
+        if not torrent_from_file and not is_magnet:
             return None, None, None, f"添加种子任务失败：无法读取种子文件"
 
         # 获取下载器
@@ -163,9 +148,9 @@ class QbittorrentModule(_ModuleBase, _DownloaderBase[Qbittorrent]):
         # 如果要选择文件则先暂停
         is_paused = True if episodes else False
         # 添加任务
-        state = server.add_torrent(
+        state, added_torrent_ids = server.add_torrent(
             content=content,
-            download_dir=str(download_dir),
+            download_dir=self.normalize_path(download_dir, downloader),
             is_paused=is_paused,
             tag=tags,
             cookie=cookie,
@@ -185,8 +170,8 @@ class QbittorrentModule(_ModuleBase, _DownloaderBase[Qbittorrent]):
                 try:
                     for torrent in torrents:
                         # 名称与大小相等则认为是同一个种子
-                        if torrent.get("name") == torrent.name \
-                                and torrent.get("total_size") == torrent.total_size:
+                        if torrent.get("name") == getattr(torrent_from_file, 'name', '') \
+                                and torrent.get("total_size") == getattr(torrent_from_file, 'total_size', 0):
                             torrent_hash = torrent.get("hash")
                             torrent_tags = [str(tag).strip() for tag in torrent.get("tags").split(',')]
                             logger.warn(f"下载器中已存在该种子任务：{torrent_hash} - {torrent.get('name')}")
@@ -203,7 +188,11 @@ class QbittorrentModule(_ModuleBase, _DownloaderBase[Qbittorrent]):
             return None, None, None, f"添加种子任务失败：{content}"
         else:
             # 获取种子Hash
-            torrent_hash = server.get_torrent_id_by_tag(tags=tag)
+            torrent_hash = next(iter(added_torrent_ids), None)
+            if torrent_hash:
+                server.delete_torrents_tag(torrent_hash, tag)
+            else:
+                torrent_hash = server.get_torrent_id_by_tag(tags=tag)
             if not torrent_hash:
                 return None, None, None, f"下载任务添加成功，但获取Qbittorrent任务信息失败：{content}"
             else:
@@ -333,6 +322,7 @@ class QbittorrentModule(_ModuleBase, _DownloaderBase[Qbittorrent]):
                             state="paused" if torrent.get('state') in ("paused", "pausedDL") else "downloading",
                             dlspeed=StringUtils.str_filesize(torrent.get('dlspeed')),
                             upspeed=StringUtils.str_filesize(torrent.get('upspeed')),
+                            tags=torrent.get('tags'),
                             left_time=StringUtils.str_secends(
                                 (torrent.get('total_size') - torrent.get('completed')) / torrent.get(
                                     'dlspeed')) if torrent.get(
@@ -370,6 +360,21 @@ class QbittorrentModule(_ModuleBase, _DownloaderBase[Qbittorrent]):
         if not server:
             return None
         return server.delete_torrents(delete_file=delete_file, ids=hashs)
+
+    def set_torrents_tag(self, hashs: Union[str, list], tags: list,
+                        downloader: Optional[str] = None) -> Optional[bool]:
+        """
+        设置种子标签
+        :param hashs:  种子Hash
+        :param tags:  标签列表
+        :param downloader:  下载器
+        :return: bool
+        """
+        server: Qbittorrent = self.get_instance(downloader)
+        if not server:
+            return None
+        server.set_torrents_tag(ids=hashs, tags=tags)
+        return True
 
     def start_torrents(self, hashs: Union[list, str],
                        downloader: Optional[str] = None) -> Optional[bool]:

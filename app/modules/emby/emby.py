@@ -407,6 +407,7 @@ class Emby:
         """
         if not self._host or not self._apikey:
             return None, None
+        cached_item_id = item_id
         # 电视剧
         if not item_id:
             item_id = self.__get_emby_series_id_by_name(title, year)
@@ -416,12 +417,23 @@ class Emby:
                 return None, {}
         # 验证tmdbid是否相同
         item_info = self.get_iteminfo(item_id)
+        if not item_info and cached_item_id and title:
+            # 媒体删除后重新入库会导致缓存ID失效，回退到标题搜索避免误判整部剧缺失。
+            logger.warning(f"Emby缓存的电视剧媒体ID {cached_item_id} 已失效，尝试按标题重新搜索：{title}")
+            item_id = self.__get_emby_series_id_by_name(title, year)
+            if item_id is None:
+                return None, None
+            if not item_id:
+                return None, {}
+            item_info = self.get_iteminfo(item_id)
+        if not item_info:
+            return None, {}
         if item_info:
             if tmdb_id and item_info.tmdbid:
                 if str(tmdb_id) != str(item_info.tmdbid):
                     return None, {}
         # 查集的信息
-        if not season:
+        if season is None:
             season = None
         try:
             url = f"{self._host}emby/Shows/{item_id}/Episodes"
@@ -437,12 +449,12 @@ class Emby:
                 season_episodes = {}
                 for res_item in res_items:
                     season_index = res_item.get("ParentIndexNumber")
-                    if not season_index:
+                    if season_index is None:
                         continue
-                    if season and season != season_index:
+                    if season is not None and season != season_index:
                         continue
                     episode_index = res_item.get("IndexNumber")
-                    if not episode_index:
+                    if episode_index is None:
                         continue
                     if season_index not in season_episodes:
                         season_episodes[season_index] = []
@@ -640,7 +652,7 @@ class Emby:
                 item_type=item.get("Type"),
                 title=item.get("Name"),
                 original_title=item.get("OriginalTitle"),
-                year=str(item.get("ProductionYear")),
+                year=item.get("ProductionYear"),
                 tmdbid=int(tmdbid) if tmdbid else None,
                 imdbid=item.get("ProviderIds", {}).get("Imdb"),
                 tvdbid=item.get("ProviderIds", {}).get("Tvdb"),
@@ -714,7 +726,7 @@ class Emby:
             logger.error(f"连接Users/Items出错：" + str(e))
         return None
 
-    def get_webhook_message(self, form: any, args: dict) -> Optional[schemas.WebhookEventInfo]:
+    def get_webhook_message(self, form: Any, args: dict) -> Optional[schemas.WebhookEventInfo]:
         """
         解析Emby Webhook报文
         电影：

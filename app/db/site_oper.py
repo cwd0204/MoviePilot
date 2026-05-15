@@ -29,6 +29,12 @@ class SiteOper(DbOper):
         """
         return Site.get(self._db, sid)
 
+    async def async_get(self, sid: int) -> Site:
+        """
+        异步查询单个站点
+        """
+        return await Site.async_get(self._db, sid)
+
     def list(self) -> List[Site]:
         """
         获取站点列表
@@ -84,6 +90,12 @@ class SiteOper(DbOper):
         异步按域名获取站点
         """
         return await Site.async_get_by_domain(self._db, domain)
+
+    async def async_get_by_name(self, name: str) -> Site:
+        """
+        异步按名称获取站点
+        """
+        return await Site.async_get_by_name(self._db, name)
 
     def get_domains_by_ids(self, ids: List[int]) -> List[str]:
         """

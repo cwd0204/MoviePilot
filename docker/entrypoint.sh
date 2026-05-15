@@ -62,7 +62,7 @@ function load_config_from_app_env() {
         ["SSL_DOMAIN"]=""
         ["NGINX_PORT"]="3000"
         ["PORT"]="3001"
-        ["NGINX_CLIENT_MAX_BODY_SIZE"]="10m"
+        ["NGINX_CLIENT_MAX_BODY_SIZE"]="50m"
     )
 
     INFO "开始加载配置 (配置文件: ${env_file})..."
@@ -173,8 +173,103 @@ function load_config_from_app_env() {
     INFO "配置加载流程执行完毕。"
 }
 
+# 优雅退出
+function graceful_exit() {
+    local exit_code=${1:-0}
+    local reason=${2:-python_exit}
+
+    if [ "$reason" = "signal" ]; then
+        INFO "→ 收到停止信号，执行精准清理程序..."
+    else
+        INFO "→ 主进程已退出 (代码: $exit_code)，执行清理程序..."
+    fi
+
+    # 第一步：停止前端 Nginx
+    # 默认配置启动的 Nginx，默认 PID 在 /var/run/nginx.pid
+    INFO "→ [1/3] 正在关闭前端 Nginx..."
+    nginx -c /etc/nginx/nginx.conf -s stop 2>/dev/null || true
+
+    # 第二步：等待 Python 退出
+    # 由于使用了 tini -g，Python 已经收到了信号，我们只需等待
+    if [ -n "$PYTHON_PID" ] && ps -p "$PYTHON_PID" > /dev/null; then
+        INFO "→ [2/3] 正在等待 Python (PID: $PYTHON_PID) 完成清理..."
+        # 这里的 wait 会阻塞，直到 Python 真正退出
+        wait "$PYTHON_PID" 2>/dev/null || true
+    fi
+
+    # 第三步：最后关闭 Docker Proxy
+    # 必须指定配置文件路径，否则 nginx -s stop 找不到它
+    INFO "→ [3/3] 后端已安全退出，正在关闭 Docker Proxy..."
+    if [ -S "/var/run/docker.sock" ]; then
+        nginx -c /etc/nginx/docker_http_proxy.conf -s stop 2>/dev/null || true
+    fi
+
+    # 根据退出码判断最终日志性质
+    # 0: 正常退出
+    # 130/143: 被系统信号终止（通常也视为预期的清理退出）
+    if [ "$exit_code" -eq 0 ] || [ "$exit_code" -eq 130 ] || [ "$exit_code" -eq 143 ]; then
+        INFO "→ 所有服务已按序清理，容器正常退出 (ExitCode: $exit_code)。"
+    else
+        # 非预期退出码，使用 ERROR 级别并加重提示
+        ERROR "→ 清理完成，但主进程检测到异常退出 (ExitCode: $exit_code)！"
+    fi
+    exit "$exit_code"
+}
+
+# 启动前先检查后端核心依赖是否仍然可导入。
+# 插件依赖和主程序共用同一套 venv 时，历史安装记录可能已经污染环境，
+# 这里优先在真正拉起后端前做一次自愈，避免容器反复起不来。
+function ensure_backend_runtime_dependencies() {
+    local probe_code="import alembic, fastapi, pydantic, pydantic_core, pydantic_settings, sqlalchemy, starlette, uvicorn; from pydantic import BaseModel, Field"
+
+    INFO "→ 启动前检查后端核心依赖..."
+    if "${VENV_PATH}/bin/python3" -c "${probe_code}" >/dev/null 2>&1; then
+        INFO "→ 后端核心依赖检查通过。"
+        return 0
+    fi
+
+    WARN "→ 检测到后端核心依赖异常，开始尝试恢复主程序依赖..."
+    local -a pip_cmd=("${VENV_PATH}/bin/pip" "install" "-r" "/app/requirements.txt")
+    if [ -n "${PIP_PROXY}" ]; then
+        pip_cmd+=("-i" "${PIP_PROXY}")
+    elif [ -n "${PROXY_HOST}" ]; then
+        pip_cmd+=("--proxy" "${PROXY_HOST}")
+    fi
+
+    if ! "${pip_cmd[@]}" > /dev/stdout 2> /dev/stderr; then
+        ERROR "→ 自动恢复主程序依赖失败，后端无法启动。"
+        exit 1
+    fi
+
+    if ! "${VENV_PATH}/bin/python3" -c "${probe_code}" >/dev/null 2>&1; then
+        ERROR "→ 主程序依赖恢复后仍然异常，后端无法启动。"
+        exit 1
+    fi
+
+    INFO "→ 已自动恢复主程序依赖，继续启动后端。"
+}
+
 # 使用env配置
 load_config_from_app_env
+
+# 一次性升级标记仅影响本次启动，避免把临时升级模式带入运行中的 Python 进程
+ONE_SHOT_UPDATE_FLAG="${CONFIG_DIR}/temp/moviepilot.pending_update"
+ONE_SHOT_UPDATE_APPLIED="false"
+MOVIEPILOT_AUTO_UPDATE_ORIGINAL="${MOVIEPILOT_AUTO_UPDATE}"
+if [ -f "${ONE_SHOT_UPDATE_FLAG}" ]; then
+    ONE_SHOT_UPDATE_MODE="$(tr -d '\r\n' < "${ONE_SHOT_UPDATE_FLAG}" | tr '[:upper:]' '[:lower:]')"
+    rm -f "${ONE_SHOT_UPDATE_FLAG}"
+    if [ "${ONE_SHOT_UPDATE_MODE}" = "true" ]; then
+        ONE_SHOT_UPDATE_MODE="release"
+    fi
+    if [ "${ONE_SHOT_UPDATE_MODE}" = "release" ] || [ "${ONE_SHOT_UPDATE_MODE}" = "dev" ]; then
+        INFO "检测到一次性升级标记，本次启动将执行 ${ONE_SHOT_UPDATE_MODE} 升级..."
+        export MOVIEPILOT_AUTO_UPDATE="${ONE_SHOT_UPDATE_MODE}"
+        ONE_SHOT_UPDATE_APPLIED="true"
+    elif [ -n "${ONE_SHOT_UPDATE_MODE}" ]; then
+        WARN "检测到无效的一次性升级模式：${ONE_SHOT_UPDATE_MODE}，已忽略"
+    fi
+fi
 
 # 生成HTTPS配置块
 if [ "${ENABLE_SSL}" = "true" ]; then
@@ -213,6 +308,9 @@ envsubst '${NGINX_PORT}${PORT}${NGINX_CLIENT_MAX_BODY_SIZE}${ENABLE_SSL}${HTTPS_
 # 自动更新
 cd /
 source /usr/local/bin/mp_update.sh
+if [ "${ONE_SHOT_UPDATE_APPLIED}" = "true" ]; then
+    export MOVIEPILOT_AUTO_UPDATE="${MOVIEPILOT_AUTO_UPDATE_ORIGINAL}"
+fi
 cd /app || exit
 
 # 更改 moviepilot userid 和 groupid
@@ -231,9 +329,9 @@ chown moviepilot:moviepilot /etc/hosts /tmp
 
 # 下载浏览器内核
 if [[ "$HTTPS_PROXY" =~ ^https?:// ]] || [[ "$HTTPS_PROXY" =~ ^https?:// ]] || [[ "$PROXY_HOST" =~ ^https?:// ]]; then
-  HTTPS_PROXY="${HTTPS_PROXY:-${https_proxy:-$PROXY_HOST}}" gosu moviepilot:moviepilot playwright install chromium
+  HTTPS_PROXY="${HTTPS_PROXY:-${https_proxy:-$PROXY_HOST}}" gosu moviepilot:moviepilot playwright install ${PLAYWRIGHT_BROWSER_TYPE:-chromium}
 else
-  gosu moviepilot:moviepilot playwright install chromium
+  gosu moviepilot:moviepilot playwright install ${PLAYWRIGHT_BROWSER_TYPE:-chromium}
 fi
 
 # 证书管理
@@ -242,6 +340,10 @@ source /app/docker/cert.sh
 # 启动前端nginx服务
 INFO "→ 启动前端nginx服务..."
 nginx
+
+# 捕获信号并跳转到函数
+trap 'graceful_exit 130 "signal"' SIGINT
+trap 'graceful_exit 143 "signal"' SIGTERM
 
 # 启动docker http proxy nginx
 if [ -S "/var/run/docker.sock" ]; then
@@ -255,6 +357,9 @@ fi
 
 # 设置后端服务权限掩码
 umask "${UMASK}"
+
+# 启动前优先确认主运行环境仍然健康，避免插件依赖污染导致服务直接起不来。
+ensure_backend_runtime_dependencies
 
 # 清除非系统环境导入的变量，保证转移到 dumb-init 的时候，不会带入不必要的环境变量
 INFO "准备为 Python 应用清理的非系统环境导入的变量..."
@@ -275,7 +380,17 @@ fi
 # 启动后端服务
 INFO "→ 启动后端服务..."
 if [ "${START_NOGOSU:-false}" = "true" ]; then
-    exec dumb-init "${VENV_PATH}/bin/python3" app/main.py
+    "${VENV_PATH}/bin/python3" app/main.py > /dev/stdout 2> /dev/stderr &
 else
-    exec dumb-init gosu moviepilot:moviepilot "${VENV_PATH}/bin/python3" app/main.py
+    gosu moviepilot:moviepilot "${VENV_PATH}/bin/python3" app/main.py > /dev/stdout 2> /dev/stderr &
 fi
+PYTHON_PID=$!
+
+# 等待 Python 进程退出。
+# 如果收到信号，trap 会中断 wait，并执行 graceful_exit。
+# 如果 Python 正常退出，wait 会结束，然后我们手动调用 graceful_exit。
+wait "$PYTHON_PID" 2>/dev/null
+exit_code=$?
+
+# 如果 Python 自己退出了（非信号触发），执行清理
+graceful_exit "$exit_code" "python_exit"

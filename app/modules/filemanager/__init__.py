@@ -36,7 +36,7 @@ class FileManagerModule(_ModuleBase):
         self._storage_schemas = ModuleHelper.load('app.modules.filemanager.storages',
                                                   filter_func=lambda _, obj: hasattr(obj, 'schema') and obj.schema)
         # 获取存储类型
-        self._support_storages = [storage.schema.value for storage in self._storage_schemas]
+        self._support_storages = [storage.schema.value for storage in self._storage_schemas if storage.schema]
 
     @staticmethod
     def get_name() -> str:
@@ -81,26 +81,26 @@ class FileManagerModule(_ModuleBase):
                 return False, f"{d.name} 的下载目录未设置"
             if d.storage == "local" and not Path(download_path).exists():
                 return False, f"{d.name} 的下载目录 {download_path} 不存在"
-            # 媒体库目录
+            # 仅在启用整理时检查媒体库目录
             library_path = d.library_path
-            if not library_path:
-                return False, f"{d.name} 的媒体库目录未设置"
-            if d.library_storage == "local" and not Path(library_path).exists():
-                return False, f"{d.name} 的媒体库目录 {library_path} 不存在"
-            # 硬链接
-            if d.transfer_type == "link" \
-                    and d.storage == "local" \
-                    and d.library_storage == "local" \
-                    and not SystemUtils.is_same_disk(Path(download_path), Path(library_path)):
-                return False, f"{d.name} 的下载目录 {download_path} 与媒体库目录 {library_path} 不在同一磁盘，无法硬链接"
+            if d.transfer_type:
+                if not library_path:
+                    return False, f"{d.name} 的媒体库目录未设置"
+                if d.library_storage == "local" and not Path(library_path).exists():
+                    return False, f"{d.name} 的媒体库目录 {library_path} 不存在"
+                # 硬链接
+                if d.transfer_type == "link" \
+                        and d.storage == "local" \
+                        and d.library_storage == "local" \
+                        and not SystemUtils.is_same_disk(Path(download_path), Path(library_path)):
+                    return False, f"{d.name} 的下载目录 {download_path} 与媒体库目录 {library_path} 不在同一磁盘，无法硬链接"
             # 存储
             storage_oper = self.__get_storage_oper(d.storage)
-            if not storage_oper:
-                return False, f"{d.name} 的存储类型 {d.storage} 不支持"
-            if not storage_oper.check():
-                return False, f"{d.name} 的存储测试不通过"
-            if d.transfer_type and d.transfer_type not in storage_oper.support_transtype():
-                return False, f"{d.name} 的存储不支持 {d.transfer_type} 整理方式"
+            if storage_oper:
+                if not storage_oper.check():
+                    return False, f"{d.name} 的存储测试不通过"
+                if d.transfer_type and d.transfer_type not in storage_oper.support_transtype():
+                    return False, f"{d.name} 的存储不支持 {d.transfer_type} 整理方式"
 
         return True, ""
 
@@ -196,6 +196,16 @@ class FileManagerModule(_ModuleBase):
             logger.error(f"不支持 {storage} 的二维码生成")
             return None
         return storage_oper.generate_qrcode()
+
+    def generate_auth_url(self, storage: str) -> Optional[Tuple[dict, str]]:
+        """
+        生成 OAuth2 授权 URL
+        """
+        storage_oper = self.__get_storage_oper(storage, "generate_auth_url")
+        if not storage_oper:
+            logger.error(f"不支持 {storage} 的 OAuth2 授权")
+            return {}, f"不支持 {storage} 的 OAuth2 授权"
+        return storage_oper.generate_auth_url()
 
     def check_login(self, storage: str, **kwargs) -> Optional[Dict[str, str]]:
         """
@@ -396,7 +406,8 @@ class FileManagerModule(_ModuleBase):
                  transfer_type: Optional[str] = None, scrape: Optional[bool] = None,
                  library_type_folder: Optional[bool] = None, library_category_folder: Optional[bool] = None,
                  episodes_info: List[TmdbEpisode] = None,
-                 source_oper: Callable = None, target_oper: Callable = None) -> TransferInfo:
+                 source_oper: Callable = None, target_oper: Callable = None,
+                 preview: Optional[bool] = False) -> TransferInfo:
         """
         文件整理
         :param fileitem:  文件信息
@@ -464,7 +475,7 @@ class FileManagerModule(_ModuleBase):
         else:
             # 未找到有效的媒体库目录
             logger.error(
-                f"{mediainfo.type.value} {mediainfo.title_year} 未找到有效的媒体库目录，无法整理文件，源路径：{fileitem.path}")
+                f"{mediainfo.type.value if mediainfo.type else '未知类型'} {mediainfo.title_year} 未找到有效的媒体库目录，无法整理文件，源路径：{fileitem.path}")
             return TransferInfo(success=False,
                                 fileitem=fileitem,
                                 message="未找到有效的媒体库目录")
@@ -512,6 +523,7 @@ class FileManagerModule(_ModuleBase):
                                       need_notify=need_notify,
                                       overwrite_mode=overwrite_mode,
                                       episodes_info=episodes_info,
+                                      preview=preview,
                                       source_oper=source_oper,
                                       target_oper=target_oper)
 

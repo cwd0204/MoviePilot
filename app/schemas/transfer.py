@@ -3,11 +3,11 @@ from typing import Optional, List, Any, Callable
 
 from pydantic import BaseModel, Field
 
-from app.schemas.tmdb import TmdbEpisode
-from app.schemas.history import DownloadHistory
 from app.schemas.context import MetaInfo, MediaInfo
 from app.schemas.file import FileItem
+from app.schemas.history import DownloadHistory
 from app.schemas.system import TransferDirectoryConf
+from app.schemas.tmdb import TmdbEpisode
 
 
 class TransferTorrent(BaseModel):
@@ -40,6 +40,7 @@ class DownloadingTorrent(BaseModel):
     state: Optional[str] = 'downloading'
     upspeed: Optional[str] = None
     dlspeed: Optional[str] = None
+    tags: Optional[str] = None
     media: Optional[dict] = Field(default_factory=dict)
     userid: Optional[str] = None
     username: Optional[str] = None
@@ -65,8 +66,10 @@ class TransferTask(BaseModel):
     downloader: Optional[str] = None
     download_hash: Optional[str] = None
     download_history: Optional[DownloadHistory] = None
+    transfer_batch_id: Optional[str] = None
     manual: Optional[bool] = False
     background: Optional[bool] = True
+    preview: Optional[bool] = False
 
     def to_dict(self):
         """
@@ -124,14 +127,6 @@ class TransferInfo(BaseModel):
     total_size: Optional[int] = Field(default=0)
     # 失败清单
     fail_list: Optional[list] = Field(default_factory=list)
-    # 处理字幕文件清单
-    subtitle_list: Optional[list] = Field(default_factory=list)
-    # 目标字幕文件清单
-    subtitle_list_new: Optional[list] = Field(default_factory=list)
-    # 处理音频文件清单
-    audio_list: Optional[list] = Field(default_factory=list)
-    # 目标音频文件清单
-    audio_list_new: Optional[list] = Field(default_factory=list)
     # 错误信息
     message: Optional[str] = None
     # 是否需要刮削
@@ -210,3 +205,5 @@ class ManualTransferItem(BaseModel):
     from_history: Optional[bool] = False
     # 剧集组
     episode_group: Optional[str] = None
+    # 仅预览，不执行整理
+    preview: Optional[bool] = False
