@@ -14,22 +14,22 @@ from transmission_rpc import File
 
 from app.core.cache import FileCache, AsyncFileCache, fresh, async_fresh
 from app.core.config import settings
-from app.core.context import Context, MediaInfo, TorrentInfo
+from app.core.context import Context, MediaInfo, SubtitleInfo, TorrentInfo
 from app.core.event import EventManager
 from app.core.meta import MetaBase
 from app.core.module import ModuleManager
 from app.core.plugin import PluginManager
 from app.db.message_oper import MessageOper
 from app.db.user_oper import UserOper
-from app.helper.recognize import MediaRecognizeShareHelper
 from app.helper.message import MessageHelper, MessageQueueManager, MessageTemplateHelper
+from app.helper.server import MoviePilotServerHelper
 from app.helper.service import ServiceConfigHelper
 from app.log import logger
 from app.schemas import (
+    RateLimitExceededException,
     TransferInfo,
-    TransferTorrent,
     ExistMediaInfo,
-    DownloadingTorrent,
+    DownloaderTorrent,
     CommingMessage,
     Notification,
     WebhookEventInfo,
@@ -40,6 +40,7 @@ from app.schemas import (
     MessageResponse,
 )
 from app.utils.identity import normalize_internal_user_id
+from app.schemas.message import ChannelCapability, ChannelCapabilityManager
 from app.schemas.category import CategoryConfig
 from app.schemas.types import (
     TorrentStatus,
@@ -121,6 +122,74 @@ class ChainBase(metaclass=ABCMeta):
         """
         self.filecache.delete(filename)
 
+    def start_message_processing_status(
+            self,
+            channel: MessageChannel,
+            source: Optional[str],
+            userid: Optional[Union[str, int]] = None,
+            message_id: Optional[Union[str, int]] = None,
+            chat_id: Optional[Union[str, int]] = None,
+            text: Optional[str] = None,
+    ) -> Optional[dict]:
+        """
+        启动渠道侧消息输入/处理状态。
+        具体表现由消息模块实现，例如 typing 保活或消息 reaction。
+        """
+        if not channel or not ChannelCapabilityManager.supports_capability(
+                channel, ChannelCapability.PROCESSING_STATUS
+        ):
+            return None
+        try:
+            status = self.run_module(
+                "mark_message_processing_started",
+                channel=channel,
+                source=source,
+                userid=userid,
+                message_id=message_id,
+                chat_id=chat_id,
+                text=text,
+            )
+        except Exception as err:
+            logger.debug(f"启动消息处理状态失败: {err}")
+            return None
+        return status if isinstance(status, dict) else None
+
+    def finish_message_processing_status(
+            self,
+            status: Optional[dict] = None,
+            channel: Optional[MessageChannel] = None,
+            source: Optional[str] = None,
+            userid: Optional[Union[str, int]] = None,
+            message_id: Optional[Union[str, int]] = None,
+            chat_id: Optional[Union[str, int]] = None,
+    ) -> None:
+        """
+        结束渠道侧消息输入/处理状态。
+        优先使用 start 返回的 status，缺失时使用显式渠道和消息定位参数。
+        """
+        target_channel = channel
+        if status:
+            try:
+                target_channel = MessageChannel(status.get("channel"))
+            except Exception:
+                target_channel = channel
+        if not target_channel or not ChannelCapabilityManager.supports_capability(
+                target_channel, ChannelCapability.PROCESSING_STATUS
+        ):
+            return
+        try:
+            self.run_module(
+                "mark_message_processing_finished",
+                channel=target_channel,
+                source=(status or {}).get("source") or source,
+                userid=(status or {}).get("userid") or userid,
+                message_id=(status or {}).get("message_id") or message_id,
+                chat_id=(status or {}).get("chat_id") or chat_id,
+                status=status,
+            )
+        except Exception as err:
+            logger.debug(f"结束消息处理状态失败: {err}")
+
     @staticmethod
     def _normalize_notification_for_dispatch(
             message: Notification
@@ -135,6 +204,13 @@ class ChainBase(metaclass=ABCMeta):
             dispatch_message.userid
         )
         return dispatch_message
+
+    @staticmethod
+    def _build_notice_message_data(message: Notification) -> dict:
+        """
+        构造消息通知事件数据。
+        """
+        return {**message.model_dump(exclude={"save_history"}), "type": message.mtype}
 
     async def async_remove_cache(self, filename: str) -> None:
         """
@@ -159,7 +235,7 @@ class ChainBase(metaclass=ABCMeta):
         处理插件模块执行错误
         """
         if kwargs.get("raise_exception"):
-            raise
+            raise err
         logger.error(
             f"运行插件 {plugin_id} 模块 {method} 出错：{str(err)}\n{traceback.format_exc()}"
         )
@@ -185,7 +261,7 @@ class ChainBase(metaclass=ABCMeta):
         处理系统模块执行错误
         """
         if kwargs.get("raise_exception"):
-            raise
+            raise err
         logger.error(
             f"运行模块 {module_id}.{method} 出错：{str(err)}\n{traceback.format_exc()}"
         )
@@ -203,6 +279,18 @@ class ChainBase(metaclass=ABCMeta):
                 "traceback": traceback.format_exc(),
             },
         )
+
+    @staticmethod
+    def __handle_rate_limit_error(
+            err: RateLimitExceededException, source_type: str, source_id: str,
+            method: str, **kwargs
+    ) -> None:
+        """
+        处理本地限流跳过，避免预期的限流状态进入系统错误告警。
+        """
+        if kwargs.get("raise_exception"):
+            raise err
+        logger.info(f"{source_type} {source_id}.{method} 已限流，跳过执行：{str(err)}")
 
     def __execute_plugin_modules(
             self, method: str, result: Any, *args, **kwargs
@@ -227,6 +315,10 @@ class ChainBase(metaclass=ABCMeta):
                                 result.extend(temp)
                         else:
                             break
+                    except RateLimitExceededException as err:
+                        self.__handle_rate_limit_error(
+                            err, "插件", plugin_id, method, **kwargs
+                        )
                     except Exception as err:
                         self.__handle_plugin_error(
                             err, plugin_id, plugin_name, method, **kwargs
@@ -264,6 +356,10 @@ class ChainBase(metaclass=ABCMeta):
                                 result.extend(temp)
                         else:
                             break
+                    except RateLimitExceededException as err:
+                        self.__handle_rate_limit_error(
+                            err, "插件", plugin_id, method, **kwargs
+                        )
                     except Exception as err:
                         self.__handle_plugin_error(
                             err, plugin_id, plugin_name, method, **kwargs
@@ -303,6 +399,10 @@ class ChainBase(metaclass=ABCMeta):
                 else:
                     # 中止继续执行
                     break
+            except RateLimitExceededException as err:
+                self.__handle_rate_limit_error(
+                    err, "模块", module_id, method, **kwargs
+                )
             except Exception as err:
                 logger.error(traceback.format_exc())
                 self.__handle_system_error(
@@ -353,6 +453,10 @@ class ChainBase(metaclass=ABCMeta):
                 else:
                     # 中止继续执行
                     break
+            except RateLimitExceededException as err:
+                self.__handle_rate_limit_error(
+                    err, "模块", module_id, method, **kwargs
+                )
             except Exception as err:
                 logger.error(traceback.format_exc())
                 self.__handle_system_error(
@@ -484,6 +588,8 @@ class ChainBase(metaclass=ABCMeta):
             tmdbid = meta.tmdbid
         if not doubanid and hasattr(meta, "doubanid"):
             doubanid = meta.doubanid
+        if not episode_group and hasattr(meta, "episode_group"):
+            episode_group = meta.episode_group
         # 有tmdbid时，不使用meta推断的类型（由消歧逻辑决定），也不使用其它ID
         if tmdbid:
             doubanid = None
@@ -491,7 +597,6 @@ class ChainBase(metaclass=ABCMeta):
         elif not mtype and meta and meta.type in [MediaType.TV, MediaType.MOVIE]:
             mtype = meta.type
         share_query_meta = share_meta or meta
-        share_helper = MediaRecognizeShareHelper()
         with fresh(not cache):
             mediainfo = self.run_module(
                 "recognize_media",
@@ -505,7 +610,7 @@ class ChainBase(metaclass=ABCMeta):
             )
         if mediainfo:
             if not mediainfo.recognize_cache_hit:
-                share_helper.report(
+                MoviePilotServerHelper.report_recognize_share(
                     meta=meta,
                     mediainfo=mediainfo,
                     keyword_meta=share_query_meta,
@@ -516,12 +621,12 @@ class ChainBase(metaclass=ABCMeta):
                 share_query_meta, tmdbid, doubanid, bangumiid
         ):
             shared_cache_meta = self._snapshot_recognize_cache_meta(meta)
-            shared_item = share_helper.query(
+            shared_item = MoviePilotServerHelper.query_recognize_share(
                 meta=meta,
                 mtype=mtype,
                 keyword_meta=share_query_meta,
             )
-            shared_params = share_helper.to_recognize_params(shared_item)
+            shared_params = MoviePilotServerHelper.to_recognize_params(shared_item)
             if shared_params:
                 with fresh(not cache):
                     mediainfo = self.run_module(
@@ -567,6 +672,8 @@ class ChainBase(metaclass=ABCMeta):
             tmdbid = meta.tmdbid
         if not doubanid and hasattr(meta, "doubanid"):
             doubanid = meta.doubanid
+        if not episode_group and hasattr(meta, "episode_group"):
+            episode_group = meta.episode_group
         # 有tmdbid时，不使用meta推断的类型（由消歧逻辑决定），也不使用其它ID
         if tmdbid:
             doubanid = None
@@ -574,7 +681,6 @@ class ChainBase(metaclass=ABCMeta):
         elif not mtype and meta and meta.type in [MediaType.TV, MediaType.MOVIE]:
             mtype = meta.type
         share_query_meta = share_meta or meta
-        share_helper = MediaRecognizeShareHelper()
         async with async_fresh(not cache):
             mediainfo = await self.async_run_module(
                 "async_recognize_media",
@@ -588,7 +694,7 @@ class ChainBase(metaclass=ABCMeta):
             )
         if mediainfo:
             if not mediainfo.recognize_cache_hit:
-                await share_helper.async_report(
+                await MoviePilotServerHelper.async_report_recognize_share(
                     meta=meta,
                     mediainfo=mediainfo,
                     keyword_meta=share_query_meta,
@@ -599,12 +705,12 @@ class ChainBase(metaclass=ABCMeta):
                 share_query_meta, tmdbid, doubanid, bangumiid
         ):
             shared_cache_meta = self._snapshot_recognize_cache_meta(meta)
-            shared_item = await share_helper.async_query(
+            shared_item = await MoviePilotServerHelper.async_query_recognize_share(
                 meta=meta,
                 mtype=mtype,
                 keyword_meta=share_query_meta,
             )
-            shared_params = share_helper.to_recognize_params(shared_item)
+            shared_params = MoviePilotServerHelper.to_recognize_params(shared_item)
             if shared_params:
                 async with async_fresh(not cache):
                     mediainfo = await self.async_run_module(
@@ -922,6 +1028,18 @@ class ChainBase(metaclass=ABCMeta):
         """
         return await self.async_run_module("async_search_collections", name=name)
 
+    def get_search_page_size(
+            self,
+            site: dict,
+            keyword: Optional[str] = None,
+    ) -> Optional[int]:
+        """
+        获取站点搜索单页容量；返回 None 表示当前搜索入口不支持可靠翻页。
+        """
+        return self.run_module(
+            "get_search_page_size", site=site, keyword=keyword
+        )
+
     def search_torrents(
             self,
             site: dict,
@@ -941,6 +1059,23 @@ class ChainBase(metaclass=ABCMeta):
             "search_torrents", site=site, keyword=keyword, mtype=mtype, page=page
         )
 
+    def search_subtitles(
+            self,
+            site: dict,
+            keyword: str,
+            page: Optional[int] = 0,
+    ) -> List[SubtitleInfo]:
+        """
+        搜索一个站点的字幕资源。
+        :param site: 站点
+        :param keyword: 搜索关键词
+        :param page: 页码
+        :return: 字幕列表
+        """
+        return self.run_module(
+            "search_subtitles", site=site, keyword=keyword, page=page
+        )
+
     async def async_search_torrents(
             self,
             site: dict,
@@ -958,6 +1093,23 @@ class ChainBase(metaclass=ABCMeta):
         """
         return await self.async_run_module(
             "async_search_torrents", site=site, keyword=keyword, mtype=mtype, page=page
+        )
+
+    async def async_search_subtitles(
+            self,
+            site: dict,
+            keyword: str,
+            page: Optional[int] = 0,
+    ) -> List[SubtitleInfo]:
+        """
+        异步搜索一个站点的字幕资源。
+        :param site: 站点
+        :param keyword: 搜索关键词
+        :param page: 页码
+        :return: 字幕列表
+        """
+        return await self.async_run_module(
+            "async_search_subtitles", site=site, keyword=keyword, page=page
         )
 
     def refresh_torrents(
@@ -1075,16 +1227,22 @@ class ChainBase(metaclass=ABCMeta):
             status: TorrentStatus = None,
             hashs: Union[list, str] = None,
             downloader: Optional[str] = None,
-    ) -> Optional[List[Union[TransferTorrent, DownloadingTorrent]]]:
+            include_all_tags: bool = False,
+    ) -> Optional[List[DownloaderTorrent]]:
         """
         获取下载器种子列表
         :param status:  种子状态
         :param hashs:  种子Hash
         :param downloader:  下载器
+        :param include_all_tags:  是否包含未打内置标签的下载任务
         :return: 下载器中符合状态的种子列表
         """
         return self.run_module(
-            "list_torrents", status=status, hashs=hashs, downloader=downloader
+            "list_torrents",
+            status=status,
+            hashs=hashs,
+            downloader=downloader,
+            include_all_tags=include_all_tags,
         )
 
     def transfer(
@@ -1202,6 +1360,61 @@ class ChainBase(metaclass=ABCMeta):
         """
         return self.run_module("set_torrents_tag", hashs=hashs, tags=tags, downloader=downloader)
 
+    def update_torrent(
+            self,
+            hash_string: str,
+            downloader: Optional[str] = None,
+            download_limit: Optional[float] = None,
+            upload_limit: Optional[float] = None,
+            tracker_list: Optional[list] = None,
+            save_path: Optional[str] = None,
+            category: Optional[str] = None,
+            ratio_limit: Optional[float] = None,
+            seeding_time_limit: Optional[int] = None,
+    ) -> Optional[Dict[str, bool]]:
+        """
+        修改下载任务属性。
+        :param hash_string: 种子Hash
+        :param downloader: 下载器
+        :param download_limit: 下载限速，单位 KB/s
+        :param upload_limit: 上传限速，单位 KB/s
+        :param tracker_list: Tracker URL列表
+        :param save_path: 保存目录
+        :param category: 分类
+        :param ratio_limit: 分享率限制
+        :param seeding_time_limit: 做种时间限制，单位分钟
+        :return: 各项修改结果
+        """
+        return self.run_module(
+            "update_torrent",
+            hash_string=hash_string,
+            downloader=downloader,
+            download_limit=download_limit,
+            upload_limit=upload_limit,
+            tracker_list=tracker_list,
+            save_path=save_path,
+            category=category,
+            ratio_limit=ratio_limit,
+            seeding_time_limit=seeding_time_limit,
+        )
+
+    def get_torrent_trackers(
+            self,
+            hash_string: str,
+            downloader: Optional[str] = None,
+    ) -> Optional[Dict[str, List[str]]]:
+        """
+        查询下载任务Tracker列表。
+        :param hash_string: 种子Hash
+        :param downloader: 下载器
+        :return: 下载器名称到Tracker列表的映射
+        """
+        return self.run_module(
+            "get_torrent_trackers",
+            hash_string=hash_string,
+            downloader=downloader,
+        )
+
     def torrent_files(
             self, tid: str, downloader: Optional[str] = None
     ) -> Optional[Union[TorrentFilesList, List[File]]]:
@@ -1272,9 +1485,8 @@ class ChainBase(metaclass=ABCMeta):
         if not message:
             logger.warning("消息为空，跳过发送")
             return
-        # 保存消息
-        self.messagehelper.put(message, role="user", title=message.title)
-        self.messageoper.add(**message.model_dump())
+        if message.save_history:
+            self.messageoper.add(**message.model_dump())
         dispatch_message = self._normalize_notification_for_dispatch(message)
         # 发送消息按设置隔离
         if not dispatch_message.userid and dispatch_message.mtype:
@@ -1335,7 +1547,7 @@ class ChainBase(metaclass=ABCMeta):
                     # 按设定发送
                     self.eventmanager.send_event(
                         etype=EventType.NoticeMessage,
-                        data={**send_message.model_dump(), "type": send_message.mtype},
+                        data=self._build_notice_message_data(send_message),
                     )
                     self.messagequeue.send_message(
                         "post_message", message=send_message, **kwargs
@@ -1345,7 +1557,7 @@ class ChainBase(metaclass=ABCMeta):
         # 发送消息事件
         self.eventmanager.send_event(
             etype=EventType.NoticeMessage,
-            data={**dispatch_message.model_dump(), "type": dispatch_message.mtype},
+            data=self._build_notice_message_data(dispatch_message),
         )
         # 按原消息发送
         self.messagequeue.send_message(
@@ -1389,9 +1601,8 @@ class ChainBase(metaclass=ABCMeta):
         if not message:
             logger.warning("消息为空，跳过发送")
             return
-        # 保存消息
-        self.messagehelper.put(message, role="user", title=message.title)
-        await self.messageoper.async_add(**message.model_dump())
+        if message.save_history:
+            await self.messageoper.async_add(**message.model_dump())
         dispatch_message = self._normalize_notification_for_dispatch(message)
         # 发送消息按设置隔离
         if not dispatch_message.userid and dispatch_message.mtype:
@@ -1452,7 +1663,7 @@ class ChainBase(metaclass=ABCMeta):
                     # 按设定发送
                     await self.eventmanager.async_send_event(
                         etype=EventType.NoticeMessage,
-                        data={**send_message.model_dump(), "type": send_message.mtype},
+                        data=self._build_notice_message_data(send_message),
                     )
                     await self.messagequeue.async_send_message(
                         "post_message", message=send_message, **kwargs
@@ -1462,7 +1673,7 @@ class ChainBase(metaclass=ABCMeta):
         # 发送消息事件
         await self.eventmanager.async_send_event(
             etype=EventType.NoticeMessage,
-            data={**dispatch_message.model_dump(), "type": dispatch_message.mtype},
+            data=self._build_notice_message_data(dispatch_message),
         )
         # 按原消息发送
         await self.messagequeue.async_send_message(
@@ -1482,10 +1693,8 @@ class ChainBase(metaclass=ABCMeta):
         :return: 成功或失败
         """
         note_list = [media.to_dict() for media in medias]
-        self.messagehelper.put(
-            message, role="user", note=note_list, title=message.title
-        )
-        self.messageoper.add(**message.model_dump(), note=note_list)
+        if message.save_history:
+            self.messageoper.add(**message.model_dump(), note=note_list)
         dispatch_message = self._normalize_notification_for_dispatch(message)
         return self.messagequeue.send_message(
             "post_medias_message",
@@ -1504,10 +1713,8 @@ class ChainBase(metaclass=ABCMeta):
         :return: 成功或失败
         """
         note_list = [torrent.torrent_info.to_dict() for torrent in torrents]
-        self.messagehelper.put(
-            message, role="user", note=note_list, title=message.title
-        )
-        self.messageoper.add(**message.model_dump(), note=note_list)
+        if message.save_history:
+            self.messageoper.add(**message.model_dump(), note=note_list)
         dispatch_message = self._normalize_notification_for_dispatch(message)
         return self.messagequeue.send_message(
             "post_torrents_message",
@@ -1562,6 +1769,21 @@ class ChainBase(metaclass=ABCMeta):
         :param metadata: 其他消息元数据
         :return: 编辑是否成功
         """
+        if channel == MessageChannel.WebAgent:
+            try:
+                from app.helper.agent import edit_web_agent_message
+
+                return edit_web_agent_message(
+                    user_id=str((metadata or {}).get("userid") or ""),
+                    message_id=message_id,
+                    title=title,
+                    text=text,
+                    buttons=buttons,
+                )
+            except Exception as err:
+                logger.debug(f"编辑 WebAgent 消息失败: {err}")
+                return False
+
         return self.run_module(
             "edit_message",
             channel=channel,

@@ -5,11 +5,11 @@ from pydantic import Field
 from app.workflow.actions import BaseAction
 from app.chain.media import MediaChain
 from app.core.config import settings, global_vars
-from app.core.context import Context
+from app.core.context import Context, TorrentInfo
 from app.core.metainfo import MetaInfo
 from app.helper.rss import RssHelper
 from app.log import logger
-from app.schemas import ActionParams, ActionContext, TorrentInfo
+from app.schemas import ActionParams, ActionContext
 
 
 class FetchRssParams(ActionParams):
@@ -29,6 +29,10 @@ class FetchRssAction(BaseAction):
     """
     获取RSS资源列表
     """
+
+    contract = {
+        "outputs": [{"name": "torrents", "label": "资源", "kind": "list"}],
+    }
 
     def __init__(self, action_id: str):
         super().__init__(action_id)

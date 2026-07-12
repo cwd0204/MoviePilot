@@ -1,19 +1,27 @@
+import asyncio
 import mimetypes
 import shutil
 from typing import Annotated, Any, List, Optional
 
 import aiofiles
 from anyio import Path as AsyncPath
-from fastapi import APIRouter, Depends, Header, HTTPException
+from fastapi import APIRouter, Depends, Header, HTTPException, Security
 from fastapi.concurrency import run_in_threadpool
 from starlette import status
 from starlette.responses import StreamingResponse
 
 from app import schemas
 from app.command import Command
+from app.core.cache import async_fresh
 from app.core.config import settings
+from app.core.event import eventmanager
 from app.core.plugin import PluginManager
-from app.core.security import verify_apikey, verify_token
+from app.core.security import (
+    resource_token_cookie,
+    verify_apikey,
+    verify_resource_token,
+    verify_token,
+)
 from app.db.models import User
 from app.db.systemconfig_oper import SystemConfigOper
 from app.db.user_oper import (
@@ -21,15 +29,78 @@ from app.db.user_oper import (
     get_current_active_superuser_async,
 )
 from app.factory import app
+from app.helper.server import MoviePilotServerHelper
 from app.helper.plugin import PluginHelper
 from app.log import logger
 from app.scheduler import Scheduler
-from app.schemas.types import SystemConfigKey
+from app.schemas.event import PluginDataResetEventData
+from app.schemas.types import ChainEventType, SystemConfigKey
 
 PROTECTED_ROUTES = {"/api/v1/openapi.json", "/docs", "/docs/oauth2-redirect", "/redoc"}
 PLUGIN_PREFIX = f"{settings.API_V1_STR}/plugin"
 
 router = APIRouter()
+_plugin_release_refresh_tasks: set[asyncio.Task] = set()
+
+
+async def _get_market_plugin_from_repo(
+    plugin_manager: PluginManager,
+    plugin_id: str,
+    repo_url: str,
+    force: bool,
+) -> Optional[schemas.Plugin]:
+    """
+    只读取指定插件仓库的市场元数据，避免单插件详情触发全部市场刷新。
+    """
+    market_plugins = await plugin_manager.async_get_plugins_from_market(
+        repo_url, settings.VERSION_FLAG, force
+    )
+    market_plugin = next(
+        (
+            plugin
+            for plugin in market_plugins or []
+            if plugin.id == plugin_id
+        ),
+        None,
+    )
+    if market_plugin or not settings.VERSION_FLAG:
+        return market_plugin
+
+    compatible_plugins = await plugin_manager.async_get_plugins_from_market(
+        repo_url, None, force
+    )
+    return next(
+        (
+            plugin
+            for plugin in compatible_plugins or []
+            if plugin.id == plugin_id
+        ),
+        None,
+    )
+
+
+async def _refresh_plugin_release_versions(plugin_id: str, repo_url: str) -> None:
+    """
+    后台强制刷新 Release 缓存，接口响应路径优先返回已有缓存。
+    """
+    try:
+        async with async_fresh(True):
+            await PluginHelper().async_get_plugin_release_versions(plugin_id, repo_url)
+    except Exception as e:
+        logger.warning(f"后台刷新插件 {plugin_id} Release 列表失败：{e}")
+
+
+def _schedule_plugin_release_refresh(plugin_id: str, repo_url: str) -> None:
+    """
+    保留后台任务引用，避免任务被回收，同时让 helper 负责同仓库强刷合并。
+    """
+    task = asyncio.create_task(_refresh_plugin_release_versions(plugin_id, repo_url))
+    _plugin_release_refresh_tasks.add(task)
+
+    def _discard_task(completed_task: asyncio.Task) -> None:
+        _plugin_release_refresh_tasks.discard(completed_task)
+
+    task.add_done_callback(_discard_task)
 
 
 def register_plugin_api(plugin_id: Optional[str] = None):
@@ -145,6 +216,114 @@ def register_plugin(plugin_id: str):
     register_plugin_api(plugin_id)
 
 
+def _merge_plugin_market_metadata(
+    plugin: schemas.Plugin, market_plugin: schemas.Plugin
+) -> schemas.Plugin:
+    """
+    合并插件市场中的远端元数据，供已安装插件按需展示更新说明。
+    """
+    plugin.repo_url = market_plugin.repo_url or plugin.repo_url
+    plugin.history = market_plugin.history or {}
+    plugin.release = market_plugin.release
+    plugin.has_update = market_plugin.has_update
+    plugin.system_version = market_plugin.system_version or plugin.system_version
+    plugin.system_version_compatible = market_plugin.system_version_compatible
+    plugin.system_version_message = (
+        market_plugin.system_version_message or plugin.system_version_message
+    )
+    return plugin
+
+
+def _is_plugin_auth_remote_file(plugin_id: str, filepath: str) -> bool:
+    """
+    判断静态文件是否属于插件声明的匿名登录认证远程组件。
+
+    登录页加载插件认证组件时尚未产生登录态和资源 Cookie，因此仅对插件主动
+    声明的认证 remote 保留匿名读取能力，其余插件静态资源仍需资源令牌。
+    """
+    path = filepath.lstrip("/")
+    normalized_plugin_id = plugin_id.lower()
+    plugin_manager = PluginManager()
+    for provider in plugin_manager.get_plugin_auth_providers():
+        remote = provider.get("remote") or {}
+        if str(remote.get("id") or "").lower() != normalized_plugin_id:
+            continue
+        remote_path = str(remote.get("url") or "").lstrip("/")
+        remote_path_lower = remote_path.lower()
+        expected_prefix = f"plugin/file/{normalized_plugin_id}/"
+        if not remote_path_lower.startswith(expected_prefix):
+            continue
+        remote_file = remote_path[len(expected_prefix):]
+        remote_dir = remote_file.rsplit("/", 1)[0] if "/" in remote_file else ""
+        if path == remote_file or (remote_dir and path.startswith(f"{remote_dir}/")):
+            return True
+    return False
+
+
+def _verify_plugin_static_file_access(
+    plugin_id: str,
+    filepath: str,
+    resource_token: Annotated[Optional[str], Security(resource_token_cookie)] = None,
+) -> None:
+    """
+    校验插件静态文件访问权限。
+
+    普通插件资源依赖登录后写入的资源 Cookie；登录认证插件的远程组件需要在
+    登录前加载，因此仅对插件声明的认证 remote 放行匿名读取。
+    """
+    if _is_plugin_auth_remote_file(plugin_id, filepath):
+        return
+    verify_resource_token(resource_token)
+
+
+async def _get_plugin_history_detail(
+    plugin_id: str, force: bool = True
+) -> Optional[schemas.Plugin]:
+    """
+    按需获取插件远端元数据，避免插件列表加载时批量访问网络。
+    """
+    plugin_manager = PluginManager()
+    installed_plugin = next(
+        (
+            plugin
+            for plugin in plugin_manager.get_local_plugins()
+            if plugin.id == plugin_id and plugin.installed
+        ),
+        None,
+    )
+    if not installed_plugin:
+        return None
+
+    local_repo_plugin = next(
+        (plugin for plugin in plugin_manager.get_local_repo_plugins() if plugin.id == plugin_id),
+        None,
+    )
+    if local_repo_plugin:
+        return _merge_plugin_market_metadata(installed_plugin, local_repo_plugin)
+
+    if installed_plugin.repo_url:
+        market_plugin = await _get_market_plugin_from_repo(
+            plugin_manager, plugin_id, installed_plugin.repo_url, force
+        )
+        if not market_plugin:
+            logger.debug(f"插件 {plugin_id} 未从来源仓库获取到更新说明，返回本地插件信息")
+            return installed_plugin
+        return _merge_plugin_market_metadata(installed_plugin, market_plugin)
+
+    market_plugin = next(
+        (
+            plugin
+            for plugin in await plugin_manager.async_get_online_plugins(force=force)
+            if plugin.id == plugin_id
+        ),
+        None,
+    )
+    if not market_plugin:
+        return installed_plugin
+
+    return _merge_plugin_market_metadata(installed_plugin, market_plugin)
+
+
 @router.get("/", summary="所有插件", response_model=List[schemas.Plugin])
 async def all_plugins(
     _: User = Depends(get_current_active_superuser_async),
@@ -212,12 +391,89 @@ async def installed(_: User = Depends(get_current_active_superuser_async)) -> An
     return SystemConfigOper().get(SystemConfigKey.UserInstalledPlugins) or []
 
 
+@router.get("/history/{plugin_id}", summary="获取插件更新说明", response_model=schemas.Plugin)
+async def plugin_history(
+    plugin_id: str,
+    _: User = Depends(get_current_active_superuser_async),
+    force: bool = True,
+) -> schemas.Plugin:
+    """
+    按需获取指定插件的更新说明。
+    """
+    plugin = await _get_plugin_history_detail(plugin_id=plugin_id, force=force)
+    if not plugin:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"插件 {plugin_id} 不存在或未安装",
+        )
+    return plugin
+
+
+@router.get("/releases/{plugin_id}", summary="获取插件Release版本", response_model=dict)
+async def plugin_releases(
+    plugin_id: str,
+    _: User = Depends(get_current_active_superuser_async),
+    repo_url: Optional[str] = "",
+    force: bool = False,
+) -> dict:
+    """
+    查询指定插件可直接安装的 GitHub Release 版本。
+
+    市场元数据只读取请求仓库的当前 package，避免版本历史请求触发全部市场缓存读取。
+    """
+    if not repo_url:
+        return {
+            "release_supported": False,
+            "latest_version": None,
+            "current_version": None,
+            "items": [],
+        }
+
+    plugin_manager = PluginManager()
+    market_plugin = await _get_market_plugin_from_repo(
+        plugin_manager, plugin_id, repo_url, force
+    )
+    latest_version = market_plugin.plugin_version if market_plugin else None
+    current_version = plugin_manager.get_local_plugin_version(plugin_id)
+    if not getattr(market_plugin, "release", False):
+        return {
+            "release_supported": False,
+            "latest_version": latest_version,
+            "current_version": current_version,
+            "items": [],
+        }
+
+    plugin_helper = PluginHelper()
+    has_release_cache = (
+        await plugin_helper.async_has_plugin_release_cache(repo_url)
+        if force
+        else False
+    )
+    release_items = await plugin_helper.async_get_plugin_release_versions(plugin_id, repo_url)
+    if force and has_release_cache:
+        _schedule_plugin_release_refresh(plugin_id, repo_url)
+    items = []
+    for item in release_items:
+        version = item.get("version")
+        copied_item = item.copy()
+        copied_item["is_latest"] = bool(latest_version and version == latest_version)
+        copied_item["is_current"] = bool(current_version and version == current_version)
+        items.append(copied_item)
+
+    return {
+        "release_supported": bool(items),
+        "latest_version": latest_version,
+        "current_version": current_version,
+        "items": items,
+    }
+
+
 @router.get("/statistic", summary="插件安装统计", response_model=dict)
 async def statistic(_: schemas.TokenPayload = Depends(verify_token)) -> Any:
     """
     插件安装统计
     """
-    return await PluginHelper().async_get_statistic()
+    return await MoviePilotServerHelper.async_get_plugin_statistic()
 
 
 @router.get(
@@ -240,6 +496,7 @@ def reload_plugin(
 async def install(
     plugin_id: str,
     repo_url: Optional[str] = "",
+    release_version: Optional[str] = None,
     force: Optional[bool] = False,
     _: User = Depends(get_current_active_superuser_async),
 ) -> Any:
@@ -251,16 +508,23 @@ async def install(
     # 首先检查插件是否已经存在，并且是否强制安装，否则只进行安装统计
     plugin_helper = PluginHelper()
     if not force and plugin_id in PluginManager().get_plugin_ids():
-        await plugin_helper.async_install_reg(pid=plugin_id, repo_url=repo_url)
+        if repo_url:
+            compatible_message = await plugin_helper.async_get_plugin_system_version_check_message(
+                plugin_id, repo_url
+            )
+            if compatible_message:
+                return schemas.Response(success=False, message=compatible_message)
+        await MoviePilotServerHelper.async_install_plugin_reg(plugin_id=plugin_id, repo_url=repo_url)
     else:
         # 插件不存在或需要强制安装，下载安装并注册插件
         if repo_url:
             state, msg = await plugin_helper.async_install(
-                pid=plugin_id, repo_url=repo_url, force_install=force
+                pid=plugin_id, repo_url=repo_url, release_version=release_version, force_install=force
             )
             # 安装失败则直接响应
             if not state:
                 return schemas.Response(success=False, message=msg)
+            await MoviePilotServerHelper.async_install_plugin_reg(plugin_id=plugin_id, repo_url=repo_url)
         else:
             # repo_url 为空时，也直接响应
             return schemas.Response(
@@ -319,10 +583,13 @@ def plugin_form(
     render_mode, _ = plugin_instance.get_render_mode()
     try:
         conf, model = plugin_instance.get_form()
+        stored_config = plugin_manager.get_plugin_config(plugin_id)
+        # Merge stored config with defaults so all keys exist for v-show evaluation
+        merged_model = {**model, **(stored_config or {})}
         return {
             "render_mode": render_mode,
             "conf": conf,
-            "model": plugin_manager.get_plugin_config(plugin_id) or model,
+            "model": merged_model,
         }
     except Exception as e:
         logger.error(f"插件 {plugin_id} 调用方法 get_form 出错: {str(e)}")
@@ -355,7 +622,7 @@ def plugin_page(
 
 @router.get("/dashboard/meta", summary="获取所有插件仪表板元信息")
 def plugin_dashboard_meta(
-    _: schemas.TokenPayload = Depends(verify_token),
+    _: User = Depends(get_current_active_superuser),
 ) -> List[dict]:
     """
     获取所有插件仪表板元信息
@@ -368,7 +635,7 @@ def plugin_dashboard_by_key(
     plugin_id: str,
     key: str,
     user_agent: Annotated[str | None, Header()] = None,
-    _: schemas.TokenPayload = Depends(verify_token),
+    _: User = Depends(get_current_active_superuser),
 ) -> Optional[schemas.PluginDashboard]:
     """
     根据插件ID获取插件仪表板
@@ -380,8 +647,8 @@ def plugin_dashboard_by_key(
 def plugin_dashboard(
     plugin_id: str,
     user_agent: Annotated[str | None, Header()] = None,
-    _: schemas.TokenPayload = Depends(verify_token),
-) -> schemas.PluginDashboard:
+    _: User = Depends(get_current_active_superuser),
+) -> Optional[schemas.PluginDashboard]:
     """
     根据插件ID获取插件仪表板
     """
@@ -398,17 +665,27 @@ def reset_plugin(
     根据插件ID重置插件配置及数据
     """
     plugin_manager = PluginManager()
+    eventmanager.send_event(
+        ChainEventType.PluginDataReset,
+        PluginDataResetEventData(plugin_id=plugin_id, reset_config=True, reset_data=True),
+    )
+    # 事件处理器需要运行中插件完成补偿；补偿后先停止插件，避免删除数据时仍有任务读写旧状态。
+    plugin_manager.stop(plugin_id)
     # 删除配置
-    plugin_manager.delete_plugin_config(plugin_id)
+    plugin_manager.delete_plugin_config(plugin_id, force=True)
     # 删除插件所有数据
-    plugin_manager.delete_plugin_data(plugin_id)
+    plugin_manager.delete_plugin_data(plugin_id, force=True)
     # 重新加载插件
     reload_plugin(plugin_id)
     return schemas.Response(success=True)
 
 
 @router.get("/file/{plugin_id}/{filepath:path}", summary="获取插件静态文件")
-async def plugin_static_file(plugin_id: str, filepath: str):
+async def plugin_static_file(
+    plugin_id: str,
+    filepath: str,
+    _: None = Depends(_verify_plugin_static_file_access),
+) -> StreamingResponse:
     """
     获取插件静态文件
     """

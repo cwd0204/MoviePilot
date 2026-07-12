@@ -64,6 +64,68 @@ class ChainEventData(BaseEventData):
     pass
 
 
+class PluginDataResetEventData(ChainEventData):
+    """
+    PluginDataReset 事件的数据模型。
+
+    在主程序清空某个插件配置或插件数据前发出，插件可在数据被删除前完成
+    自有状态补偿。事件处理器只应处理 plugin_id 与自身匹配的事件。
+    """
+
+    plugin_id: str = Field(..., description="即将被重置的插件 ID")
+    reset_config: bool = Field(default=False, description="是否即将重置插件配置")
+    reset_data: bool = Field(default=False, description="是否即将重置插件数据")
+
+
+class AgentLLMProviderEventData(ChainEventData):
+    """
+    Agent LLM 供应商选择事件数据。
+
+    事件发出方会带入当前系统配置作为默认值；插件可覆盖 provider、base_url、
+    api_key、model、user_agent、use_proxy 等字段，并通过 selected_provider_id 标记本次选择，方便
+    后续用量事件精确回写到同一个配额条目。
+    """
+
+    provider: Optional[str] = Field(default=None, description="LLM provider ID")
+    base_url: Optional[str] = Field(default=None, description="API Base URL")
+    api_key: Optional[str] = Field(default=None, description="API Key")
+    model: Optional[str] = Field(default=None, description="模型名称")
+    base_url_preset: Optional[str] = Field(default=None, description="Base URL 预设ID")
+    user_agent: Optional[str] = Field(default=None, description="OpenAI兼容接口User-Agent")
+    use_proxy: Optional[bool] = Field(default=None, description="是否使用系统代理")
+    thinking_level: Optional[str] = Field(default=None, description="思考模式级别")
+    selected_provider_id: Optional[str] = Field(default=None, description="插件侧供应商ID")
+    selected_provider_name: Optional[str] = Field(default=None, description="插件侧供应商名称")
+    source: Optional[str] = Field(default=None, description="选择来源")
+    metadata: Dict[str, Any] = Field(default_factory=dict, description="扩展元数据")
+
+
+class AgentTokensUsageEventData(BaseEventData):
+    """
+    Agent Tokens 用量广播事件数据。
+
+    用量事件不携带 API Key，只携带选择事件返回的 selected_provider_id 以及
+    聚合后的 token 统计，避免把密钥扩散给广播订阅者。
+    """
+
+    session_id: str = Field(..., description="Agent 会话ID")
+    selected_provider_id: Optional[str] = Field(default=None, description="插件侧供应商ID")
+    selected_provider_name: Optional[str] = Field(default=None, description="插件侧供应商名称")
+    provider: Optional[str] = Field(default=None, description="实际 LLM provider ID")
+    base_url: Optional[str] = Field(default=None, description="API Base URL")
+    model: Optional[str] = Field(default=None, description="模型名称")
+    input_tokens: int = Field(default=0, description="输入 tokens")
+    output_tokens: int = Field(default=0, description="输出 tokens")
+    total_tokens: int = Field(default=0, description="总 tokens")
+    model_call_count: int = Field(default=0, description="模型调用次数")
+    success: bool = Field(default=False, description="Agent 执行是否成功")
+    error: Optional[str] = Field(default=None, description="失败原因")
+    started_at: Optional[str] = Field(default=None, description="开始时间")
+    finished_at: Optional[str] = Field(default=None, description="结束时间")
+    source: str = Field(default="agent", description="事件来源")
+    metadata: Dict[str, Any] = Field(default_factory=dict, description="扩展元数据")
+
+
 class AuthCredentials(ChainEventData):
     """
     AuthVerification 事件的数据模型
@@ -183,6 +245,44 @@ class CommandRegisterEventData(ChainEventData):
     source: str = Field(default="未知拦截源", description="拦截源")
 
 
+class TransferRenameBuildEventData(ChainEventData):
+    """
+    TransferRenameBuild 事件的数据模型
+
+    在 ``transhandler.get_rename_path`` 渲染文件名之前发出，给插件一次往
+    ``rename_dict`` 写字段的机会。典型用法是通过 ffprobe 或外部接口探测源文件，
+    把分辨率、视频/音频编码、HDR 等字段写入 ``rename_dict``，主程序下一步渲染时
+    就能直接用到这些字段，不需要插件事后再渲染一次去覆盖结果。
+
+    与 ``TransferRenameEventData`` 的分工：
+    - 本事件负责"往 ``rename_dict`` 里写字段"，没有输出参数；
+    - ``TransferRename`` 在渲染之后触发，负责对已渲染好的字符串再做改写（大小写、
+      词替换、模板覆盖等），由智能重命名一类插件使用。
+
+    使用约定：
+    - 只往 ``rename_dict`` 写字段，不要在这里改写已经渲染好的字符串；
+    - ``source_path`` / ``source_item`` 为空时（如重命名预览场景），需要源文件
+      才能工作的插件请直接 return；
+    - ``rename_dict`` 中以双下划线开头的键（``__meta__`` / ``__mediainfo__`` 等）
+      存放的是原始对象引用，只读使用，不要修改这些对象本身。
+
+    Attributes:
+        template_string (str): Jinja2 模板字符串
+        rename_dict (Dict[str, Any]): 渲染上下文，可直接修改
+        source_path (Optional[str]): 源文件路径，即待整理的文件路径
+        source_item (Optional[FileItem]): 源文件信息，即待整理的文件信息
+    """
+
+    template_string: str = Field(..., description="模板字符串")
+    rename_dict: Dict[str, Any] = Field(..., description="渲染上下文")
+    source_path: Optional[str] = Field(
+        None, description="源文件路径，即待整理的文件路径"
+    )
+    source_item: Optional[FileItem] = Field(
+        None, description="源文件信息，即待整理的文件信息"
+    )
+
+
 class TransferRenameEventData(ChainEventData):
     """
     TransferRename 事件的数据模型
@@ -288,6 +388,7 @@ class TransferInterceptEventData(ChainEventData):
     Attributes:
         # 输入参数
         fileitem (FileItem): 源文件
+        meta (Any): 元数据
         target_storage (str): 目标存储
         target_path (Path): 目标路径
         transfer_type (str): 整理方式（copy、move、link、softlink等）
@@ -301,6 +402,7 @@ class TransferInterceptEventData(ChainEventData):
 
     # 输入参数
     fileitem: FileItem = Field(..., description="源文件")
+    meta: Optional[Any] = Field(default=None, description="元数据")
     mediainfo: Any = Field(..., description="媒体信息")
     target_storage: str = Field(..., description="目标存储")
     target_path: Path = Field(..., description="目标路径")
@@ -462,3 +564,114 @@ class StorageOperSelectionEventData(ChainEventData):
 
     # 输出参数
     storage_oper: Optional[Callable] = Field(default=None, description="存储操作对象")
+
+
+class SubscribeEpisodesRefreshEventData(ChainEventData):
+    """
+    SubscribeEpisodesRefresh 事件的数据模型
+
+    主程序在推算订阅某季总集数时发出，携带主程序本次识别到的 TMDB 当前季总集数；
+    外部可据自身策略向上覆盖 total_episode（如待定集数），低于 current_total_episode 的覆盖值会被主程序钳制。
+
+    Attributes:
+        # 输入参数
+        tmdbid (Optional[int]): TMDB ID
+        doubanid (Optional[str]): 豆瓣 ID
+        season (Optional[int]): 季号
+        mediainfo (Any): 媒体信息
+        current_total_episode (int): 主程序本次识别到的 TMDB 当前季总集数
+        subscribe_id (Optional[int]): 订阅 ID；订阅创建场景下尚未入库，为空
+        scene (Optional[str]): 触发场景，create/refresh/precheck
+
+        # 输出参数
+        updated (bool): 外部是否覆盖了总集数，默认 False
+        total_episode (Optional[int]): 覆盖后的总集数，仅在 updated=True 时生效；低于 current_total_episode 时由主程序钳制
+        source (str): 覆盖来源
+        reason (str): 覆盖原因
+    """
+
+    # 输入参数
+    tmdbid: Optional[int] = Field(default=None, description="TMDB ID")
+    doubanid: Optional[str] = Field(default=None, description="豆瓣 ID")
+    season: Optional[int] = Field(default=None, description="季号")
+    mediainfo: Any = Field(default=None, description="媒体信息")
+    current_total_episode: int = Field(default=0, description="主程序本次识别到的 TMDB 当前季总集数")
+    subscribe_id: Optional[int] = Field(default=None, description="订阅 ID；创建场景为空")
+    scene: Optional[str] = Field(default=None, description="触发场景：create/refresh/precheck")
+
+    # 输出参数
+    updated: bool = Field(default=False, description="外部是否覆盖了总集数")
+    total_episode: Optional[int] = Field(default=None, description="覆盖后的总集数；低于主程序本次识别到的 TMDB 当前季总集数时由主程序钳制")
+    source: str = Field(default="未知来源", description="覆盖来源")
+    reason: str = Field(default="", description="覆盖原因")
+
+
+class SubscribeModifiedEventData(BaseEventData):
+    """
+    SubscribeModified 广播事件数据。
+
+    主程序在订阅字段被普通更新、状态入口、重置或 Agent 更新后发出。payload
+    继续保持 dict 形态，scene 用于表达操作场景，fields 表达最终快照里的真实字段差异。
+    """
+
+    subscribe_id: int = Field(description="订阅 ID")
+    old_subscribe_info: Dict[str, Any] = Field(default_factory=dict, description="更新前订阅快照")
+    subscribe_info: Dict[str, Any] = Field(default_factory=dict, description="更新后订阅快照")
+    scene: str = Field(default="update", description="触发场景：update/status/reset/agent_update")
+    fields: List[str] = Field(default_factory=list, description="真实变更字段")
+
+    @model_validator(mode="after")
+    def compute_fields(self):
+        self.fields = self._diff_fields(self.old_subscribe_info, self.subscribe_info)
+        return self
+
+    @staticmethod
+    def _diff_fields(old_info: Dict[str, Any], new_info: Dict[str, Any]) -> List[str]:
+        """
+        按 old/new 快照并集计算真实字段差异；缺失 key 按 None 参与比较。
+        """
+        old_info = old_info or {}
+        new_info = new_info or {}
+        keys = set(old_info) | set(new_info)
+        return sorted(key for key in keys if old_info.get(key) != new_info.get(key))
+
+    def to_dict(self) -> Dict[str, Any]:
+        """
+        输出公开事件 payload，避免内部属性被未来扩展意外暴露。
+        """
+        return {
+            "subscribe_id": self.subscribe_id,
+            "old_subscribe_info": self.old_subscribe_info,
+            "subscribe_info": self.subscribe_info,
+            "scene": self.scene,
+            "fields": list(self.fields),
+        }
+
+
+class SubscribeCompletionCheckEventData(ChainEventData):
+    """
+    SubscribeCompletionCheck 事件的数据模型
+
+    在订阅被自动判定完成、即将收口（写历史并删除）之前发出，允许外部据完结策略否决本次完成
+
+    Attributes:
+        # 输入参数
+        subscribe (Any): 订阅对象
+        mediainfo (Any): 媒体信息
+        meta (Any): 元数据
+
+        # 输出参数
+        cancel (bool): 是否否决本次完成，默认 False
+        source (str): 否决来源
+        reason (str): 否决原因
+    """
+
+    # 输入参数
+    subscribe: Any = Field(default=None, description="订阅对象")
+    mediainfo: Any = Field(default=None, description="媒体信息")
+    meta: Any = Field(default=None, description="元数据")
+
+    # 输出参数
+    cancel: bool = Field(default=False, description="是否否决本次完成")
+    source: str = Field(default="未知来源", description="否决来源")
+    reason: str = Field(default="", description="否决原因")

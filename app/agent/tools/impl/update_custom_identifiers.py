@@ -6,6 +6,8 @@ from typing import List, Optional, Type
 from pydantic import BaseModel, Field
 
 from app.agent.tools.base import MoviePilotTool
+from app.agent.tools.tags import ToolTag
+from app.core.metainfo import clear_rust_parse_options_cache
 from app.db.systemconfig_oper import SystemConfigOper
 from app.log import logger
 from app.schemas.types import SystemConfigKey
@@ -14,10 +16,6 @@ from app.schemas.types import SystemConfigKey
 class UpdateCustomIdentifiersInput(BaseModel):
     """更新自定义识别词工具的输入参数模型"""
 
-    explanation: str = Field(
-        ...,
-        description="Clear explanation of why this tool is being used in the current context",
-    )
     identifiers: List[str] = Field(
         ...,
         description=(
@@ -35,6 +33,11 @@ class UpdateCustomIdentifiersInput(BaseModel):
 
 class UpdateCustomIdentifiersTool(MoviePilotTool):
     name: str = "update_custom_identifiers"
+    tags: list[str] = [
+        ToolTag.Write,
+        ToolTag.FilterRule,
+        ToolTag.Admin,
+    ]
     description: str = (
         "Update the full list of custom identifiers (自定义识别词) used for preprocessing torrent/file names. "
         "This tool REPLACES all existing identifier rules with the provided list. "
@@ -50,7 +53,8 @@ class UpdateCustomIdentifiersTool(MoviePilotTool):
         "3) Episode offset: '前定位词 <> 后定位词 >> EP±N'; "
         "4) Combined: '被替换词 => 替换词 && 前定位词 <> 后定位词 >> EP±N'; "
         "Lines starting with '#' are comments. "
-        "The replacement target supports: {[tmdbid=xxx;type=movie/tv;s=xxx;e=xxx]} for direct TMDB ID matching."
+        "The replacement target supports: {[tmdbid=xxx;type=movie/tv;g=xxx;s=xxx;e=xxx]} "
+        "for direct TMDB ID matching; g is an optional TMDB episode group ID for TV recognition."
     )
     require_admin: bool = True
     args_schema: Type[BaseModel] = UpdateCustomIdentifiersInput
@@ -82,6 +86,7 @@ class UpdateCustomIdentifiersTool(MoviePilotTool):
                 SystemConfigKey.CustomIdentifiers, value
             )
             if success:
+                clear_rust_parse_options_cache()
                 return json.dumps(
                     {
                         "success": True,

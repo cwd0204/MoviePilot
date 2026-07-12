@@ -9,10 +9,10 @@ import sys
 import threading
 from asyncio import AbstractEventLoop
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple, Type
+from typing import Any, Dict, List, Optional, Tuple, Type, Union, get_origin, get_args
 from urllib.parse import quote, urlencode, urlparse
 
-from dotenv import set_key
+from dotenv import set_key, unset_key
 from pydantic import BaseModel, Field, ConfigDict, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -74,6 +74,8 @@ class ConfigModel(BaseModel):
     NGINX_PORT: int = 3000
     # 配置文件目录
     CONFIG_DIR: Optional[str] = None
+    # 安全模式，仅保留核心 API，跳过插件、调度器、监控、命令和工作流等扩展启动项
+    MOVIEPILOT_SAFE_MODE: bool = False
     # 是否调试模式
     DEBUG: bool = False
     # 是否开发模式
@@ -158,12 +160,20 @@ class ConfigModel(BaseModel):
     CACHE_BACKEND_URL: Optional[str] = "redis://localhost:6379"
     # Redis 缓存最大内存限制，未配置时，如开启大内存模式时为 "1024mb"，未开启时为 "256mb"
     CACHE_REDIS_MAXMEMORY: Optional[str] = None
+    # Redis 连接池最大连接数
+    CACHE_REDIS_MAX_CONNECTIONS: int = 256
+    # Redis 连接池耗尽时等待可用连接的时间（秒）
+    CACHE_REDIS_POOL_TIMEOUT: int = 3
     # 全局图片缓存，将媒体图片缓存到本地
     GLOBAL_IMAGE_CACHE: bool = False
     # 全局图片缓存保留天数
     GLOBAL_IMAGE_CACHE_DAYS: int = 7
     # 临时文件保留天数
     TEMP_FILE_DAYS: int = 3
+    # pip/uv 包下载缓存保留天数
+    PACKAGE_CACHE_DAYS: int = 90
+    # pip/uv 包下载缓存根目录，留空时使用配置目录下的 .cache
+    PACKAGE_CACHE_ROOT: Optional[str] = None
     # 元数据识别缓存过期时间（小时），0为自动
     META_CACHE_EXPIRE: int = 0
 
@@ -331,8 +341,12 @@ class ConfigModel(BaseModel):
     NO_CACHE_SITE_KEY: str = "m-team"
     # OCR服务器地址，用于识别站点验证码
     OCR_HOST: str = "https://movie-pilot.org"
-    # 仿真类型：playwright 或 flaresolverr
-    BROWSER_EMULATION: str = "playwright"
+    # 仿真类型：cloakbrowser 或 flaresolverr，其他值按 cloakbrowser 处理
+    BROWSER_EMULATION: str = "cloakbrowser"
+    # CloakBrowser 是否启用拟人化输入
+    CLOAKBROWSER_HUMANIZE: bool = True
+    # CloakBrowser 拟人化输入预设：default 或 careful
+    CLOAKBROWSER_HUMAN_PRESET: str = "default"
     # FlareSolverr 服务地址，例如 http://127.0.0.1:8191
     FLARESOLVERR_URL: Optional[str] = None
 
@@ -341,6 +355,8 @@ class ConfigModel(BaseModel):
     SEARCH_MULTIPLE_NAME: bool = False
     # 最大搜索名称数量
     MAX_SEARCH_NAME_LIMIT: int = 3
+    # 搜索资源获取页数
+    SEARCH_RESOURCE_PAGES: int = 1
 
     # ==================== 下载配置 ====================
     # 种子标签
@@ -361,6 +377,8 @@ class ConfigModel(BaseModel):
     COOKIECLOUD_KEY: Optional[str] = None
     # CookieCloud端对端加密密码
     COOKIECLOUD_PASSWORD: Optional[str] = None
+    # CookieCloud本地上传接口的X-CookieCloud-Auth期望值，留空表示不校验
+    COOKIECLOUD_AUTH_HEADER: Optional[str] = None
     # CookieCloud同步间隔（分钟）
     COOKIECLOUD_INTERVAL: Optional[int] = 60 * 24
     # CookieCloud同步黑名单，多个域名,分割
@@ -431,6 +449,8 @@ class ConfigModel(BaseModel):
     )
     # 插件安装数据共享
     PLUGIN_STATISTIC_SHARE: bool = True
+    # 安装版本统计上报
+    USAGE_STATISTIC_SHARE: bool = True
     # 是否开启插件热加载
     PLUGIN_AUTO_RELOAD: bool = False
     # 本地插件仓库目录，多个地址使用,分隔
@@ -474,6 +494,8 @@ class ConfigModel(BaseModel):
     # ==================== 性能配置 ====================
     # 大内存模式
     BIG_MEMORY_MODE: bool = False
+    # Rust 加速总开关，关闭时所有 Rust 快路径回退到 Python 实现
+    RUST_ACCEL: bool = True
     # 是否启用编码探测的性能模式
     ENCODING_DETECTION_PERFORMANCE_MODE: bool = True
     # 编码探测的最低置信度阈值
@@ -486,6 +508,7 @@ class ConfigModel(BaseModel):
     SECURITY_IMAGE_DOMAINS: list = Field(
         default=[
             "image.tmdb.org",
+            "images.tmdb.org",
             "static-mdb.v.geilijiasu.com",
             "bing.com",
             "doubanio.com",
@@ -501,6 +524,8 @@ class ConfigModel(BaseModel):
             "qpic.cn",
         ]
     )
+    # 图片代理允许访问的非公网 IP/CIDR，默认不放行任何非公网解析结果
+    IMAGE_PROXY_ALLOWED_PRIVATE_RANGES: list = Field(default=[])
     # 允许的图片文件后缀格式
     SECURITY_IMAGE_SUFFIXES: list = Field(
         default=[".jpg", ".jpeg", ".png", ".webp", ".gif", ".svg", ".avif"]
@@ -525,7 +550,7 @@ class ConfigModel(BaseModel):
     # ==================== Docker配置 ====================
     # Docker Client API地址
     DOCKER_CLIENT_API: Optional[str] = "tcp://127.0.0.1:38379"
-    # Playwright浏览器类型，chromium/firefox
+    # Playwright浏览器类型，供智能体浏览器工具和插件直接使用 Playwright 时读取
     PLAYWRIGHT_BROWSER_TYPE: str = "chromium"
 
     # ==================== AI智能体配置 ====================
@@ -533,6 +558,8 @@ class ConfigModel(BaseModel):
     AI_AGENT_ENABLE: bool = False
     # 合局AI智能体
     AI_AGENT_GLOBAL: bool = False
+    # 是否隐藏前端全局智能体入口
+    AI_AGENT_HIDE_ENTRY: bool = False
     # LLM提供商（支持内置 provider，以及从 models.dev 动态补充的平台）
     LLM_PROVIDER: str = "deepseek"
     # LLM模型名称
@@ -549,36 +576,28 @@ class ConfigModel(BaseModel):
     LLM_API_KEY: Optional[str] = None
     # LLM基础URL（用于自定义API端点）
     LLM_BASE_URL: Optional[str] = "https://api.deepseek.com"
+    # LLM调用是否使用系统代理
+    LLM_USE_PROXY: bool = True
     # LLM Base URL 预设标识，用于区分同一 Base URL 下的不同模型目录
     LLM_BASE_URL_PRESET: Optional[str] = None
     # LLM最大上下文Token数量（K）
-    LLM_MAX_CONTEXT_TOKENS: int = 64
+    LLM_MAX_CONTEXT_TOKENS: int = 128
+    # LLM OpenAI兼容接口请求User-Agent
+    LLM_USER_AGENT: Optional[str] = None
     # LLM温度参数
     LLM_TEMPERATURE: float = 0.3
     # LLM最大迭代次数
-    LLM_MAX_ITERATIONS: int = 128
+    LLM_MAX_ITERATIONS: int = 512
     # LLM工具调用超时时间（秒）
     LLM_TOOL_TIMEOUT: int = 300
     # 是否启用详细日志
     LLM_VERBOSE: bool = False
-    # 最大记忆消息数量
-    LLM_MAX_MEMORY_MESSAGES: int = 30
     # 内存记忆保留天数
     LLM_MEMORY_RETENTION_DAYS: int = 1
-    # Redis记忆保留天数（如果使用Redis）
-    LLM_REDIS_MEMORY_RETENTION_DAYS: int = 7
     # 是否启用AI推荐
     AI_RECOMMEND_ENABLED: bool = False
     # AI推荐用户偏好
     AI_RECOMMEND_USER_PREFERENCE: str = ""
-    # Tavily API密钥（用于网络搜索）
-    TAVILY_API_KEY: List[str] = [
-        "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",
-        "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",
-        "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",
-    ]
-    # Exa API密钥（用于网络搜索）
-    EXA_API_KEY: str = "161ce010-fb56-419c-9ea8-4fb459b96298"
 
     # AI推荐条目数量限制
     AI_RECOMMEND_MAX_ITEMS: int = 50
@@ -591,7 +610,7 @@ class ConfigModel(BaseModel):
     # AI智能体自动重试整理失败记录开关
     AI_AGENT_RETRY_TRANSFER: bool = False
 
-    # 音频输入提供商：openai/openai_chat_audio/mimo
+    # 音频输入提供商：openai/openai_chat_audio/mimo/minimax
     AUDIO_INPUT_PROVIDER: str = "openai"
     # 音频输入 API 密钥
     AUDIO_INPUT_API_KEY: Optional[str] = None
@@ -601,7 +620,7 @@ class ConfigModel(BaseModel):
     AUDIO_INPUT_MODEL: str = "gpt-4o-mini-transcribe"
     # 音频输入识别语言
     AUDIO_INPUT_LANGUAGE: str = "zh"
-    # 音频输出提供商：openai/openai_chat_audio/mimo
+    # 音频输出提供商：openai/openai_chat_audio/mimo/minimax
     AUDIO_OUTPUT_PROVIDER: str = "openai"
     # 音频输出 API 密钥
     AUDIO_OUTPUT_API_KEY: Optional[str] = None
@@ -680,6 +699,18 @@ class Settings(BaseSettings, ConfigModel, LogConfigModel):
 
         if isinstance(value, str):
             value = value.strip()
+
+        # 处理 Optional 类型：当值为空字符串且类型允许 None 时，转为 None
+        # 兼容 typing.Union (Python 3.9) 与 types.UnionType (Python 3.10+ PEP 604)
+        origin = get_origin(expected_type)
+        is_union = origin is Union or getattr(origin, "__name__", None) == "UnionType"
+        if (
+            is_union
+            and type(None) in get_args(expected_type)
+            and isinstance(value, str)
+            and not value
+        ):
+            return default, str(default) != str(original_value)
 
         try:
             if expected_type is bool:
@@ -803,13 +834,19 @@ class Settings(BaseSettings, ConfigModel, LogConfigModel):
             logger.warning(message)
             return False, message
         else:
+            # 当值为 None 时，从 env 文件中删除该键，恢复为默认值
+            if converted_value is None:
+                unset_key(
+                    dotenv_path=SystemUtils.get_env_path(),
+                    key_to_unset=field_name,
+                )
+                logger.info(f"配置项 '{field_name}' 已清空，从 'app.env' 中移除")
+                return True, message
             # 如果是列表、字典或集合类型，将其转换为JSON字符串
             if isinstance(converted_value, (list, dict, set)):
                 value_to_write = json.dumps(converted_value)
             else:
-                value_to_write = (
-                    str(converted_value) if converted_value is not None else ""
-                )
+                value_to_write = str(converted_value)
 
             set_key(
                 dotenv_path=SystemUtils.get_env_path(),
@@ -912,6 +949,12 @@ class Settings(BaseSettings, ConfigModel, LogConfigModel):
         return self.CONFIG_PATH / "cache"
 
     @property
+    def PACKAGE_CACHE_PATH(self):
+        if self.PACKAGE_CACHE_ROOT and self.PACKAGE_CACHE_ROOT.strip():
+            return Path(self.PACKAGE_CACHE_ROOT).expanduser()
+        return self.CONFIG_PATH / ".cache"
+
+    @property
     def ROOT_PATH(self):
         return Path(__file__).parents[2]
 
@@ -957,12 +1000,35 @@ class Settings(BaseSettings, ConfigModel, LogConfigModel):
         )
 
     @property
-    def PROXY(self):
-        if self.PROXY_HOST:
+    def PROXY(self) -> Optional[Dict[str, str]]:
+        """
+        获取 requests 兼容的系统代理配置。
+        """
+        if self.PROXY_HOST and self.PROXY_HOST.strip():
+            proxy_host = self.PROXY_HOST.strip()
             return {
-                "http": self.PROXY_HOST,
-                "https": self.PROXY_HOST,
+                "http": proxy_host,
+                "https": proxy_host,
             }
+        https_proxy = self._get_env_proxy("HTTPS_PROXY", "https_proxy")
+        http_proxy = self._get_env_proxy("HTTP_PROXY", "http_proxy")
+        proxy_host = https_proxy or http_proxy
+        if proxy_host:
+            return {
+                "http": http_proxy or proxy_host,
+                "https": https_proxy or proxy_host,
+            }
+        return None
+
+    @staticmethod
+    def _get_env_proxy(*names: str) -> Optional[str]:
+        """
+        按顺序读取非空代理环境变量。
+        """
+        for name in names:
+            proxy_host = os.environ.get(name)
+            if proxy_host and proxy_host.strip():
+                return proxy_host.strip()
         return None
 
     @property
@@ -1000,7 +1066,7 @@ class Settings(BaseSettings, ConfigModel, LogConfigModel):
 
     @property
     def PROXY_SERVER(self):
-        if self.PROXY_HOST:
+        if self.PROXY_HOST and self.PROXY_HOST.strip():
             try:
                 parsed = urlparse(self.PROXY_HOST)
                 if not parsed.scheme:
@@ -1121,6 +1187,8 @@ class GlobalVar(object):
     STOP_EVENT: threading.Event = threading.Event()
     # webpush订阅
     SUBSCRIPTIONS: List[dict] = []
+    # webpush订阅读写锁
+    SUBSCRIPTIONS_LOCK: threading.Lock = threading.Lock()
     # 需应急停止的工作流
     EMERGENCY_STOP_WORKFLOWS: List[int] = []
     # 需应急停止文件整理
@@ -1160,13 +1228,37 @@ class GlobalVar(object):
         """
         获取webpush订阅
         """
-        return self.SUBSCRIPTIONS
+        with self.SUBSCRIPTIONS_LOCK:
+            return list(self.SUBSCRIPTIONS)
 
     def push_subscription(self, subscription: dict):
         """
-        添加webpush订阅
+        添加或更新webpush订阅。
         """
-        self.SUBSCRIPTIONS.append(subscription)
+        endpoint = subscription.get("endpoint") if subscription else None
+        if not endpoint:
+            return
+        with self.SUBSCRIPTIONS_LOCK:
+            for index, current in enumerate(self.SUBSCRIPTIONS):
+                if current.get("endpoint") == endpoint:
+                    self.SUBSCRIPTIONS[index] = subscription
+                    return
+            self.SUBSCRIPTIONS.append(subscription)
+
+    def remove_subscription(self, subscription: dict) -> bool:
+        """
+        根据 endpoint 移除webpush订阅，返回是否实际删除。
+        """
+        endpoint = subscription.get("endpoint") if subscription else None
+        if not endpoint:
+            return False
+        with self.SUBSCRIPTIONS_LOCK:
+            before_count = len(self.SUBSCRIPTIONS)
+            self.SUBSCRIPTIONS[:] = [
+                current for current in self.SUBSCRIPTIONS
+                if current.get("endpoint") != endpoint
+            ]
+            return len(self.SUBSCRIPTIONS) != before_count
 
     def stop_workflow(self, workflow_id: int):
         """

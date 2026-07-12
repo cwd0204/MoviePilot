@@ -2,7 +2,6 @@ import re
 from typing import Optional, List, Tuple, Union, Dict
 
 import cn2an
-import zhconv
 
 from app import schemas
 from app.core.config import settings
@@ -17,6 +16,7 @@ from app.modules.themoviedb.tmdbapi import TmdbApi
 from app.schemas.category import CategoryConfig
 from app.schemas.types import MediaType, MediaImageType, ModuleType, MediaRecognizeType
 from app.utils.http import RequestUtils
+from app.utils.zhconv import convert as zhconv_convert
 
 
 _DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
@@ -116,7 +116,7 @@ class TheMovieDbModule(_ModuleBase):
         准备搜索名称列表
         """
         # 简体名称
-        zh_name = zhconv.convert(meta.cn_name, "zh-hans") if meta.cn_name else None
+        zh_name = zhconv_convert(meta.cn_name, "zh-hans") if meta.cn_name else None
         # 使用中英文名分别识别，去重去空，但要保持顺序
         return list(dict.fromkeys([k for k in [meta.cn_name, zh_name, meta.en_name] if k]))
 
@@ -501,9 +501,6 @@ class TheMovieDbModule(_ModuleBase):
                 names = self._prepare_search_names(meta)
                 for name in names:
                     info = self._search_by_name(name, meta, group_seasons)
-                    if not info:
-                        # 从网站查询
-                        info = self.tmdb.match_web(name=name, mtype=meta.type)
                     if info:
                         # 查到就退出
                         break
@@ -590,9 +587,6 @@ class TheMovieDbModule(_ModuleBase):
                 names = self._prepare_search_names(meta)
                 for name in names:
                     info = await self._async_search_by_name(name, meta, group_seasons)
-                    if not info:
-                        # 从网站查询
-                        info = await self.tmdb.async_match_web(name=name, mtype=meta.type)
                     if info:
                         # 查到就退出
                         break
@@ -975,7 +969,24 @@ class TheMovieDbModule(_ModuleBase):
         return None
 
     @staticmethod
-    def _process_tmdb_images(mediainfo: MediaInfo, images: dict) -> MediaInfo:
+    def _pick_best_tmdb_image(images: list) -> Optional[str]:
+        """
+        从 TMDB 图片候选中选出评分最高的文件路径。
+        """
+        if not images:
+            return None
+        images = sorted(
+            images,
+            key=lambda x: (
+                x.get("vote_average") or 0,
+                x.get("vote_count") or 0,
+            ),
+            reverse=True,
+        )
+        return images[0].get("file_path")
+
+    @classmethod
+    def _process_tmdb_images(cls, mediainfo: MediaInfo, images: dict) -> MediaInfo:
         """
         处理 TMDB 图片数据
         :param mediainfo: 媒体信息
@@ -986,22 +997,16 @@ class TheMovieDbModule(_ModuleBase):
             images = images[0]
         # 背景图
         if not mediainfo.backdrop_path:
-            backdrops = images.get("backdrops")
-            if backdrops:
-                backdrops = sorted(backdrops, key=lambda x: x.get("vote_average"), reverse=True)
-                mediainfo.backdrop_path = settings.TMDB_IMAGE_URL(backdrops[0].get("file_path"))
+            if image_path := cls._pick_best_tmdb_image(images.get("backdrops")):
+                mediainfo.backdrop_path = settings.TMDB_IMAGE_URL(image_path)
         # 标志
         if not mediainfo.logo_path:
-            logos = images.get("logos")
-            if logos:
-                logos = sorted(logos, key=lambda x: x.get("vote_average"), reverse=True)
-                mediainfo.logo_path = settings.TMDB_IMAGE_URL(logos[0].get("file_path"))
+            if image_path := cls._pick_best_tmdb_image(images.get("logos")):
+                mediainfo.logo_path = settings.TMDB_IMAGE_URL(image_path)
         # 海报
         if not mediainfo.poster_path:
-            posters = images.get("posters")
-            if posters:
-                posters = sorted(posters, key=lambda x: x.get("vote_average"), reverse=True)
-                mediainfo.poster_path = settings.TMDB_IMAGE_URL(posters[0].get("file_path"))
+            if image_path := cls._pick_best_tmdb_image(images.get("posters")):
+                mediainfo.poster_path = settings.TMDB_IMAGE_URL(image_path)
         return mediainfo
 
     def obtain_images(self, mediainfo: MediaInfo) -> Optional[MediaInfo]:
@@ -1017,9 +1022,15 @@ class TheMovieDbModule(_ModuleBase):
 
         # 调用TMDB图片接口
         if mediainfo.type == MediaType.MOVIE:
-            images = self.tmdb.get_movie_images(mediainfo.tmdb_id)
+            images = self.tmdb.get_movie_images(
+                mediainfo.tmdb_id,
+                original_language=mediainfo.original_language,
+            )
         else:
-            images = self.tmdb.get_tv_images(mediainfo.tmdb_id)
+            images = self.tmdb.get_tv_images(
+                mediainfo.tmdb_id,
+                original_language=mediainfo.original_language,
+            )
         if not images:
             return mediainfo
 
@@ -1039,9 +1050,15 @@ class TheMovieDbModule(_ModuleBase):
 
         # 调用TMDB图片接口
         if mediainfo.type == MediaType.MOVIE:
-            images = await self.tmdb.async_get_movie_images(mediainfo.tmdb_id)
+            images = await self.tmdb.async_get_movie_images(
+                mediainfo.tmdb_id,
+                original_language=mediainfo.original_language,
+            )
         else:
-            images = await self.tmdb.async_get_tv_images(mediainfo.tmdb_id)
+            images = await self.tmdb.async_get_tv_images(
+                mediainfo.tmdb_id,
+                original_language=mediainfo.original_language,
+            )
         if not images:
             return mediainfo
 

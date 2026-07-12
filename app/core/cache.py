@@ -421,7 +421,8 @@ class MemoryBackend(CacheBackend):
         region_cache = self.__get_region_cache(region)
         if region_cache is None:
             return False
-        return key in region_cache
+        with self._lock:
+            return key in region_cache
 
     def get(self, key: str, region: Optional[str] = DEFAULT_CACHE_REGION) -> Any:
         """
@@ -434,7 +435,8 @@ class MemoryBackend(CacheBackend):
         region_cache = self.__get_region_cache(region)
         if region_cache is None:
             return None
-        return region_cache.get(key)
+        with self._lock:
+            return region_cache.get(key)
 
     def delete(self, key: str, region: Optional[str] = DEFAULT_CACHE_REGION):
         """
@@ -447,7 +449,8 @@ class MemoryBackend(CacheBackend):
         if region_cache is None:
             return
         with self._lock:
-            del region_cache[key]
+            if key in region_cache:
+                del region_cache[key]
 
     def clear(self, region: Optional[str] = DEFAULT_CACHE_REGION) -> None:
         """
@@ -803,8 +806,10 @@ class FileBackend(CacheBackend):
         :param region: 缓存的区
         """
         cache_path = self.base / region / key
-        if cache_path.exists():
+        if cache_path.is_file():
             cache_path.unlink()
+        elif cache_path.exists():
+            shutil.rmtree(cache_path, ignore_errors=True)
 
     def clear(self, region: Optional[str] = DEFAULT_CACHE_REGION) -> None:
         """
@@ -840,10 +845,11 @@ class FileBackend(CacheBackend):
         if not cache_path.exists():
             yield from ()
             return
-        for item in cache_path.iterdir():
+        for item in sorted(cache_path.rglob("*")):
             if item.is_file():
-                with open(item, 'r') as f:
-                    yield item.as_posix(), f.read()
+                key = item.relative_to(cache_path).as_posix()
+                with open(item, 'rb') as f:
+                    yield key, f.read()
 
     def close(self) -> None:
         """
@@ -916,8 +922,10 @@ class AsyncFileBackend(AsyncCacheBackend):
         :param region: 缓存的区
         """
         cache_path = AsyncPath(self.base) / region / key
-        if await cache_path.exists():
+        if await cache_path.is_file():
             await cache_path.unlink()
+        elif await cache_path.exists():
+            await aioshutil.rmtree(cache_path, ignore_errors=True)
 
     async def clear(self, region: Optional[str] = DEFAULT_CACHE_REGION) -> None:
         """
@@ -951,12 +959,12 @@ class AsyncFileBackend(AsyncCacheBackend):
         """
         cache_path = AsyncPath(self.base) / region
         if not await cache_path.exists():
-            yield "", None
             return
-        async for item in cache_path.iterdir():
+        async for item in cache_path.rglob("*"):
             if await item.is_file():
-                async with aiofiles.open(item, 'r') as f:
-                    yield item.as_posix(), await f.read()
+                key = Path(str(item)).relative_to(Path(str(cache_path))).as_posix()
+                async with aiofiles.open(item, 'rb') as f:
+                    yield key, await f.read()
 
     async def close(self) -> None:
         """
@@ -1079,6 +1087,14 @@ def cached(region: Optional[str] = None, maxsize: Optional[int] = 1024, ttl: Opt
     """
 
     def decorator(func):
+        # 函数签名在装饰后不会变化，预计算可避免每次缓存访问都重复反射。
+        signature = inspect.signature(func)
+        parameter_names = list(signature.parameters.keys())
+        cache_parameter_names = (
+            parameter_names[1:]
+            if parameter_names and parameter_names[0] in ("self", "cls")
+            else parameter_names
+        )
 
         def should_cache(value: Any) -> bool:
             """
@@ -1143,17 +1159,12 @@ def cached(region: Optional[str] = None, maxsize: Optional[int] = 1024, ttl: Opt
             :param kwargs: 关键字参数
             :return: 缓存键
             """
-            signature = inspect.signature(func)
             # 绑定传入的参数并应用默认值
             bound = signature.bind(*args, **kwargs)
             bound.apply_defaults()
-            # 忽略第一个参数，如果它是实例(self)或类(cls)
-            parameters = list(signature.parameters.keys())
-            if parameters and parameters[0] in ("self", "cls"):
-                bound.arguments.pop(parameters[0], None)
             # 按照函数签名顺序提取参数值列表
             keys = [
-                bound.arguments[param] for param in signature.parameters if param in bound.arguments
+                bound.arguments[param] for param in cache_parameter_names if param in bound.arguments
             ]
             # 使用有序参数生成缓存键
             return f"{func_name}_{hashkey(*keys)}"
@@ -1203,8 +1214,19 @@ def cached(region: Optional[str] = None, maxsize: Optional[int] = 1024, ttl: Opt
                 """
                 await cache_backend.clear(region=cache_region)
 
+            async def cache_exists(*args, **kwargs) -> bool:
+                """
+                判断当前参数对应的有效缓存是否存在。
+                """
+                cache_key = __get_cache_key(args, kwargs)
+                cached_value = await cache_backend.get(cache_key, region=cache_region)
+                return should_cache(cached_value) and await async_is_valid_cache_value(
+                    cache_key, cached_value, cache_region
+                )
+
             async_wrapper.cache_region = cache_region
             async_wrapper.cache_clear = cache_clear
+            async_wrapper.cache_exists = cache_exists
             return async_wrapper
         else:
             # 同步函数使用同步缓存后端
@@ -1235,8 +1257,19 @@ def cached(region: Optional[str] = None, maxsize: Optional[int] = 1024, ttl: Opt
                 """
                 cache_backend.clear(region=cache_region)
 
+            def cache_exists(*args, **kwargs) -> bool:
+                """
+                判断当前参数对应的有效缓存是否存在。
+                """
+                cache_key = __get_cache_key(args, kwargs)
+                cached_value = cache_backend.get(cache_key, region=cache_region)
+                return should_cache(cached_value) and is_valid_cache_value(
+                    cache_key, cached_value, cache_region
+                )
+
             wrapper.cache_region = cache_region
             wrapper.cache_clear = cache_clear
+            wrapper.cache_exists = cache_exists
             return wrapper
 
     return decorator

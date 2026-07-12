@@ -1,45 +1,14 @@
-import unittest
+"""全量单测入口：以 pytest 跑 tests 目录全部用例，命令行参数透传给 pytest。
 
-from tests.test_bluray import BluRayTest
-from tests.test_mediascrape import (
-    TestMediaScrapingPaths,
-    TestMediaScrapingNFO,
-    TestMediaScrapingImages,
-    TestMediaScrapingTVDirectory,
-    TestMediaScrapeEvents
-)
-from tests.test_metainfo import MetaInfoTest
-from tests.test_object import ObjectUtilsTest
-from tests.test_subscribe_chain import SubscribeChainTest
+用 __file__ 推导 tests 目录绝对路径，使脚本不依赖当前工作目录，从任意位置调用均可。
+"""
+import sys
+from pathlib import Path
 
+import pytest
 
-if __name__ == '__main__':
-    suite = unittest.TestSuite()
+# 本文件即位于 tests/ 下，其所在目录即测试根目录
+_TESTS_DIR = Path(__file__).resolve().parent
 
-    # 测试名称识别
-    suite.addTest(MetaInfoTest('test_metainfo'))
-    suite.addTest(MetaInfoTest('test_emby_format_ids'))
-    suite.addTest(ObjectUtilsTest('test_check_method'))
-
-    # 测试自定义识别词功能
-    suite.addTest(MetaInfoTest('test_metainfopath_with_custom_words'))
-    suite.addTest(MetaInfoTest('test_metainfopath_without_custom_words'))
-    suite.addTest(MetaInfoTest('test_metainfopath_with_empty_custom_words'))
-    suite.addTest(MetaInfoTest('test_custom_words_apply_words_recording'))
-
-    # 测试蓝光目录识别
-    suite.addTest(BluRayTest())
-
-    # 测试媒体刮削
-    suite.addTest(unittest.TestLoader().loadTestsFromTestCase(TestMediaScrapingPaths))
-    suite.addTest(unittest.TestLoader().loadTestsFromTestCase(TestMediaScrapingNFO))
-    suite.addTest(unittest.TestLoader().loadTestsFromTestCase(TestMediaScrapingImages))
-    suite.addTest(unittest.TestLoader().loadTestsFromTestCase(TestMediaScrapingTVDirectory))
-    suite.addTest(unittest.TestLoader().loadTestsFromTestCase(TestMediaScrapeEvents))
-
-    # 测试订阅洗版匹配
-    suite.addTest(SubscribeChainTest('test_is_episode_range_covered'))
-
-    # 运行测试
-    runner = unittest.TextTestRunner()
-    runner.run(suite)
+if __name__ == "__main__":
+    sys.exit(pytest.main([str(_TESTS_DIR), *sys.argv[1:]]))

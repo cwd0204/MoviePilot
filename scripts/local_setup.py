@@ -17,6 +17,7 @@ import subprocess
 import sys
 import tarfile
 import textwrap
+import urllib.parse
 import uuid
 import zipfile
 from datetime import datetime
@@ -87,6 +88,21 @@ LLM_PROVIDER_DEFAULTS = {
         "model": "",
         "base_url": "https://modelservice.jdcloud.com/v1",
     },
+    "china-unicom": {
+        "model": "",
+        "base_url": "https://aigw-gzgy2.cucloud.cn:8443/v1",
+        "base_url_preset": "china-unicom-coding-openai",
+    },
+    "china-mobile": {
+        "model": "",
+        "base_url": "https://ecloud.10086.cn/api",
+        "base_url_preset": "china-mobile-moma",
+    },
+    "china-telecom": {
+        "model": "",
+        "base_url": "https://wishub-x6.ctyun.cn/v1",
+        "base_url_preset": "china-telecom-token-service",
+    },
     "kuaishou-wanqing": {
         "model": "",
         "base_url": "https://wanqing.streamlakeapi.com/api/gateway/v1/endpoints",
@@ -102,6 +118,9 @@ LLM_PROVIDER_FALLBACK_CHOICES = {
     "openrouter": "OpenRouter",
     "groq": "Groq",
     "jdcloud": "京东云",
+    "china-unicom": "中国联通",
+    "china-mobile": "中国移动",
+    "china-telecom": "中国电信",
     "kuaishou-wanqing": "快手万擎",
 }
 RUNTIME_PACKAGE = {
@@ -475,10 +494,62 @@ def print_step(message: str) -> None:
     print(f"==> {message}")
 
 
-def run(command: list[str], cwd: Optional[Path] = None) -> None:
-    pretty = " ".join(command)
+def _redact_url(value: str) -> str:
+    parsed = urllib.parse.urlsplit(value)
+    if "@" not in parsed.netloc:
+        return value
+    host = parsed.netloc.rsplit("@", 1)[-1]
+    return urllib.parse.urlunsplit(
+        (parsed.scheme, host, parsed.path, parsed.query, parsed.fragment)
+    )
+
+
+def redact_command(command: list[str]) -> list[str]:
+    redacted: list[str] = []
+    for item in command:
+        value = str(item)
+        url_marker = value.find("://")
+        equals_marker = value.find("=")
+        if url_marker >= 0 and 0 <= equals_marker < url_marker:
+            key, separator, url = value.partition("=")
+            value = f"{key}{separator}{_redact_url(url)}"
+        elif url_marker >= 0:
+            value = _redact_url(value)
+        redacted.append(value)
+    return redacted
+
+
+def build_package_install_env() -> dict[str, str]:
+    env = os.environ.copy()
+    package_cache_root = env.get("PACKAGE_CACHE_ROOT", "").strip() or str(CONFIG_DIR / ".cache")
+    env.setdefault("PACKAGE_CACHE_ROOT", package_cache_root)
+    env.setdefault("PIP_CACHE_DIR", os.path.join(package_cache_root, "pip"))
+    env.setdefault("UV_CACHE_DIR", os.path.join(package_cache_root, "uv"))
+
+    index_url = env.get("PIP_PROXY", "").strip()
+    if index_url:
+        env["PIP_INDEX_URL"] = index_url
+        env["UV_DEFAULT_INDEX"] = index_url
+
+    proxy = env.get("PROXY_HOST", "").strip()
+    if proxy:
+        for key in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"):
+            env[key] = proxy
+    return env
+
+
+def run(
+    command: list[str],
+    cwd: Optional[Path] = None,
+    env: Optional[dict[str, str]] = None,
+    safe_command: Optional[list[str]] = None,
+) -> None:
+    """
+    执行安装步骤中的外部命令，并在失败时让调用方中断流程。
+    """
+    pretty = " ".join(safe_command or redact_command(command))
     print(f"+ {pretty}")
-    subprocess.run(command, cwd=str(cwd or ROOT), check=True)
+    subprocess.run(command, cwd=str(cwd or ROOT), check=True, env=env)
 
 
 def capture(command: list[str], cwd: Optional[Path] = None) -> str:
@@ -572,13 +643,17 @@ def _ensure_uv_available_for_venv(venv_dir: Path, venv_python: Path) -> Optional
         return uv_bin
 
     print_step("当前未检测到 uv，先在虚拟环境内安装 uv")
-    run([str(venv_python), "-m", "pip", "install", "--upgrade", "pip", "uv"])
+    command = [str(venv_python), "-m", "pip", "install", "--upgrade", "pip", "uv"]
+    run(command, env=build_package_install_env(), safe_command=redact_command(command))
     if uv_bin.exists():
         return uv_bin
     raise RuntimeError("uv 安装完成，但虚拟环境中未找到 uv 可执行文件")
 
 
 def configure_venv_pip_compat(venv_dir: Path, venv_python: Path) -> Path:
+    """
+    在虚拟环境中安装 uv 并保持 pip 命令兼容，供现有安装流程复用。
+    """
     if os.name == "nt":
         return get_venv_pip(venv_dir)
 
@@ -2628,6 +2703,9 @@ def init_local(
 
 
 def install_deps(*, python_bin: str, venv_dir: Path, recreate: bool) -> Path:
+    """
+    创建或复用本地虚拟环境，并安装后端依赖和浏览器运行时。
+    """
     ensure_supported_python(python_bin)
     venv_dir = venv_dir.expanduser().resolve()
     venv_python = get_venv_python(venv_dir)
@@ -2646,14 +2724,25 @@ def install_deps(*, python_bin: str, venv_dir: Path, recreate: bool) -> Path:
 
     if os.name == "nt":
         print_step("升级 pip")
-        run([str(venv_python), "-m", "pip", "install", "--upgrade", "pip"])
+        command = [str(venv_python), "-m", "pip", "install", "--upgrade", "pip"]
+        run(command, env=build_package_install_env(), safe_command=redact_command(command))
     else:
         print_step("为虚拟环境配置 uv 兼容 pip 命令")
         venv_pip = configure_venv_pip_compat(venv_dir, venv_python)
 
     print_step("安装项目依赖")
-    run([str(venv_pip), "install", "-r", str(ROOT / "requirements.txt")])
+    command = [str(venv_pip), "install", "-r", str(ROOT / "requirements.txt")]
+    run(command, env=build_package_install_env(), safe_command=redact_command(command))
+    install_browser_runtime(venv_python)
     return venv_python
+
+
+def install_browser_runtime(venv_python: Path) -> None:
+    """
+    预下载 CloakBrowser 浏览器内核，避免首次仿真登录时才拉取大文件。
+    """
+    print_step("安装 CloakBrowser 浏览器内核")
+    run([str(venv_python), "-m", "cloakbrowser", "install"])
 
 
 def _startup_platform_name() -> str:

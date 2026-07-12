@@ -26,7 +26,7 @@ from app.db.models.transferhistory import TransferHistory
 from app.db.systemconfig_oper import SystemConfigOper
 from app.db.transferhistory_oper import TransferHistoryOper
 from app.helper.directory import DirectoryHelper
-from app.helper.format import FormatParser
+from app.helper.format import EpisodeFormatRuleHelper, FormatParser
 from app.helper.progress import ProgressHelper
 from app.log import logger
 from app.schemas import StorageOperSelectionEventData
@@ -40,6 +40,7 @@ from app.schemas import (
     TransferQueue,
     TransferJob,
     TransferJobTask,
+    TmdbEpisode,
 )
 from app.schemas.exception import OperationInterrupted
 from app.schemas.types import (
@@ -64,6 +65,48 @@ downloader_lock = threading.Lock()
 job_lock = threading.Lock()
 # 任务锁
 task_lock = threading.Lock()
+
+# 字幕文件常见的语言/默认/强制标记，整理同名字幕时只允许剥离这些字幕专属尾缀。
+SUBTITLE_STEM_TAGS = {
+    "cc",
+    "chi",
+    "chs",
+    "cht",
+    "cn",
+    "default",
+    "en",
+    "eng",
+    "english",
+    "forced",
+    "gb",
+    "gb2312",
+    "hk",
+    "ja",
+    "jap",
+    "japanese",
+    "jp",
+    "jpn",
+    "sc",
+    "sdh",
+    "tc",
+    "zh",
+    "zh-cn",
+    "zh-hans",
+    "zh-hant",
+    "zh-tw",
+    "zh_cn",
+    "zh_hans",
+    "zh_hant",
+    "zh_tw",
+    "zho",
+    "中英",
+    "中字",
+    "双语",
+    "简中",
+    "简体",
+    "繁中",
+    "繁体",
+}
 
 
 class JobManager:
@@ -99,6 +142,18 @@ class JobManager:
         if not media:
             return None, season
         return media.tmdb_id or media.douban_id, season
+
+    @staticmethod
+    def __get_file_key(fileitem: FileItem) -> Optional[Tuple[str, str]]:
+        """
+        获取源文件唯一键，用于跨媒体作业识别同一个整理任务。
+        """
+        if not fileitem or not fileitem.path:
+            return None
+        normalized_path = (
+            Path(str(fileitem.path).replace("\\", "/")).as_posix().rstrip("/") or "/"
+        )
+        return fileitem.storage or "local", normalized_path
 
     def __get_id(self, task: TransferTask = None) -> Tuple:
         """
@@ -145,8 +200,19 @@ class JobManager:
         """
         if not all([task, task.meta, task.fileitem]):
             return False
+        file_key = self.__get_file_key(task.fileitem)
+        if not file_key:
+            return False
         with job_lock:
             __mediaid__ = self.__get_id(task)
+            # 同一个源文件可能在识别前后落入不同作业，必须跨作业去重。
+            if any(
+                    self.__get_file_key(t.fileitem) == file_key
+                    for job in self._job_view.values()
+                    for t in job.tasks
+            ):
+                logger.debug(f"任务 {task.fileitem.name} 已存在，跳过重复添加")
+                return False
             if __mediaid__ not in self._job_view:
                 self._job_view[__mediaid__] = TransferJob(
                     media=self.__get_media(task),
@@ -165,7 +231,7 @@ class JobManager:
                 # 不重复添加任务
                 if any(
                         [
-                            t.fileitem == task.fileitem
+                            self.__get_file_key(t.fileitem) == file_key
                             for t in self._job_view[__mediaid__].tasks
                         ]
                 ):
@@ -281,10 +347,13 @@ class JobManager:
         """
         if not task or not task.fileitem:
             return
+        file_key = self.__get_file_key(task.fileitem)
+        if not file_key:
+            return
         with job_lock:
             for mediaid, job in self._job_view.items():
                 for job_task in job.tasks:
-                    if job_task.fileitem != task.fileitem:
+                    if self.__get_file_key(job_task.fileitem) != file_key:
                         continue
                     if job_task.state not in ["completed", "failed"]:
                         job_task.state = "failed"
@@ -308,11 +377,14 @@ class JobManager:
         """
         根据文件项移除任务，并返回任务所在的作业ID
         """
+        file_key = self.__get_file_key(fileitem)
+        if not file_key:
+            return None, None
         with job_lock:
             for mediaid in list(self._job_view):
                 job = self._job_view[mediaid]
                 for task in job.tasks:
-                    if task.fileitem == fileitem:
+                    if self.__get_file_key(task.fileitem) == file_key:
                         job.tasks.remove(task)
                         # 如果没有作业了，则移除作业
                         if not job.tasks:
@@ -820,13 +892,27 @@ class TransferChain(ChainBase, ConfigReloadMixin, metaclass=Singleton):
             else False
         )
 
+    @staticmethod
+    def __is_hidden_or_recycle_path(file_path: Optional[str]) -> bool:
+        """
+        判断是否隐藏或回收站路径
+        """
+        if not file_path:
+            return False
+        normalized_path = file_path.replace("\\", "/")
+        return (
+            "/@Recycle/" in normalized_path
+            or "/#recycle/" in normalized_path
+            or "/." in normalized_path
+            or "/@eaDir" in normalized_path
+        )
+
     def __default_callback(
             self, task: TransferTask, transferinfo: TransferInfo, /
     ) -> Tuple[bool, str]:
         """
         整理完成后处理
         """
-
         # 状态
         ret_status = True
         # 错误信息
@@ -862,10 +948,12 @@ class TransferChain(ChainBase, ConfigReloadMixin, metaclass=Singleton):
                     mediainfo=task.mediainfo,
                     transferinfo=transferinfo,
                     season_episode=se_str,
+                    episodes_info=task.episodes_info,
                     username=task.username,
                 )
 
         transferhis = TransferHistoryOper()
+        target_dir_path = self.__get_transfer_target_dir_path(transferinfo)
 
         # 转移失败
         if not transferinfo.success:
@@ -983,9 +1071,7 @@ class TransferChain(ChainBase, ConfigReloadMixin, metaclass=Singleton):
 
         else:
             # 转移成功
-            logger.info(
-                f"{task.fileitem.name} 入库成功：{transferinfo.target_diritem.path}"
-            )
+            logger.info(f"{task.fileitem.name} 入库成功：{target_dir_path or ''}")
 
             # 新增task转移成功历史记录
             history = transferhis.add_success(
@@ -1043,13 +1129,13 @@ class TransferChain(ChainBase, ConfigReloadMixin, metaclass=Singleton):
                 )
 
             # task登记转移成功文件清单
-            target_dir_path = transferinfo.target_diritem.path
             target_files = transferinfo.file_list_new
-            with job_lock:
-                if self._success_target_files.get(target_dir_path):
-                    self._success_target_files[target_dir_path].extend(target_files)
-                else:
-                    self._success_target_files[target_dir_path] = target_files
+            if target_dir_path:
+                with job_lock:
+                    if self._success_target_files.get(target_dir_path):
+                        self._success_target_files[target_dir_path].extend(target_files)
+                    else:
+                        self._success_target_files[target_dir_path] = target_files
 
             # 设置任务成功
             self.jobview.finish_task(task)
@@ -1061,9 +1147,12 @@ class TransferChain(ChainBase, ConfigReloadMixin, metaclass=Singleton):
         if self.jobview.is_finished(task):
             # 更新文件清单
             with job_lock:
-                transferinfo.file_list_new = self._success_target_files.pop(
-                    transferinfo.target_diritem.path, []
-                )
+                if target_dir_path:
+                    transferinfo.file_list_new = self._success_target_files.pop(
+                        target_dir_path, []
+                    )
+                else:
+                    transferinfo.file_list_new = transferinfo.file_list_new or []
             __notify()
             if not task.transfer_batch_id:
                 self.__send_metadata_scrape_event(task, transferinfo)
@@ -1104,6 +1193,22 @@ class TransferChain(ChainBase, ConfigReloadMixin, metaclass=Singleton):
                         StorageChain().delete_media_file(t.fileitem, delete_self=False)
 
         return ret_status, ret_message
+
+    def __get_transfer_target_dir_path(
+            self, transferinfo: Optional[TransferInfo]
+    ) -> Optional[str]:
+        """
+        获取整理目标目录路径，兼容 OpenList 等成功后目录项短时间不可见的存储。
+        """
+        if not transferinfo:
+            return None
+        if transferinfo.target_diritem and transferinfo.target_diritem.path:
+            return transferinfo.target_diritem.path
+        if transferinfo.target_item and transferinfo.target_item.path:
+            return Path(transferinfo.target_item.path).parent.as_posix()
+        if transferinfo.file_list_new:
+            return Path(transferinfo.file_list_new[0]).parent.as_posix()
+        return None
 
     def put_to_queue(self, task: TransferTask) -> bool:
         """
@@ -1154,9 +1259,12 @@ class TransferChain(ChainBase, ConfigReloadMixin, metaclass=Singleton):
                 not task
                 or not transferinfo
                 or not transferinfo.need_scrape
-                or not transferinfo.target_diritem
                 or not self.__is_media_file(task.fileitem)
         ):
+            return
+
+        target_diritem = transferinfo.target_diritem
+        if not target_diritem:
             return
 
         self.eventmanager.send_event(
@@ -1164,7 +1272,7 @@ class TransferChain(ChainBase, ConfigReloadMixin, metaclass=Singleton):
             {
                 "meta": task.meta,
                 "mediainfo": task.mediainfo,
-                "fileitem": transferinfo.target_diritem,
+                "fileitem": target_diritem,
                 "file_list": transferinfo.file_list_new,
                 "overwrite": False,
             },
@@ -1214,12 +1322,14 @@ class TransferChain(ChainBase, ConfigReloadMixin, metaclass=Singleton):
                 or not task.transfer_batch_id
                 or not transferinfo
                 or not transferinfo.need_scrape
-                or not transferinfo.target_diritem
                 or not self.__is_media_file(task.fileitem)
         ):
             return
 
         target_diritem = transferinfo.target_diritem
+        if not target_diritem:
+            return
+
         target_files = transferinfo.file_list_new or []
         target_key = (target_diritem.storage, target_diritem.path)
         with job_lock:
@@ -1433,7 +1543,13 @@ class TransferChain(ChainBase, ConfigReloadMixin, metaclass=Singleton):
                 if download_history:
                     task.username = download_history.username
                     # 识别媒体信息
-                    if download_history.tmdbid or download_history.doubanid:
+                    history_year_conflict = self._is_movie_year_conflict(
+                        task.meta, download_history
+                    )
+                    if (
+                            (download_history.tmdbid or download_history.doubanid)
+                            and not history_year_conflict
+                    ):
                         # 下载记录中已存在识别信息
                         mediainfo: Optional[MediaInfo] = self.recognize_media(
                             mtype=MediaType(download_history.type),
@@ -1446,6 +1562,18 @@ class TransferChain(ChainBase, ConfigReloadMixin, metaclass=Singleton):
                             # 更新自定义媒体类别
                             if download_history.media_category:
                                 mediainfo.category = download_history.media_category
+                    else:
+                        if history_year_conflict:
+                            logger.info(
+                                f"{task.fileitem.name} 文件年份 {task.meta.year} 与下载记录年份 "
+                                f"{download_history.year} 不一致，按文件名重新识别"
+                            )
+                        mediainfo = MediaChain().recognize_by_meta(
+                            task.meta,
+                            obtain_images=True,
+                        )
+                        if mediainfo and download_history.media_category:
+                            mediainfo.category = download_history.media_category
                 else:
                     # 识别媒体信息
                     mediainfo = MediaChain().recognize_by_meta(
@@ -1532,7 +1660,9 @@ class TransferChain(ChainBase, ConfigReloadMixin, metaclass=Singleton):
                 # 更新任务信息
                 task.mediainfo = mediainfo
                 # 更新队列任务
-                self.jobview.migrate_task(task)
+                if not self.jobview.migrate_task(task):
+                    logger.info(f"{task.fileitem.name} 已存在整理任务，跳过重复处理")
+                    return False, f"{task.fileitem.name} 已在整理队列中"
 
             # 获取集数据
             if task.mediainfo.type == MediaType.TV and not task.episodes_info:
@@ -1652,9 +1782,164 @@ class TransferChain(ChainBase, ConfigReloadMixin, metaclass=Singleton):
         """
         return self.run_module("recommend_name", meta=meta, mediainfo=mediainfo)
 
-    def process(self) -> bool:
+    def recommend_episode_format(
+            self,
+            fileitem: FileItem,
+            fileitems: Optional[List[FileItem]] = None,
+    ) -> Tuple[bool, str, Optional[dict]]:
+        """
+        根据目录样本推荐集数定位模板
+        """
+        if not fileitem and not fileitems:
+            logger.warn("推荐集数定位模板失败：缺少目录参数")
+            return False, "缺少目录参数", None
+
+        rules = self.__get_episode_format_rules()
+        if fileitems:
+            state, errmsg, sample_files = self.__get_selected_episode_format_sample_files(
+                fileitems
+            )
+            if not state:
+                logger.warn(f"推荐集数定位模板失败：{errmsg}")
+                return False, errmsg, None
+            target_path = sample_files[0].path if sample_files else None
+        else:
+            if not fileitem or not fileitem.path:
+                logger.warn("推荐集数定位模板失败：缺少目录参数")
+                return False, "缺少目录参数", None
+            directory = self.__resolve_episode_format_directory(fileitem)
+            if not directory or directory.type != "dir":
+                logger.warn(f"推荐集数定位模板失败：目录不存在 - {fileitem.path}")
+                return False, "目录不存在", None
+            sample_files = self.__get_episode_format_sample_files(directory)
+            target_path = directory.path
+        logger.info(
+            f"开始匹配集数定位规则：{target_path}，规则数 {len(rules)}，样本数 {len(sample_files)}"
+        )
+        state, errmsg, data = EpisodeFormatRuleHelper().recommend(
+            rules=rules,
+            sample_files=sample_files,
+        )
+        if not state:
+            logger.warn(f"集数定位模板推荐失败：{target_path} - {errmsg}")
+            return state, errmsg, data
+        logger.info(
+            f"集数定位模板推荐成功：{target_path} - 规则 {data.get('rule_name') if data else None}"
+        )
+        return state, errmsg, data
+
+    @staticmethod
+    def __get_episode_format_rules() -> List[schemas.EpisodeFormatRule]:
+        """
+        获取启用的集数定位规则
+        """
+        rule_items = SystemConfigOper().get(SystemConfigKey.EpisodeFormatRuleTable) or []
+        rules: List[schemas.EpisodeFormatRule] = []
+        for item in rule_items:
+            if not isinstance(item, dict):
+                continue
+            try:
+                rule = schemas.EpisodeFormatRule(**item)
+            except Exception as err:
+                logger.warn(f"忽略无效的集数定位规则：{err}")
+                continue
+            if rule.enabled:
+                rules.append(rule)
+        return sorted(rules, key=lambda item: item.order)
+
+    def __resolve_episode_format_directory(
+            self, fileitem: FileItem
+    ) -> Optional[FileItem]:
+        """
+        将文件或目录入参归一化为目录对象
+        """
+        storage_chain = StorageChain()
+        if fileitem.type == "dir":
+            return storage_chain.get_item(fileitem)
+        source_path = Path(fileitem.path)
+        parent_item = FileItem(
+            storage=fileitem.storage,
+            path=source_path.parent.as_posix(),
+            type="dir",
+            name=source_path.parent.name,
+        )
+        return storage_chain.get_item(parent_item)
+
+    def __get_selected_episode_format_sample_files(
+            self, fileitems: List[FileItem]
+    ) -> Tuple[bool, str, List[FileItem]]:
+        """
+        获取当前选择文件中可参与模板推荐的样本文件。
+        """
+        if not fileitems:
+            return False, "没有可用于识别的样本文件", []
+
+        expected_dir_key: Optional[Tuple[str, str]] = None
+        selected_files: List[FileItem] = []
+        seen_files = set()
+        for item in fileitems:
+            if not item or not item.path or item.type != "file":
+                return False, "当前选择不满足智能识别条件", []
+
+            dir_key = (
+                item.storage or "local",
+                Path(item.path).parent.as_posix(),
+            )
+            if expected_dir_key is None:
+                expected_dir_key = dir_key
+            elif dir_key != expected_dir_key:
+                return False, "当前选择不满足智能识别条件", []
+
+            file_key = (item.storage or "local", item.path)
+            if file_key in seen_files:
+                continue
+            seen_files.add(file_key)
+
+            if not (
+                    self.__is_media_file(item)
+                    or self.__is_subtitle_file(item)
+                    or self.__is_audio_file(item)
+            ):
+                continue
+            if self.__is_hidden_or_recycle_path(item.path):
+                continue
+            selected_files.append(item)
+
+        if not selected_files:
+            return False, "没有可用于识别的样本文件", []
+        return True, "", selected_files
+
+    def __get_episode_format_sample_files(
+            self, directory: FileItem
+    ) -> List[FileItem]:
+        """
+        获取目录下可参与模板推荐的样本文件。
+
+        推荐结果最终会在手动整理链路中作为 `episode_format`
+        交由 `FormatParser` 过滤主视频、字幕和外挂音频，因此这里需要把
+        同目录下的主视频、字幕和外挂音频一起纳入推荐流程。
+        """
+        file_items = StorageChain().list_files(directory, recursion=False) or []
+        sample_files: List[FileItem] = []
+        for item in file_items:
+            if not item or item.type != "file":
+                continue
+            if not (
+                    self.__is_media_file(item)
+                    or self.__is_subtitle_file(item)
+                    or self.__is_audio_file(item)
+            ):
+                continue
+            if self.__is_hidden_or_recycle_path(item.path):
+                continue
+            sample_files.append(item)
+        return sample_files
+
+    def process(self, progress_callback: Optional[Callable[..., None]] = None) -> bool:
         """
         获取下载器中的种子列表，并执行整理
+
+        :param progress_callback: 定时服务进度更新回调
         """
         # 全局锁，避免定时服务重复
         with downloader_lock:
@@ -1666,9 +1951,13 @@ class TransferChain(ChainBase, ConfigReloadMixin, metaclass=Singleton):
                     dir_info.monitor_type == "downloader" and dir_info.storage == "local"
                     for dir_info in download_dirs
             ):
+                if progress_callback:
+                    progress_callback(value=100, text="未配置下载器监控目录，跳过整理")
                 return True
 
             logger.info("开始整理下载器中已经完成下载的文件 ...")
+            if progress_callback:
+                progress_callback(value=0, text="正在查询已完成下载任务 ...")
 
             # 从下载器获取种子列表
             if torrents_list := self.list_torrents(status=TorrentStatus.TRANSFER):
@@ -1686,14 +1975,38 @@ class TransferChain(ChainBase, ConfigReloadMixin, metaclass=Singleton):
 
             if not torrents:
                 logger.info("没有已完成下载但未整理的任务")
+                if progress_callback:
+                    progress_callback(value=100, text="没有已完成下载但未整理的任务")
                 return False
 
             logger.info(f"获取到 {len(torrents)} 个已完成的下载任务")
+            if progress_callback:
+                progress_callback(
+                    value=0,
+                    text=f"获取到 {len(torrents)} 个已完成下载任务",
+                    data={"total": len(torrents), "finished": 0},
+                )
 
             try:
-                for torrent in torrents:
+                total_num = len(torrents)
+                for index, torrent in enumerate(torrents, start=1):
                     if global_vars.is_system_stopped:
                         break
+                    if progress_callback:
+                        torrent_name = (
+                            getattr(torrent, "title", None)
+                            or getattr(torrent, "name", None)
+                            or torrent.hash
+                        )
+                        progress_callback(
+                            value=(index - 1) / total_num * 100,
+                            text=f"正在整理下载任务（{index}/{total_num}）{torrent_name} ...",
+                            data={
+                                "total": total_num,
+                                "finished": index - 1,
+                                "current": torrent.hash,
+                            },
+                        )
 
                     # 文件路径
                     file_path = torrent.path
@@ -1757,9 +2070,15 @@ class TransferChain(ChainBase, ConfigReloadMixin, metaclass=Singleton):
                             extension=file_path.suffix.lstrip("."),
                         ),
                         mediainfo=mediainfo,
-                        downloader=torrent.downloader,
-                        download_hash=torrent.hash,
-                    )
+                            downloader=torrent.downloader,
+                            download_hash=torrent.hash,
+                        )
+                    if progress_callback:
+                        progress_callback(
+                            value=index / total_num * 100,
+                            text=f"下载任务（{index}/{total_num}）整理处理完成",
+                            data={"total": total_num, "finished": index},
+                        )
 
             finally:
                 torrents.clear()
@@ -2004,6 +2323,31 @@ class TransferChain(ChainBase, ConfigReloadMixin, metaclass=Singleton):
         return None
 
     @staticmethod
+    def _is_movie_year_conflict(
+            file_meta: MetaBase, media: Union[DownloadHistory, MediaInfo]
+    ) -> bool:
+        """
+        判断文件名年份是否与已识别电影年份冲突。
+
+        多电影合集只保存一条下载历史，不能把合集首部电影的媒体 ID 套用到其它年份的文件；
+        电视剧季包仍应继续复用同一条下载历史。
+        """
+        file_year = getattr(file_meta, "year", None)
+        media_year = getattr(media, "year", None)
+        if not file_meta or not media or not file_year or not media_year:
+            return False
+        media_type = getattr(media, "type", None)
+        if not isinstance(media_type, MediaType):
+            try:
+                media_type = MediaType(media_type)
+            except (TypeError, ValueError):
+                return False
+        return (
+            media_type == MediaType.MOVIE
+            and str(file_year) != str(media_year)
+        )
+
+    @staticmethod
     def __optional_attr_equal(
             source: MetaBase,
             target: MetaBase,
@@ -2053,69 +2397,67 @@ class TransferChain(ChainBase, ConfigReloadMixin, metaclass=Singleton):
                 return False
         return True
 
-    def __get_sync_extra_fileitems(
+    @staticmethod
+    def __get_file_key(fileitem: FileItem) -> Tuple[str, str]:
+        """
+        获取文件缓存键。
+        """
+        normalized_path = Path(str(fileitem.path).replace("\\", "/")).as_posix()
+        return fileitem.storage or "local", normalized_path
+
+    @staticmethod
+    def __get_file_stem(fileitem: FileItem) -> str:
+        """
+        获取文件主干名，用于判断同名附加文件。
+        """
+        file_name = fileitem.name or Path(fileitem.path).name
+        return Path(file_name).stem.lower()
+
+    @classmethod
+    def __get_subtitle_media_stem(cls, subtitle_fileitem: FileItem) -> str:
+        """
+        获取字幕对应主视频的候选主干名。
+        """
+        current_stem = cls.__get_file_stem(subtitle_fileitem)
+        while current_stem:
+            media_stem, separator, suffix = current_stem.rpartition(".")
+            if not separator or suffix not in SUBTITLE_STEM_TAGS:
+                return current_stem
+            current_stem = media_stem
+        return current_stem
+
+    def __get_extra_media_stem(self, extra_fileitem: FileItem) -> str:
+        """
+        获取附加文件对应主视频的候选主干名。
+        """
+        if self.__is_subtitle_file(extra_fileitem):
+            return self.__get_subtitle_media_stem(extra_fileitem)
+        return self.__get_file_stem(extra_fileitem)
+
+    def __get_related_main_file_key(
             self,
-            main_fileitem: FileItem,
-            main_meta: MetaBase,
-            meta_factory: Callable[[Path], Optional[MetaBase]],
-            predicate: Optional[Callable[[FileItem, bool], bool]] = None,
-            extra_cache: Optional[Dict[Tuple[str, str], List[FileItem]]] = None,
-    ) -> List[Tuple[FileItem, bool]]:
+            extra_fileitem: FileItem,
+            main_fileitems: List[FileItem],
+    ) -> Optional[Tuple[str, str]]:
         """
-        获取与当前主视频识别信息一致的同目录附加文件。
+        获取与附加文件名完全匹配的主视频键。
         """
-        if (
-                not main_fileitem
-                or main_fileitem.type != "file"
-                or not self.__is_media_file(main_fileitem)
-                or not main_meta
+        if not (
+                self.__is_subtitle_file(extra_fileitem)
+                or self.__is_audio_file(extra_fileitem)
         ):
-            return []
+            return None
 
-        parent_key = self.__get_file_parent_key(main_fileitem)
-        if extra_cache is not None and parent_key in extra_cache:
-            extra_candidates = extra_cache[parent_key]
-        else:
-            storagechain = StorageChain()
-            parent_item = storagechain.get_parent_item(main_fileitem)
-            if not parent_item:
-                logger.debug(f"{main_fileitem.path} 未找到父目录，跳过同步整理附加文件")
-                return []
+        extra_media_stem = self.__get_extra_media_stem(extra_fileitem)
+        matched_items: List[FileItem] = []
+        for main_fileitem in main_fileitems:
+            main_stem = self.__get_file_stem(main_fileitem)
+            if main_stem and main_stem == extra_media_stem:
+                matched_items.append(main_fileitem)
 
-            parent_key = self.__get_dir_key(parent_item)
-            extra_candidates: List[FileItem] = []
-            for item in storagechain.list_files(parent_item, recursion=False) or []:
-                if (
-                        not item
-                        or item.type != "file"
-                        or not (
-                            self.__is_subtitle_file(item)
-                            or self.__is_audio_file(item)
-                        )
-                ):
-                    continue
-                if predicate and not predicate(item, False):
-                    continue
-
-                extra_candidates.append(item)
-
-            if extra_cache is not None:
-                extra_cache[parent_key] = extra_candidates
-
-        extra_fileitems: List[Tuple[FileItem, bool]] = []
-        for item in extra_candidates:
-            if item.path == main_fileitem.path:
-                continue
-            extra_meta = meta_factory(Path(item.path))
-            # 不能直接按文件名判断归属，必须基于解析后的媒体身份和季集信息。
-            if self.__is_same_media_meta(main_meta, extra_meta):
-                extra_fileitems.append((item, False))
-
-        if extra_fileitems:
-            logger.info(
-                f"{main_fileitem.path} 同步匹配到 {len(extra_fileitems)} 个附加文件"
-            )
-        return extra_fileitems
+        if len(matched_items) != 1:
+            return None
+        return self.__get_file_key(matched_items[0])
 
     @staticmethod
     def __normalize_dir_path(dir_path: Union[str, Path]) -> str:
@@ -2140,6 +2482,32 @@ class TransferChain(ChainBase, ConfigReloadMixin, metaclass=Singleton):
             self.__normalize_dir_path(Path(current_item.path).parent),
         )
 
+    @staticmethod
+    def _get_subscribe_custom_words(
+            history_record: Optional[DownloadHistory],
+    ) -> Optional[List[str]]:
+        """
+        获取整理用自定义识别词：优先使用下载时保存的快照，无快照（历史旧记录）时再按来源实时反查订阅。
+
+        快照优先可避免整理阶段因订阅季号漂移、来源解析失败或订阅完成被删导致识别词丢失，从而原样入库到偏移前的季集。
+        """
+        if not history_record:
+            return None
+        # 下载时保存的完整订阅识别词快照优先
+        if history_record.custom_words:
+            return history_record.custom_words.split("\n")
+        # 兜底：历史旧记录无快照时，按下载来源实时反查订阅
+        if not isinstance(history_record.note, dict):
+            return None
+        subscribe = SubscribeChain().get_subscribe_by_source(
+            history_record.note.get("source")
+        )
+        return (
+            subscribe.custom_words.split("\n")
+            if subscribe and subscribe.custom_words
+            else None
+        )
+
     def do_transfer(
             self,
             fileitem: FileItem,
@@ -2162,6 +2530,7 @@ class TransferChain(ChainBase, ConfigReloadMixin, metaclass=Singleton):
             manual: Optional[bool] = False,
             preview: Optional[bool] = False,
             sync_extra_files: Optional[bool] = False,
+            cleanup_dest_fileitem: Optional[FileItem] = None,
             continue_callback: Callable = None,
     ) -> Tuple[bool, Union[str, dict]]:
         """
@@ -2186,6 +2555,7 @@ class TransferChain(ChainBase, ConfigReloadMixin, metaclass=Singleton):
         :param manual: 是否手动整理
         :param preview: 是否仅预览
         :param sync_extra_files: 是否在整理主视频文件时同步整理同媒体附加文件
+        :param cleanup_dest_fileitem: 确认存在待整理任务后需要清理的旧目标文件
         :param continue_callback: 继续处理回调
         返回：成功标识，错误信息
         """
@@ -2195,8 +2565,8 @@ class TransferChain(ChainBase, ConfigReloadMixin, metaclass=Singleton):
         if preview:
             # 预览模式始终同步执行，避免进入异步队列
             background = False
-
         # 自定义格式
+        has_episode_format_template = bool(epformat and epformat.format)
         formaterHandler = (
             FormatParser(
                 eformat=epformat.format,
@@ -2214,24 +2584,7 @@ class TransferChain(ChainBase, ConfigReloadMixin, metaclass=Singleton):
         )
         # 汇总错误信息
         err_msgs: List[str] = []
-
-        def _get_subscribe_custom_words(
-                history_record: Optional[DownloadHistory],
-        ) -> Optional[List[str]]:
-            """
-            根据下载记录获取订阅自定义识别词。
-            """
-            if not history_record or not isinstance(history_record.note, dict):
-                return None
-            # 使用source动态获取订阅
-            subscribe = SubscribeChain().get_subscribe_by_source(
-                history_record.note.get("source")
-            )
-            return (
-                subscribe.custom_words.split("\n")
-                if subscribe and subscribe.custom_words
-                else None
-            )
+        matched_episode_format_template = False
 
         def _build_file_meta(
                 source_path: Path,
@@ -2245,6 +2598,10 @@ class TransferChain(ChainBase, ConfigReloadMixin, metaclass=Singleton):
             )
             if not built_meta:
                 return None
+            if not meta:
+                # _build_path_meta 已经应用过手动季集/自定义格式覆盖；
+                # 这里避免再次偏移集数，导致手动整理的集数偏移翻倍。
+                return built_meta
             return _apply_meta_overrides(built_meta, source_path)
 
         def _build_path_meta(
@@ -2286,17 +2643,20 @@ class TransferChain(ChainBase, ConfigReloadMixin, metaclass=Singleton):
 
             return current_meta
 
-        def _filter(item: FileItem, is_bluray_dir: bool) -> bool:
+        def _is_allowed_transfer_item(item: FileItem, is_bluray_dir: bool) -> bool:
             """
-            过滤文件项
+            判断候选文件项是否允许进入整理规划。
 
             :return: True 表示保留，False 表示排除
             """
+            nonlocal matched_episode_format_template
             if continue_callback and not continue_callback():
                 raise OperationInterrupted()
-            # 有集自定义格式，过滤文件
-            if formaterHandler and not formaterHandler.match(item.name):
-                return False
+            # 存在集数定位模板时，模板匹配结果作为手动整理的硬过滤条件。
+            if has_episode_format_template and formaterHandler:
+                if not formaterHandler.match(item.name):
+                    return False
+                matched_episode_format_template = True
             # 过滤后缀和大小（蓝光目录、附加文件不过滤）
             if (
                     not is_bluray_dir
@@ -2323,109 +2683,290 @@ class TransferChain(ChainBase, ConfigReloadMixin, metaclass=Singleton):
                 return False
             return True
 
+        def _keep_candidate_item(item: FileItem, is_bluray_dir: bool) -> bool:
+            """
+            收集候选文件时仅检查中断状态，不套用整理业务过滤。
+            """
+            if continue_callback and not continue_callback():
+                raise OperationInterrupted()
+            return True
+
+        def _collect_candidate_file_items() -> List[Tuple[FileItem, bool]]:
+            """
+            收集来源下的候选文件项，不在此阶段套用整理业务过滤。
+            """
+            return self.__get_trans_fileitems(fileitem, predicate=_keep_candidate_item)
+
+        def _filter_allowed_file_items(
+                candidates: List[Tuple[FileItem, bool]]
+        ) -> List[Tuple[FileItem, bool]]:
+            """
+            将候选文件项筛选为本轮允许整理的文件项。
+            """
+            return [
+                (candidate_item, candidate_bluray_dir)
+                for candidate_item, candidate_bluray_dir in candidates
+                if _is_allowed_transfer_item(candidate_item, candidate_bluray_dir)
+            ]
+
+        def _build_main_meta(
+                main_fileitem: FileItem,
+                main_bluray_dir: bool,
+                download_history_oper: DownloadHistoryOper,
+        ) -> Optional[MetaBase]:
+            """
+            构建主视频元数据。
+            """
+            main_path = Path(main_fileitem.path)
+            main_download_history = self._resolve_download_history(
+                downloadhis=download_history_oper,
+                file_path=main_path,
+                bluray_dir=main_bluray_dir,
+                download_hash=download_hash,
+            )
+            return _build_file_meta(
+                main_path,
+                custom_word_list=self._get_subscribe_custom_words(main_download_history),
+            )
+
+        def _append_item(
+                planned_items: List[Tuple[FileItem, bool]],
+                seen_file_keys: set[Tuple[str, str]],
+                item: FileItem,
+                is_bluray_dir: bool,
+        ) -> bool:
+            """
+            添加待整理文件项并去重。
+            """
+            file_key = self.__get_file_key(item)
+            if file_key in seen_file_keys:
+                return False
+            planned_items.append((item, is_bluray_dir))
+            seen_file_keys.add(file_key)
+            return True
+
+        def _build_directory_index(
+                items: List[Tuple[FileItem, bool]]
+        ) -> Tuple[
+            Dict[Tuple[str, str], List[FileItem]],
+            Dict[Tuple[str, str], List[Tuple[FileItem, bool]]],
+        ]:
+            """
+            基于已遍历结果构建同目录主视频和附加文件索引。
+            """
+            main_items_by_dir: Dict[Tuple[str, str], List[FileItem]] = {}
+            extra_items_by_dir: Dict[Tuple[str, str], List[Tuple[FileItem, bool]]] = {}
+            for item, is_bluray_dir in items:
+                if not item or item.type != "file":
+                    continue
+                dir_key = self.__get_file_parent_key(item)
+                if not is_bluray_dir and self.__is_media_file(item):
+                    main_items_by_dir.setdefault(dir_key, []).append(item)
+                elif self.__is_subtitle_file(item) or self.__is_audio_file(item):
+                    extra_items_by_dir.setdefault(dir_key, []).append((item, is_bluray_dir))
+            return main_items_by_dir, extra_items_by_dir
+
+        def _get_single_file_sibling_items(
+                current_fileitem: FileItem,
+        ) -> Tuple[List[FileItem], List[Tuple[FileItem, bool]]]:
+            """
+            单文件整理时只额外读取一次父目录，收集同目录主视频和附加文件。
+            """
+            storagechain = StorageChain()
+            if not hasattr(storagechain, "get_parent_item") or not hasattr(
+                    storagechain, "list_files"
+            ):
+                return [], []
+            parent_item = storagechain.get_parent_item(current_fileitem)
+            if not parent_item:
+                return [], []
+            main_fileitems: List[FileItem] = []
+            extra_items: List[Tuple[FileItem, bool]] = []
+            for item in storagechain.list_files(parent_item, recursion=False) or []:
+                if not item or item.type != "file":
+                    continue
+                if self.__is_media_file(item):
+                    main_fileitems.append(item)
+                    continue
+                if not (self.__is_subtitle_file(item) or self.__is_audio_file(item)):
+                    continue
+                if not _is_allowed_transfer_item(item, False):
+                    continue
+                extra_items.append((item, False))
+            return main_fileitems, extra_items
+
+        def _plan_file_items(
+                items: List[Tuple[FileItem, bool]]
+        ) -> Tuple[List[Tuple[FileItem, bool]], Dict[Tuple[str, str], MetaBase]]:
+            """
+            生成最终整理顺序：主视频优先，同名附加文件跟随，剩余附加文件最后处理。
+            """
+            if not items:
+                return [], {}
+
+            download_history_oper = DownloadHistoryOper()
+            inherited_map: Dict[Tuple[str, str], MetaBase] = {}
+            main_items_by_dir, extra_items_by_dir = _build_directory_index(items)
+            main_items = [
+                (item, is_bluray_dir)
+                for item, is_bluray_dir in items
+                if item
+                and (is_bluray_dir or (item.type == "file" and self.__is_media_file(item)))
+            ]
+
+            single_file_mode = len(items) == 1 and fileitem.type == "file"
+            if single_file_mode:
+                current_item, current_bluray_dir = items[0]
+                if current_item.type == "file":
+                    sibling_main_items, sibling_extra_items = _get_single_file_sibling_items(
+                        current_item
+                    )
+                    current_dir_key = self.__get_file_parent_key(current_item)
+                    if not current_bluray_dir and self.__is_media_file(current_item):
+                        main_items = [(current_item, current_bluray_dir)]
+                        main_items_by_dir[current_dir_key] = [current_item]
+                        extra_items_by_dir[current_dir_key] = sibling_extra_items
+                    elif self.__is_subtitle_file(current_item) or self.__is_audio_file(current_item):
+                        related_main_file_key = self.__get_related_main_file_key(
+                            extra_fileitem=current_item,
+                            main_fileitems=sibling_main_items,
+                        )
+                        related_main_fileitem = next(
+                            (
+                                main_item
+                                for main_item in sibling_main_items
+                                if self.__get_file_key(main_item) == related_main_file_key
+                            ),
+                            None,
+                        )
+                        if related_main_fileitem:
+                            main_meta = _build_main_meta(
+                                related_main_fileitem,
+                                False,
+                                download_history_oper,
+                            )
+                            if main_meta:
+                                inherited_map[self.__get_file_key(current_item)] = deepcopy(main_meta)
+                        return list(items), inherited_map
+
+            if not main_items:
+                return list(items), inherited_map
+
+            planned_items: List[Tuple[FileItem, bool]] = []
+            seen_file_keys: set[Tuple[str, str]] = set()
+            extra_meta_cache: Dict[Tuple[str, Tuple[str, ...]], Optional[MetaBase]] = {}
+
+            def _get_cached_extra_meta(
+                    extra_path: Path,
+                    custom_word_list: Optional[List[str]],
+            ) -> Optional[MetaBase]:
+                """
+                同一组识别词下的附加文件只解析一次。
+                """
+                custom_words_key = tuple(custom_word_list or [])
+                cache_key = (extra_path.as_posix(), custom_words_key)
+                if cache_key not in extra_meta_cache:
+                    extra_meta_cache[cache_key] = _build_path_meta(
+                        extra_path,
+                        custom_word_list=list(custom_words_key) or None,
+                    )
+                return extra_meta_cache[cache_key]
+
+            for main_item, main_bluray_dir in main_items:
+                _append_item(planned_items, seen_file_keys, main_item, main_bluray_dir)
+                if main_bluray_dir or not self.__is_media_file(main_item):
+                    continue
+
+                main_path = Path(main_item.path)
+                main_download_history = self._resolve_download_history(
+                    downloadhis=download_history_oper,
+                    file_path=main_path,
+                    bluray_dir=main_bluray_dir,
+                    download_hash=download_hash,
+                )
+                subscribe_custom_words = self._get_subscribe_custom_words(
+                    main_download_history
+                )
+                main_meta = _build_file_meta(
+                    main_path,
+                    custom_word_list=subscribe_custom_words,
+                )
+                if not main_meta:
+                    continue
+
+                dir_key = self.__get_file_parent_key(main_item)
+                main_fileitems = main_items_by_dir.get(dir_key) or [main_item]
+                main_file_key = self.__get_file_key(main_item)
+                for extra_item, extra_bluray_dir in extra_items_by_dir.get(dir_key, []):
+                    if self.__get_file_key(extra_item) in seen_file_keys:
+                        continue
+                    related_main_file_key = self.__get_related_main_file_key(
+                        extra_fileitem=extra_item,
+                        main_fileitems=main_fileitems,
+                    )
+                    if related_main_file_key:
+                        if related_main_file_key == main_file_key:
+                            if _append_item(
+                                    planned_items,
+                                    seen_file_keys,
+                                    extra_item,
+                                    extra_bluray_dir,
+                            ):
+                                inherited_map[self.__get_file_key(extra_item)] = deepcopy(main_meta)
+                        continue
+
+                    if single_file_mode or not sync_extra_files:
+                        continue
+
+                    extra_meta = _get_cached_extra_meta(
+                        Path(extra_item.path),
+                        subscribe_custom_words,
+                    )
+                    if not self.__is_same_media_meta(main_meta, extra_meta):
+                        continue
+                    if _append_item(
+                            planned_items,
+                            seen_file_keys,
+                            extra_item,
+                            extra_bluray_dir,
+                    ):
+                        inherited_map[self.__get_file_key(extra_item)] = deepcopy(extra_meta)
+
+            for item, is_bluray_dir in items:
+                _append_item(planned_items, seen_file_keys, item, is_bluray_dir)
+
+            return planned_items, inherited_map
+
+        candidate_file_items: List[Tuple[FileItem, bool]] = []
         try:
-            # 获取经过筛选后的待整理文件项列表
-            file_items = self.__get_trans_fileitems(fileitem, predicate=_filter)
+            candidate_file_items = _collect_candidate_file_items()
+            file_items = _filter_allowed_file_items(candidate_file_items)
         except OperationInterrupted:
             return False, f"{fileitem.name} 已取消"
+        finally:
+            candidate_file_items.clear()
 
         if not file_items:
+            if has_episode_format_template and not matched_episode_format_template:
+                logger.info(f"{fileitem.path} 未匹配到集数定位模板，跳过整理")
+                if preview:
+                    return True, {
+                        "summary": {"total": 0, "success": 0, "failed": 0},
+                        "items": [],
+                        "message": "",
+                    }
+                return True, ""
             logger.warn(f"{fileitem.path} 没有找到可整理的媒体文件")
             return False, f"{fileitem.name} 没有找到可整理的媒体文件"
 
-        if sync_extra_files:
-            # 单文件和目录整理都按“主视频 -> 同媒体附加文件”补齐；目录场景会逐个视频处理。
-            extra_file_cache: Dict[Tuple[str, str], List[FileItem]] = {}
-            main_file_items: List[Tuple[FileItem, bool]] = []
-            for candidate_item, candidate_bluray_dir in file_items:
-                if not candidate_item:
-                    continue
-                if candidate_bluray_dir or self.__is_media_file(candidate_item):
-                    main_file_items.append((candidate_item, candidate_bluray_dir))
-                    continue
-                if (
-                        candidate_item.type == "file"
-                        and (
-                            self.__is_subtitle_file(candidate_item)
-                            or self.__is_audio_file(candidate_item)
-                        )
-                ):
-                    # 目录递归阶段已拿到附加文件时，直接填入父目录缓存，避免后续重复列目录。
-                    extra_file_cache.setdefault(
-                        self.__get_file_parent_key(candidate_item), []
-                    ).append(candidate_item)
-
-            if main_file_items:
-                file_items = list(main_file_items)
-                seen_file_keys = {
-                    (item.storage, item.path)
-                    for item, _ in file_items
-                    if item and item.path
-                }
-                downloadhis = DownloadHistoryOper()
-                extra_meta_cache: Dict[
-                    Tuple[str, Tuple[str, ...]], Optional[MetaBase]
-                ] = {}
-
-                def _get_cached_extra_meta(
-                        extra_path: Path, custom_words_key: Tuple[str, ...]
-                ) -> Optional[MetaBase]:
-                    """
-                    同一个父目录下的附加文件只解析一次，多个主视频只做内存匹配。
-                    """
-                    cache_key = (extra_path.as_posix(), custom_words_key)
-                    if cache_key not in extra_meta_cache:
-                        extra_meta_cache[cache_key] = _build_path_meta(
-                            extra_path,
-                            custom_word_list=list(custom_words_key) or None,
-                        )
-                    return extra_meta_cache[cache_key]
-
-                def _build_extra_meta_factory(
-                        custom_word_list: Optional[List[str]],
-                ) -> Callable[[Path], Optional[MetaBase]]:
-                    """
-                    将可变识别词列表转成不可变缓存键，避免闭包默认参数持有可变对象。
-                    """
-                    custom_words_key = tuple(custom_word_list or [])
-
-                    def _extra_meta_factory(extra_path: Path) -> Optional[MetaBase]:
-                        return _get_cached_extra_meta(extra_path, custom_words_key)
-
-                    return _extra_meta_factory
-
-                for main_item, main_bluray_dir in list(main_file_items):
-                    if main_bluray_dir or not self.__is_media_file(main_item):
-                        continue
-
-                    main_path = Path(main_item.path)
-                    main_download_history = self._resolve_download_history(
-                        downloadhis=downloadhis,
-                        file_path=main_path,
-                        bluray_dir=main_bluray_dir,
-                        download_hash=download_hash,
-                    )
-                    subscribe_custom_words = _get_subscribe_custom_words(
-                        main_download_history
-                    )
-                    main_meta = _build_file_meta(
-                        main_path, custom_word_list=subscribe_custom_words
-                    )
-                    extra_items = self.__get_sync_extra_fileitems(
-                        main_fileitem=main_item,
-                        main_meta=main_meta,
-                        meta_factory=_build_extra_meta_factory(subscribe_custom_words),
-                        predicate=_filter,
-                        extra_cache=extra_file_cache,
-                    )
-                    for extra_item, extra_bluray_dir in extra_items:
-                        extra_key = (extra_item.storage, extra_item.path)
-                        if extra_key in seen_file_keys:
-                            continue
-                        file_items.append((extra_item, extra_bluray_dir))
-                        seen_file_keys.add(extra_key)
+        file_items, inherited_meta_map = _plan_file_items(file_items)
 
         planned_file_count = len(file_items)
+        if cleanup_dest_fileitem and planned_file_count and not preview:
+            state = StorageChain().delete_media_file(cleanup_dest_fileitem)
+            if not state:
+                return False, f"{cleanup_dest_fileitem.path} 删除失败"
+
         if preview:
             logger.info(f"正在预览 {planned_file_count} 个文件的整理路径...")
         else:
@@ -2475,10 +3016,16 @@ class TransferChain(ChainBase, ConfigReloadMixin, metaclass=Singleton):
 
                 if not meta:
                     # 文件元数据(优先使用订阅识别词)
-                    file_meta = _build_file_meta(
-                        file_path,
-                        custom_word_list=_get_subscribe_custom_words(download_history),
+                    inherited_meta = inherited_meta_map.get(
+                        self.__get_file_key(file_item)
                     )
+                    if inherited_meta:
+                        file_meta = deepcopy(inherited_meta)
+                    else:
+                        file_meta = _build_file_meta(
+                            file_path,
+                            custom_word_list=self._get_subscribe_custom_words(download_history),
+                        )
                 else:
                     file_meta = _build_file_meta(file_path)
 
@@ -2496,11 +3043,19 @@ class TransferChain(ChainBase, ConfigReloadMixin, metaclass=Singleton):
                     _downloader = downloader
                     _download_hash = download_hash
 
+                # 自动整理预载的媒体信息来自整条下载历史；电影合集内文件年份冲突时逐文件识别。
+                task_mediainfo = mediainfo
+                if (
+                        not manual
+                        and self._is_movie_year_conflict(file_meta, task_mediainfo)
+                ):
+                    task_mediainfo = None
+
                 # 后台整理
                 transfer_task = TransferTask(
                     fileitem=file_item,
                     meta=file_meta,
-                    mediainfo=mediainfo,
+                    mediainfo=task_mediainfo,
                     target_directory=target_directory,
                     target_storage=target_storage,
                     target_path=target_path,
@@ -2554,6 +3109,10 @@ class TransferChain(ChainBase, ConfigReloadMixin, metaclass=Singleton):
                     "episode": item_meta.begin_episode if item_meta else None,
                     "episode_end": item_meta.end_episode if item_meta else None,
                     "part": item_meta.part if item_meta else None,
+                    "org_string": item_meta.org_string if item_meta else None,
+                    "apply_words": item_meta.apply_words if item_meta else [],
+                    "resource_team": item_meta.resource_team if item_meta else None,
+                    "customization": item_meta.customization if item_meta else None,
                 }
             )
             return transferinfo.success, transferinfo.message
@@ -2629,6 +3188,10 @@ class TransferChain(ChainBase, ConfigReloadMixin, metaclass=Singleton):
                                     "episode": transfer_task.meta.begin_episode if transfer_task.meta else None,
                                     "episode_end": transfer_task.meta.end_episode if transfer_task.meta else None,
                                     "part": transfer_task.meta.part if transfer_task.meta else None,
+                                    "org_string": transfer_task.meta.org_string if transfer_task.meta else None,
+                                    "apply_words": transfer_task.meta.apply_words if transfer_task.meta else [],
+                                    "resource_team": transfer_task.meta.resource_team if transfer_task.meta else None,
+                                    "customization": transfer_task.meta.customization if transfer_task.meta else None,
                                 }
                             )
                         fail_num += 1
@@ -2699,6 +3262,7 @@ class TransferChain(ChainBase, ConfigReloadMixin, metaclass=Singleton):
                     title="请输入正确的命令格式：/redo [id] 或 /redo [id] [tmdbid/豆瓣id]|[类型]，"
                           "[id] 为整理记录编号",
                     userid=userid,
+                    save_history=False,
                 )
             )
 
@@ -2725,6 +3289,7 @@ class TransferChain(ChainBase, ConfigReloadMixin, metaclass=Singleton):
                         text=errmsg,
                         userid=userid,
                         link=settings.MP_DOMAIN("#/history"),
+                        save_history=False,
                     )
                 )
             return
@@ -2751,6 +3316,7 @@ class TransferChain(ChainBase, ConfigReloadMixin, metaclass=Singleton):
                     text=errmsg,
                     userid=userid,
                     link=settings.MP_DOMAIN("#/history"),
+                    save_history=False,
                 )
             )
             return
@@ -2863,6 +3429,8 @@ class TransferChain(ChainBase, ConfigReloadMixin, metaclass=Singleton):
             downloader: Optional[str] = None,
             download_hash: Optional[str] = None,
             preview: Optional[bool] = False,
+            sync_extra_files: Optional[bool] = True,
+            cleanup_dest_fileitem: Optional[FileItem] = None,
     ) -> Tuple[bool, Union[str, dict]]:
         """
         手动整理，支持复杂条件，带进度显示
@@ -2885,6 +3453,8 @@ class TransferChain(ChainBase, ConfigReloadMixin, metaclass=Singleton):
         :param downloader: 下载器名称
         :param download_hash: 下载任务哈希
         :param preview: 是否仅预览
+        :param sync_extra_files: 是否同步整理同媒体附加文件
+        :param cleanup_dest_fileitem: 确认存在待整理任务后需要清理的旧目标文件
         """
         logger.info(f"手动整理：{fileitem.path} ...")
         if tmdbid or doubanid:
@@ -2924,6 +3494,8 @@ class TransferChain(ChainBase, ConfigReloadMixin, metaclass=Singleton):
                 downloader=downloader,
                 download_hash=download_hash,
                 preview=preview,
+                sync_extra_files=sync_extra_files,
+                cleanup_dest_fileitem=cleanup_dest_fileitem,
             )
             if not state:
                 return False, errmsg
@@ -2949,6 +3521,8 @@ class TransferChain(ChainBase, ConfigReloadMixin, metaclass=Singleton):
                 downloader=downloader,
                 download_hash=download_hash,
                 preview=preview,
+                sync_extra_files=sync_extra_files,
+                cleanup_dest_fileitem=cleanup_dest_fileitem,
             )
             return state, errmsg
 
@@ -2958,10 +3532,17 @@ class TransferChain(ChainBase, ConfigReloadMixin, metaclass=Singleton):
             mediainfo: MediaInfo,
             transferinfo: TransferInfo,
             season_episode: Optional[str] = None,
+            episodes_info: Optional[List[TmdbEpisode]] = None,
             username: Optional[str] = None,
     ):
         """
         发送入库成功的消息
+        :param meta: 文件元数据
+        :param mediainfo: 识别的媒体信息
+        :param transferinfo: 文件整理信息
+        :param season_episode: 已入库季集文本
+        :param episodes_info: 当前季的全部集信息
+        :param username: 用户名
         """
         self.post_message(
             Notification(
@@ -2975,6 +3556,7 @@ class TransferChain(ChainBase, ConfigReloadMixin, metaclass=Singleton):
             mediainfo=mediainfo,
             transferinfo=transferinfo,
             season_episode=season_episode,
+            episodes_info=episodes_info,
             username=username,
         )
 

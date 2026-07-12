@@ -5,9 +5,10 @@ from typing import Optional, Type
 from pydantic import BaseModel, Field
 
 from app.agent.tools.base import MoviePilotTool
+from app.agent.tools.tags import ToolTag
 from app.core.event import eventmanager
 from app.db.subscribe_oper import SubscribeOper
-from app.helper.subscribe import SubscribeHelper
+from app.helper.server import MoviePilotServerHelper
 from app.log import logger
 from app.schemas.types import EventType
 
@@ -15,10 +16,6 @@ from app.schemas.types import EventType
 class DeleteSubscribeInput(BaseModel):
     """删除订阅工具的输入参数模型"""
 
-    explanation: str = Field(
-        ...,
-        description="Clear explanation of why this tool is being used in the current context",
-    )
     subscribe_id: int = Field(
         ...,
         description="The ID of the subscription to delete (can be obtained from query_subscribes tool)",
@@ -27,6 +24,11 @@ class DeleteSubscribeInput(BaseModel):
 
 class DeleteSubscribeTool(MoviePilotTool):
     name: str = "delete_subscribe"
+    tags: list[str] = [
+        ToolTag.Write,
+        ToolTag.Subscription,
+        ToolTag.Admin,
+    ]
     description: str = "Delete a media subscription by its ID. This will remove the subscription and stop automatic downloads for that media."
     args_schema: Type[BaseModel] = DeleteSubscribeInput
     require_admin: bool = True
@@ -51,7 +53,7 @@ class DeleteSubscribeTool(MoviePilotTool):
 
             await subscribe_oper.async_delete(subscribe_id)
             # 分享订阅统计刷新本身已异步化，这里只需要在删除后触发即可。
-            SubscribeHelper().sub_done_async(
+            MoviePilotServerHelper.sub_done_async(
                 {"tmdbid": subscribe.tmdbid, "doubanid": subscribe.doubanid}
             )
 

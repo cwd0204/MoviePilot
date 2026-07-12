@@ -232,7 +232,7 @@ python_install_hint() {
       ;;
     Linux*)
       echo "脚本已尝试自动安装 Git、curl 和 Python 3.11+。" >&2
-      echo "如果自动安装失败，请先安装 Git、curl 和 Python 3.11+，并确保包含 venv 模块。" >&2
+      echo "如果自动安装失败，请先安装 Git、curl、Python 3.11+，并确保包含 venv 模块。" >&2
       echo "例如 Debian/Ubuntu: sudo apt install git curl python3.11 python3.11-venv" >&2
       echo "例如 Fedora/RHEL:  sudo dnf install git curl python3.11" >&2
       ;;
@@ -240,7 +240,7 @@ python_install_hint() {
       echo "推荐在 WSL、Linux 或 macOS 终端中运行此脚本。" >&2
       ;;
     *)
-      echo "请先安装 Git、curl 和 Python 3.11 或更高版本。" >&2
+      echo "请先安装 Git、curl、Python 3.11 或更高版本。" >&2
       ;;
   esac
 }

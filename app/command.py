@@ -28,6 +28,18 @@ class CommandChain(ChainBase):
     pass
 
 
+def _finish_command_processing_status(status: Optional[dict], user_id: Optional[str] = None) -> None:
+    """
+    命令执行完成后通过消息模块收口渠道处理状态。
+    """
+    if not status:
+        return
+    CommandChain().finish_message_processing_status(
+        status=status,
+        userid=user_id,
+    )
+
+
 class Command(metaclass=Singleton):
     """
     全局命令管理，消费事件
@@ -340,6 +352,14 @@ class Command(metaclass=Singleton):
         """
         获取命令列表
         """
+        if not self._commands:
+            with self._rlock:
+                if not self._commands:
+                    self._commands = {
+                        **self._preset_commands,
+                        **self._plugin_commands,
+                        **self._other_commands,
+                    }
         return self._commands
 
     def get(self, cmd: str) -> Any:
@@ -434,17 +454,23 @@ class Command(metaclass=Singleton):
         event_source = event.event_data.get("source")
         # 消息用户
         event_user = event.event_data.get("user")
-        if event_str:
-            cmd = event_str.split()[0]
-            args = " ".join(event_str.split()[1:])
-            if self.get(cmd):
-                self.execute(
-                    cmd=cmd,
-                    data_str=args,
-                    channel=event_channel,
-                    source=event_source,
-                    userid=event_user,
-                )
+        try:
+            if event_str:
+                cmd = event_str.split()[0]
+                args = " ".join(event_str.split()[1:])
+                if self.get(cmd):
+                    self.execute(
+                        cmd=cmd,
+                        data_str=args,
+                        channel=event_channel,
+                        source=event_source,
+                        userid=event_user,
+                    )
+        finally:
+            _finish_command_processing_status(
+                event.event_data.get("processing_status"),
+                user_id=event_user,
+            )
 
     @eventmanager.register(EventType.ModuleReload)
     def module_reload_event(self, _: ManagerEvent) -> None:

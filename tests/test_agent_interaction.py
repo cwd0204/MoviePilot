@@ -1,6 +1,6 @@
 import asyncio
 import unittest
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 from app.agent.prompt import prompt_manager
 from app.agent.tools.factory import MoviePilotToolFactory
@@ -8,11 +8,13 @@ from app.agent.tools.impl.ask_user_choice import (
     AskUserChoiceTool,
     UserChoiceOptionInput,
 )
+from app.agent.tools.impl.send_message import SendMessageTool
 from app.helper.interaction import (
     AgentInteractionOption,
     agent_interaction_manager,
 )
 from app.chain.message import MessageChain
+from app.core.config import settings
 from app.schemas.types import MessageChannel
 
 
@@ -24,12 +26,30 @@ class TestAgentInteraction(unittest.TestCase):
         telegram_prompt = prompt_manager.get_agent_prompt(
             channel=MessageChannel.Telegram.value
         )
+        web_agent_prompt = prompt_manager.get_agent_prompt(
+            channel=MessageChannel.WebAgent.value
+        )
         wechat_prompt = prompt_manager.get_agent_prompt(
             channel=MessageChannel.Wechat.value
         )
 
         self.assertIn("ask_user_choice", telegram_prompt)
+        self.assertIn("ask_user_choice", web_agent_prompt)
+        self.assertIn("terminal interaction tool", telegram_prompt)
+        self.assertIn("do not write a final text reply after it", telegram_prompt)
         self.assertNotIn("ask_user_choice", wechat_prompt)
+
+    def test_prompt_does_not_inject_send_message_html_hint(self):
+        telegram_prompt = prompt_manager.get_agent_prompt(
+            channel=MessageChannel.Telegram.value
+        )
+        wechat_prompt = prompt_manager.get_agent_prompt(
+            channel=MessageChannel.Wechat.value
+        )
+
+        self.assertNotIn("parse_mode=\"HTML\"", telegram_prompt)
+        self.assertNotIn("Telegram-supported HTML tags", telegram_prompt)
+        self.assertNotIn("parse_mode=\"HTML\"", wechat_prompt)
 
     def test_factory_injects_choice_tool_only_for_button_channels(self):
         with patch(
@@ -43,6 +63,13 @@ class TestAgentInteraction(unittest.TestCase):
                 source="telegram-test",
                 username="tester",
             )
+            web_agent_tools = MoviePilotToolFactory.create_tools(
+                session_id="session-web",
+                user_id="10001",
+                channel=MessageChannel.WebAgent.value,
+                source="web-agent",
+                username="tester",
+            )
             wechat_tools = MoviePilotToolFactory.create_tools(
                 session_id="session-2",
                 user_id="10001",
@@ -52,7 +79,22 @@ class TestAgentInteraction(unittest.TestCase):
             )
 
         self.assertIn("ask_user_choice", [tool.name for tool in telegram_tools])
+        self.assertIn("ask_user_choice", [tool.name for tool in web_agent_tools])
         self.assertNotIn("ask_user_choice", [tool.name for tool in wechat_tools])
+
+    def test_choice_tool_returns_direct_after_sending_interaction(self):
+        """发送按钮后应结束当前 Agent 轮次，等待用户选择作为新消息进入。"""
+        tool = AskUserChoiceTool(session_id="session-1", user_id="10001")
+
+        self.assertTrue(tool.return_direct)
+        self.assertIn("terminal interaction tool", tool.description)
+
+    def test_send_message_tool_returns_direct_after_sending_message(self):
+        """发送消息工具发出用户可见消息后应结束当前 Agent 轮次。"""
+        tool = SendMessageTool(session_id="session-1", user_id="10001")
+
+        self.assertTrue(tool.return_direct)
+        self.assertIn("terminal response tool", tool.description)
 
     def test_choice_tool_sends_buttons_and_registers_pending_request(self):
         tool = AskUserChoiceTool(session_id="session-1", user_id="10001")
@@ -64,7 +106,7 @@ class TestAgentInteraction(unittest.TestCase):
         tool.set_agent_context(agent_context={})
 
         with patch(
-            "app.agent.tools.impl.ask_user_choice.ToolChain.async_post_message",
+            "app.agent.tools.base.ToolChain.async_post_message",
             new=AsyncMock(),
         ) as async_post_message:
             result = asyncio.run(
@@ -83,6 +125,7 @@ class TestAgentInteraction(unittest.TestCase):
         notification = async_post_message.await_args.args[0]
         self.assertEqual(notification.text, "请选择要执行的操作")
         self.assertEqual(sum(len(row) for row in notification.buttons), 2)
+        self.assertNotIn("description", notification.buttons[0][0])
 
         callback_data = notification.buttons[0][0]["callback_data"]
         _, _, request_id, option_index = callback_data.split(":")
@@ -92,6 +135,40 @@ class TestAgentInteraction(unittest.TestCase):
         self.assertIsNotNone(resolved)
         _, option = resolved
         self.assertEqual(option.value, "继续下载")
+
+    def test_choice_tool_blocks_after_feedback_quality_rejection(self):
+        tool = AskUserChoiceTool(session_id="session-feedback", user_id="10001")
+        tool.set_message_attr(
+            channel=MessageChannel.Telegram.value,
+            source="telegram-test",
+            username="tester",
+        )
+        tool.set_agent_context(
+            agent_context={"feedback_issue_rejected_quality": True}
+        )
+
+        with patch(
+            "app.agent.tools.base.ToolChain.async_post_message",
+            new=AsyncMock(),
+        ) as async_post_message:
+            result = asyncio.run(
+                tool.run(
+                    message="测试ISSUE提交被系统质量校验拦截，请选择：",
+                    options=[
+                        UserChoiceOptionInput(
+                            label="提供真实问题描述重新提交",
+                            value="提供真实问题描述重新提交",
+                        ),
+                        UserChoiceOptionInput(
+                            label="取消测试，了解原因",
+                            value="取消测试，了解原因",
+                        ),
+                    ],
+                )
+            )
+
+        self.assertIn("质量门槛拒绝", result)
+        async_post_message.assert_not_awaited()
 
     def test_agent_interaction_callback_routes_selected_value_back_to_agent(self):
         chain = MessageChain()
@@ -109,12 +186,20 @@ class TestAgentInteraction(unittest.TestCase):
             ],
         )
 
-        with patch.object(chain, "_handle_ai_message") as handle_ai_message, patch.object(
+        with patch.object(settings, "AI_AGENT_ENABLE", True), patch.object(
             chain.messagehelper, "put"
-        ) as message_put, patch.object(chain.messageoper, "add") as message_add, patch.object(
+        ) as message_put, patch.object(
+            chain.messageoper, "add"
+        ) as message_add, patch.object(
             chain, "edit_message", return_value=True
-        ) as edit_message:
-            chain._handle_callback(
+        ) as edit_message, patch(
+            "app.chain.message.agent_manager.process_message",
+            new_callable=AsyncMock,
+        ) as process_message, patch(
+            "app.chain.message.asyncio.run_coroutine_threadsafe",
+            side_effect=lambda coro, _loop: (coro.close(), Mock())[1],
+        ):
+            handled = chain._handle_callback(
                 text=f"CALLBACK:agent_interaction:choice:{request.request_id}:1",
                 channel=MessageChannel.Telegram,
                 source="telegram-test",
@@ -124,7 +209,7 @@ class TestAgentInteraction(unittest.TestCase):
                 original_chat_id="456",
             )
 
-        handle_ai_message.assert_called_once()
+        self.assertTrue(handled)
         edit_message.assert_called_once_with(
             channel=MessageChannel.Telegram,
             source="telegram-test",
@@ -133,11 +218,15 @@ class TestAgentInteraction(unittest.TestCase):
             title="需要你的选择",
             text="请选择\n\n已选择：电影",
         )
-        kwargs = handle_ai_message.call_args.kwargs
-        self.assertEqual(kwargs["text"], "我选择电影")
+        process_message.assert_called_once()
+        kwargs = process_message.call_args.kwargs
+        self.assertEqual(kwargs["message"], "我选择电影")
         self.assertEqual(kwargs["session_id"], "session-choice")
-        message_put.assert_called_once()
-        message_add.assert_called_once()
+        self.assertEqual(kwargs["channel"], MessageChannel.Telegram.value)
+        self.assertEqual(kwargs["source"], "telegram-test")
+        self.assertNotIn("processing_status", kwargs)
+        message_put.assert_not_called()
+        message_add.assert_not_called()
 
     def test_legacy_agent_choice_callback_still_supported(self):
         chain = MessageChain()
@@ -164,7 +253,3 @@ class TestAgentInteraction(unittest.TestCase):
             )
 
         handle_ai_message.assert_called_once()
-
-
-if __name__ == "__main__":
-    unittest.main()

@@ -5,6 +5,7 @@ from __future__ import annotations
 import re
 import shutil
 import threading
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable, Optional
@@ -22,8 +23,11 @@ JOBS_DIR = "jobs"
 ACTIVITY_DIR = "activity"
 PERSONAS_DIR = "personas"
 PERSONA_FILE = "PERSONA.md"
+SUBAGENTS_DIR = "subagents"
+SUBAGENT_FILE = "SUBAGENT.md"
 CURRENT_PERSONA_SCHEMA_VERSION = 3
 PERSONA_SCHEMA_VERSION = 1
+SUBAGENT_SCHEMA_VERSION = 1
 DEFAULT_PERSONA_ID = "default"
 PERSONA_ID_PATTERN = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
 
@@ -112,6 +116,41 @@ class PersonaDefinition:
 
 
 @dataclass
+class SubAgentDefinition:
+    """单个子代理定义。"""
+
+    subagent_id: str
+    path: Path
+    description: str
+    text: str
+    include_tags: list[str]
+    exclude_tags: list[str]
+    version: int = SUBAGENT_SCHEMA_VERSION
+    label: str = ""
+
+    def summary_line(self) -> str:
+        """渲染可读的一行子代理摘要。"""
+        parts = [f"`{self.subagent_id}`"]
+        if self.label and self.label != self.subagent_id:
+            parts.append(self.label)
+        if self.description:
+            parts.append(self.description)
+        return " - ".join(parts)
+
+    def to_dict(self) -> dict[str, Any]:
+        """输出给查询或调试入口的结构化信息。"""
+        return {
+            "subagent_id": self.subagent_id,
+            "label": self.label,
+            "description": self.description,
+            "include_tags": self.include_tags,
+            "exclude_tags": self.exclude_tags,
+            "version": self.version,
+            "path": str(self.path),
+        }
+
+
+@dataclass
 class AgentRuntimeConfig:
     """一次加载后的根层配置快照。"""
 
@@ -120,6 +159,7 @@ class AgentRuntimeConfig:
     current_persona_path: Path
     persona: PersonaDefinition
     available_personas: list[PersonaDefinition]
+    available_subagents: list[SubAgentDefinition]
     extra_context_paths: list[Path]
     extra_contexts: list[tuple[Path, str]]
     warnings: list[str] = field(default_factory=list)
@@ -127,15 +167,11 @@ class AgentRuntimeConfig:
 
     def render_prompt_sections(self) -> str:
         """渲染进入系统提示词的运行时片段。"""
-        sections: list[str] = [
-            "<agent_runtime_config>",
-            f"- Active persona: `{self.active_persona}`",
-            f"- Active persona source: `{self.persona.path}`",
-        ]
-        if self.available_personas:
-            sections.append("- Available personas:")
-            sections.extend(f"  - {persona.summary_line()}" for persona in self.available_personas)
-        sections.append("</agent_runtime_config>")
+        sections: list[str] = ["<agent_runtime_config>", f"- Active persona: `{self.active_persona}`",
+                               f"- Active persona file: `personas/{self.persona.persona_id}/{PERSONA_FILE}`",
+                               "- Use `query_personas` before switching persona when the requested speaking style is unclear.",
+                               "- Subagent availability is exposed by the subagent task tools; do not rely on this runtime section as a catalog.",
+                               "</agent_runtime_config>"]
 
         if self.warnings:
             sections.extend(
@@ -201,30 +237,40 @@ class AgentRuntimeManager:
         self.skills_dir = self.agent_root_dir / SKILLS_DIR
         self.jobs_dir = self.agent_root_dir / JOBS_DIR
         self.activity_dir = self.agent_root_dir / ACTIVITY_DIR
+        self.subagents_dir = self.runtime_dir / SUBAGENTS_DIR
         self.bundled_defaults_dir = bundled_defaults_dir or (
             Path(__file__).parent / "defaults"
         )
         self._cache_lock = threading.Lock()
         self._cached_signature: Optional[tuple[tuple[str, int, int], ...]] = None
         self._cached_config: Optional[AgentRuntimeConfig] = None
+        self._cached_signature_checked_at = 0.0
+        self._signature_check_interval = 1.0
+        self._layout_ready = False
 
     def ensure_layout(self) -> None:
         """创建目录、同步默认文件，并清理废弃的旧版 runtime 文件。"""
+        with self._cache_lock:
+            if self._layout_ready:
+                return
         self.agent_root_dir.mkdir(parents=True, exist_ok=True)
         self.runtime_dir.mkdir(parents=True, exist_ok=True)
         self.memory_dir.mkdir(parents=True, exist_ok=True)
         self.skills_dir.mkdir(parents=True, exist_ok=True)
         self.jobs_dir.mkdir(parents=True, exist_ok=True)
         self.activity_dir.mkdir(parents=True, exist_ok=True)
+        self.subagents_dir.mkdir(parents=True, exist_ok=True)
         self._migrate_root_runtime_files()
         self._remove_obsolete_runtime_files()
         self._sync_bundled_defaults()
         self._migrate_root_memory_files()
+        with self._cache_lock:
+            self._layout_ready = True
 
     def load_runtime_config(self) -> AgentRuntimeConfig:
         """加载配置。用户目录损坏时自动回退到内置默认配置。"""
         self.ensure_layout()
-        signature = self._build_signature()
+        signature = self.current_signature()
         with self._cache_lock:
             if self._cached_signature == signature and self._cached_config:
                 return self._cached_config
@@ -232,7 +278,7 @@ class AgentRuntimeManager:
             try:
                 config = self._load_from_root(self.runtime_dir)
             except AgentRuntimeConfigError as err:
-                logger.warning("Agent 根层配置无效，回退到内置默认配置: %s", err)
+                logger.warning(f"Agent 根层配置无效，回退到内置默认配置: {err}")
                 config = self._load_from_root(self.bundled_defaults_dir)
                 config.used_fallback = True
                 config.warnings.insert(
@@ -248,6 +294,25 @@ class AgentRuntimeManager:
         with self._cache_lock:
             self._cached_signature = None
             self._cached_config = None
+            self._cached_signature_checked_at = 0.0
+            self._layout_ready = False
+
+    def current_signature(self) -> tuple[tuple[str, int, int], ...]:
+        """返回当前运行时配置文件签名，供调用方判断缓存是否仍可复用。"""
+        now = time.monotonic()
+        with self._cache_lock:
+            if (
+                self._cached_signature is not None
+                and now - self._cached_signature_checked_at
+                < self._signature_check_interval
+            ):
+                return self._cached_signature
+
+        signature = self._build_signature()
+        with self._cache_lock:
+            self._cached_signature = signature
+            self._cached_signature_checked_at = now
+        return signature
 
     def set_active_persona(self, persona_query: str) -> AgentRuntimeConfig:
         """切换当前激活人格，并立即刷新缓存。"""
@@ -271,12 +336,16 @@ class AgentRuntimeManager:
         )
         current_path.write_text(document, encoding="utf-8")
         self.invalidate_cache()
-        logger.info("已切换 Agent 人格: %s", persona.persona_id)
+        logger.info(f"已切换 Agent 人格: {persona.persona_id}")
         return self.load_runtime_config()
 
     def list_personas(self) -> list[PersonaDefinition]:
         """列出当前可用人格。"""
         return self.load_runtime_config().available_personas
+
+    def list_subagents(self) -> list[SubAgentDefinition]:
+        """列出当前可用子代理。"""
+        return self.load_runtime_config().available_subagents
 
     def update_persona_definition(
         self,
@@ -382,7 +451,7 @@ class AgentRuntimeManager:
         return tuple(entries)
 
     def _sync_bundled_defaults(self) -> None:
-        """仅复制缺失的默认运行时文件，避免覆盖用户自定义。"""
+        """同步默认运行时文件，并按版本更新内置子代理定义。"""
         if not self.bundled_defaults_dir.exists():
             return
         for path in sorted(self.bundled_defaults_dir.rglob("*")):
@@ -392,10 +461,42 @@ class AgentRuntimeManager:
                 target.mkdir(parents=True, exist_ok=True)
                 continue
             if target.exists():
+                if self._should_update_bundled_subagent(relative, path, target):
+                    shutil.copy2(path, target)
+                    logger.info(f"已更新默认 Agent 子代理定义: {target}")
                 continue
             target.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(path, target)
-            logger.info("已同步默认 Agent 运行时文件: %s", target)
+            logger.info(f"已同步默认 Agent 运行时文件: {target}")
+
+    @classmethod
+    def _should_update_bundled_subagent(
+        cls,
+        relative_path: Path,
+        source_path: Path,
+        target_path: Path,
+    ) -> bool:
+        """判断是否需要用更高版本的内置子代理定义覆盖用户目录副本。"""
+        parts = relative_path.parts
+        if len(parts) < 3 or parts[0] != SUBAGENTS_DIR or relative_path.name != SUBAGENT_FILE:
+            return False
+
+        source_version = cls._read_markdown_version(source_path)
+        target_version = cls._read_markdown_version(target_path)
+        return source_version > target_version
+
+    @staticmethod
+    def _read_markdown_version(path: Path) -> int:
+        """读取 Markdown frontmatter 中的整数版本，失败时按 0 处理。"""
+        try:
+            document = AgentRuntimeManager._read_markdown(path)
+        except AgentRuntimeConfigError as err:
+            logger.warning(f"读取 Agent 运行时文件版本失败 {path}: {err}")
+            return 0
+        return AgentRuntimeManager._coerce_int_metadata(
+            document.metadata.get("version"),
+            default=0,
+        )
 
     def _migrate_root_runtime_files(self) -> None:
         """兼容早期直接放在 `config/agent` 根目录的 CURRENT_PERSONA。"""
@@ -405,7 +506,7 @@ class AgentRuntimeManager:
             return
         target.parent.mkdir(parents=True, exist_ok=True)
         source.rename(target)
-        logger.info("已迁移旧版 Agent 根配置文件: %s -> %s", source, target)
+        logger.info(f"已迁移旧版 Agent 根配置文件: {source} -> {target}")
 
     def _remove_obsolete_runtime_files(self) -> None:
         """删除不再支持的旧版 Agent 配置文件，避免被误迁移到 memory。"""
@@ -414,14 +515,14 @@ class AgentRuntimeManager:
             if not path.exists() or not path.is_file():
                 continue
             path.unlink()
-            logger.info("已删除废弃的 Agent 根配置文件: %s", path)
+            logger.info(f"已删除废弃的 Agent 根配置文件: {path}")
 
         for relative_path in sorted(OBSOLETE_RUNTIME_FILES):
             path = self.runtime_dir / relative_path
             if not path.exists() or not path.is_file():
                 continue
             path.unlink()
-            logger.info("已删除废弃的 Agent 运行时文件: %s", path)
+            logger.info(f"已删除废弃的 Agent 运行时文件: {path}")
 
     def _migrate_root_memory_files(self) -> None:
         """将旧版根目录 memory 文件移入 `config/agent/memory`。"""
@@ -432,7 +533,7 @@ class AgentRuntimeManager:
             if target.exists():
                 continue
             path.rename(target)
-            logger.info("已迁移旧版 Agent memory 文件: %s -> %s", path, target)
+            logger.info(f"已迁移旧版 Agent memory 文件: {path} -> {target}")
 
     def _load_from_root(self, root: Path) -> AgentRuntimeConfig:
         current_persona_path = root / CURRENT_PERSONA_FILE
@@ -451,6 +552,7 @@ class AgentRuntimeManager:
 
         available_personas = self._load_personas(root)
         persona = self._resolve_persona_definition(active_persona, available_personas)
+        available_subagents = self._load_subagents(root)
         extra_contexts = [
             (path, self._read_markdown(path).body)
             for path in extra_context_paths
@@ -468,6 +570,7 @@ class AgentRuntimeManager:
             current_persona_path=current_persona_path,
             persona=persona,
             available_personas=available_personas,
+            available_subagents=available_subagents,
             extra_context_paths=extra_context_paths,
             extra_contexts=extra_contexts,
             warnings=warnings,
@@ -513,6 +616,71 @@ class AgentRuntimeManager:
             raise AgentRuntimeConfigError(f"{personas_root} 中未找到任何人格定义")
         return personas
 
+    def _load_subagents(self, root: Path) -> list[SubAgentDefinition]:
+        """扫描并解析所有可用子代理。"""
+        subagents_root = root / SUBAGENTS_DIR
+        if not subagents_root.exists():
+            raise AgentRuntimeConfigError(f"缺少 subagents 目录: {subagents_root}")
+
+        subagents: list[SubAgentDefinition] = []
+        seen_ids: set[str] = set()
+        for subagent_dir in sorted(subagents_root.iterdir()):
+            if not subagent_dir.is_dir():
+                continue
+            subagent_path = subagent_dir / SUBAGENT_FILE
+            if not subagent_path.exists():
+                continue
+            document = self._read_markdown(subagent_path)
+            subagent_id = str(
+                document.metadata.get("subagent_id") or subagent_dir.name
+            ).strip()
+            if not subagent_id:
+                raise AgentRuntimeConfigError(f"{subagent_path} 缺少 subagent_id")
+            if not PERSONA_ID_PATTERN.fullmatch(subagent_id):
+                raise AgentRuntimeConfigError(
+                    f"{subagent_path} 的 subagent_id 只能使用小写字母、数字、下划线和中划线，且必须以字母或数字开头"
+                )
+            if subagent_id in seen_ids:
+                raise AgentRuntimeConfigError(f"检测到重复的子代理 ID: {subagent_id}")
+            seen_ids.add(subagent_id)
+
+            description = str(document.metadata.get("description") or "").strip()
+            if not description:
+                raise AgentRuntimeConfigError(f"{subagent_path} 缺少 description")
+            include_tags = self._normalize_string_list(
+                document.metadata.get("include_tags"),
+                f"{subagent_path}.include_tags",
+            )
+            if not include_tags:
+                raise AgentRuntimeConfigError(f"{subagent_path} 缺少 include_tags")
+            exclude_tags = self._normalize_string_list(
+                document.metadata.get("exclude_tags"),
+                f"{subagent_path}.exclude_tags",
+            )
+            text = self._normalize_subagent_body(document.body)
+            if not text:
+                raise AgentRuntimeConfigError(f"{subagent_path} 子代理正文不能为空")
+
+            subagents.append(
+                SubAgentDefinition(
+                    subagent_id=subagent_id,
+                    path=subagent_path,
+                    label=str(document.metadata.get("label") or subagent_id).strip(),
+                    description=description,
+                    text=text,
+                    include_tags=include_tags,
+                    exclude_tags=exclude_tags,
+                    version=self._coerce_int_metadata(
+                        document.metadata.get("version"),
+                        default=SUBAGENT_SCHEMA_VERSION,
+                    ),
+                )
+            )
+
+        if not subagents:
+            raise AgentRuntimeConfigError(f"{subagents_root} 中未找到任何子代理定义")
+        return subagents
+
     @staticmethod
     def _resolve_persona_definition(
         persona_query: str,
@@ -552,7 +720,7 @@ class AgentRuntimeManager:
         if not path.exists():
             raise AgentRuntimeConfigError(f"缺少配置文件: {path}")
         try:
-            content = path.read_text(encoding="utf-8")
+            content = path.read_text(encoding="utf-8", errors="replace")
         except Exception as err:  # noqa: BLE001
             raise AgentRuntimeConfigError(f"读取配置文件失败 {path}: {err}") from err
 
@@ -652,6 +820,27 @@ class AgentRuntimeManager:
             _, _, remainder = normalized.partition("\n")
             return remainder.strip()
         return normalized
+
+    @staticmethod
+    def _normalize_subagent_body(body: Optional[str]) -> str:
+        """去掉重复的 SUBAGENT 标题，保持正文可安全加载。"""
+        normalized = (body or "").strip()
+        if not normalized:
+            return ""
+        if normalized.startswith("# SUBAGENT"):
+            _, _, remainder = normalized.partition("\n")
+            return remainder.strip()
+        return normalized
+
+    @staticmethod
+    def _coerce_int_metadata(value: Any, *, default: int = 0) -> int:
+        """将 frontmatter 中的整数型元数据规范化。"""
+        if value is None:
+            return default
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return default
 
     def _validate_runtime_config(
         self,

@@ -6,6 +6,7 @@ from typing import Optional, Type
 from pydantic import BaseModel, Field
 
 from app.agent.tools.base import MoviePilotTool
+from app.agent.tools.tags import ToolTag
 from app.agent.tools.impl._filter_rule_utils import (
     collect_custom_rule_group_refs,
     get_custom_rules,
@@ -19,15 +20,16 @@ from app.schemas.types import SystemConfigKey
 class DeleteCustomFilterRuleInput(BaseModel):
     """删除自定义过滤规则工具的输入参数模型"""
 
-    explanation: str = Field(
-        ...,
-        description="Clear explanation of why this tool is being used in the current context",
-    )
     rule_id: str = Field(..., description="Custom rule ID to delete.")
 
 
 class DeleteCustomFilterRuleTool(MoviePilotTool):
     name: str = "delete_custom_filter_rule"
+    tags: list[str] = [
+        ToolTag.Write,
+        ToolTag.FilterRule,
+        ToolTag.Admin,
+    ]
     description: str = (
         "Delete a custom filter rule from CustomFilterRules. "
         "If the rule is still referenced by rule groups, the deletion is blocked to avoid breaking rule_string expressions."

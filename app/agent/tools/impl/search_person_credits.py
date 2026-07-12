@@ -6,6 +6,7 @@ from typing import Optional, Type
 from pydantic import BaseModel, Field
 
 from app.agent.tools.base import MoviePilotTool
+from app.agent.tools.tags import ToolTag
 from app.chain.douban import DoubanChain
 from app.chain.tmdb import TmdbChain
 from app.chain.bangumi import BangumiChain
@@ -14,7 +15,6 @@ from app.log import logger
 
 class SearchPersonCreditsInput(BaseModel):
     """搜索演员参演作品工具的输入参数模型"""
-    explanation: str = Field(..., description="Clear explanation of why this tool is being used in the current context")
     person_id: int = Field(..., description="The ID of the person/actor to search for credits (e.g., 31 for Tom Hanks in TMDB)")
     source: str = Field(..., description="The data source: 'tmdb' for TheMovieDB, 'douban' for Douban, 'bangumi' for Bangumi")
     page: Optional[int] = Field(1, description="Page number for pagination (default: 1)")
@@ -22,6 +22,10 @@ class SearchPersonCreditsInput(BaseModel):
 
 class SearchPersonCreditsTool(MoviePilotTool):
     name: str = "search_person_credits"
+    tags: list[str] = [
+        ToolTag.Read,
+        ToolTag.Media,
+    ]
     description: str = "Search for films and TV shows that a person/actor has appeared in (filmography). Supports searching by person ID from TMDB, Douban, or Bangumi database. Returns a list of media works the person has participated in."
     args_schema: Type[BaseModel] = SearchPersonCreditsInput
 

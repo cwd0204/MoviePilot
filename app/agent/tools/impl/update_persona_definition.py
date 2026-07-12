@@ -7,16 +7,13 @@ from pydantic import BaseModel, Field
 
 from app.agent.runtime import agent_runtime_manager
 from app.agent.tools.base import MoviePilotTool
+from app.agent.tools.tags import ToolTag
 from app.log import logger
 
 
 class UpdatePersonaDefinitionInput(BaseModel):
     """更新人格定义工具的输入参数模型。"""
 
-    explanation: str = Field(
-        ...,
-        description="Clear explanation of why this tool is being used in the current context",
-    )
     persona_id: str = Field(
         ...,
         description=(
@@ -58,6 +55,11 @@ class UpdatePersonaDefinitionInput(BaseModel):
 
 class UpdatePersonaDefinitionTool(MoviePilotTool):
     name: str = "update_persona_definition"
+    tags: list[str] = [
+        ToolTag.Write,
+        ToolTag.Persona,
+        ToolTag.Admin,
+    ]
     description: str = (
         "Create or update a runtime persona definition (人格定义) without manually editing PERSONA.md files. "
         "Use this when the user explicitly asks to modify how a persona is defined, such as changing tone rules, "

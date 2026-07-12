@@ -6,6 +6,7 @@ from typing import Optional, Type
 from pydantic import BaseModel, Field
 
 from app.agent.tools.base import MoviePilotTool
+from app.agent.tools.tags import ToolTag
 from app.log import logger
 from app.schemas import FileItem, MediaType
 
@@ -13,10 +14,6 @@ from app.schemas import FileItem, MediaType
 class TransferFileInput(BaseModel):
     """整理文件或目录工具的输入参数模型"""
 
-    explanation: str = Field(
-        ...,
-        description="Clear explanation of why this tool is being used in the current context",
-    )
     file_path: str = Field(
         ...,
         description="Path to the file or directory to transfer (e.g., '/path/to/file.mkv' or '/path/to/directory')",
@@ -56,9 +53,29 @@ class TransferFileInput(BaseModel):
 
 class TransferFileTool(MoviePilotTool):
     name: str = "transfer_file"
+    tags: list[str] = [
+        ToolTag.Write,
+        ToolTag.Transfer,
+        ToolTag.Library,
+        ToolTag.File,
+        ToolTag.Admin,
+    ]
     description: str = "Transfer/organize a file or directory to the media library. Automatically recognizes media information and organizes files according to configured rules. Supports custom target paths, media identification, and transfer modes."
     args_schema: Type[BaseModel] = TransferFileInput
     require_admin: bool = True
+
+    @staticmethod
+    def _get_fileitem_type(file_path: str, storage: Optional[str] = "local") -> str:
+        """
+        判断待整理路径的文件类型。
+
+        :param file_path: 已规范化的源文件或目录路径
+        :param storage: 源存储类型
+        :return: ``dir`` 或 ``file``
+        """
+        if (storage or "local") == "local" and Path(file_path).is_dir():
+            return "dir"
+        return "dir" if file_path.endswith("/") else "file"
 
     def get_tool_message(self, **kwargs) -> Optional[str]:
         """根据整理参数生成友好的提示消息"""
@@ -113,7 +130,7 @@ class TransferFileTool(MoviePilotTool):
         fileitem = FileItem(
             storage=storage or "local",
             path=file_path,
-            type="dir" if file_path.endswith("/") else "file",
+            type=TransferFileTool._get_fileitem_type(file_path, storage),
         )
         target_path_obj = Path(target_path) if target_path else None
 

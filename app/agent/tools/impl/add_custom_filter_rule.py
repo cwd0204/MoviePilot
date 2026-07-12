@@ -6,6 +6,7 @@ from typing import Optional, Type
 from pydantic import BaseModel, Field
 
 from app.agent.tools.base import MoviePilotTool
+from app.agent.tools.tags import ToolTag
 from app.agent.tools.impl._filter_rule_utils import (
     get_custom_rules,
     normalize_custom_rule,
@@ -19,10 +20,6 @@ from app.schemas.types import SystemConfigKey
 class AddCustomFilterRuleInput(BaseModel):
     """新增自定义过滤规则工具的输入参数模型"""
 
-    explanation: str = Field(
-        ...,
-        description="Clear explanation of why this tool is being used in the current context",
-    )
     rule_id: str = Field(
         ...,
         description="Unique custom rule ID. Only letters and numbers are allowed.",
@@ -48,6 +45,11 @@ class AddCustomFilterRuleInput(BaseModel):
 
 class AddCustomFilterRuleTool(MoviePilotTool):
     name: str = "add_custom_filter_rule"
+    tags: list[str] = [
+        ToolTag.Write,
+        ToolTag.FilterRule,
+        ToolTag.Admin,
+    ]
     description: str = (
         "Add a custom filter rule to CustomFilterRules. "
         "The new rule can then be referenced by rule ID inside filter rule groups."

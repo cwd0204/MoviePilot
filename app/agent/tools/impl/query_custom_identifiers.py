@@ -6,6 +6,7 @@ from typing import Optional, Type
 from pydantic import BaseModel, Field
 
 from app.agent.tools.base import MoviePilotTool
+from app.agent.tools.tags import ToolTag
 from app.db.systemconfig_oper import SystemConfigOper
 from app.log import logger
 from app.schemas.types import SystemConfigKey
@@ -14,14 +15,15 @@ from app.schemas.types import SystemConfigKey
 class QueryCustomIdentifiersInput(BaseModel):
     """查询自定义识别词工具的输入参数模型"""
 
-    explanation: str = Field(
-        ...,
-        description="Clear explanation of why this tool is being used in the current context",
-    )
 
 
 class QueryCustomIdentifiersTool(MoviePilotTool):
     name: str = "query_custom_identifiers"
+    tags: list[str] = [
+        ToolTag.Read,
+        ToolTag.FilterRule,
+        ToolTag.Admin,
+    ]
     description: str = (
         "Query all currently configured custom identifiers (自定义识别词). "
         "Returns the list of identifier rules used for preprocessing torrent/file names before media recognition. "

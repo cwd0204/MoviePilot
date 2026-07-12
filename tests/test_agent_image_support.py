@@ -1,3 +1,4 @@
+import asyncio
 import base64
 import json
 import tempfile
@@ -9,7 +10,7 @@ from urllib.parse import quote
 
 from telebot import apihelper
 
-from app.agent.tools.impl.send_message import SendMessageInput
+from app.agent.tools.impl.send_message import SendMessageInput, SendMessageTool
 from app.agent.tools.impl.send_local_file import SendLocalFileInput
 from app.agent import MoviePilotAgent, AgentChain
 from app.agent.llm import AgentCapabilityManager
@@ -27,7 +28,7 @@ from app.modules.vocechat import VoceChatModule
 from app.modules.wechat import WechatModule
 from app.modules.wechat.wechatbot import WeChatBot
 from app.schemas import CommingMessage, Notification
-from app.schemas.types import MessageChannel
+from app.schemas.types import MessageChannel, NotificationType
 
 
 class AgentImageSupportTest(unittest.TestCase):
@@ -241,6 +242,7 @@ class AgentImageSupportTest(unittest.TestCase):
 
         handle_ai_message.assert_called_once()
         self.assertEqual(handle_ai_message.call_args.kwargs["text"], "帮我推荐一部电影")
+        self.assertTrue(handle_ai_message.call_args.kwargs["has_audio_input"])
         self.assertNotIn("reply_with_voice", handle_ai_message.call_args.kwargs)
 
     def test_file_message_routes_to_agent_even_when_global_agent_is_disabled(self):
@@ -389,7 +391,35 @@ class AgentImageSupportTest(unittest.TestCase):
         self.assertIsInstance(content, list)
         payload = json.loads(content[0]["text"])
         self.assertEqual(payload["message"], "帮我总结这个文件")
+        self.assertEqual(payload["input"]["mode"], "text")
+        self.assertFalse(payload["input"]["transcribed"])
         self.assertEqual(payload["files"][0]["local_path"], "/tmp/report.txt")
+
+    def test_agent_process_marks_voice_input_in_structured_json(self):
+        """语音输入应在结构化消息中标记为转写来源。"""
+        agent = MoviePilotAgent(
+            session_id="session-1",
+            user_id="user-1",
+            channel=MessageChannel.Telegram.value,
+            source="telegram-test",
+            username="tester",
+        )
+
+        with patch(
+            "app.agent.memory.memory_manager.get_agent_messages", return_value=[]
+        ), patch.object(agent, "_execute_agent", new_callable=AsyncMock) as execute_agent:
+            asyncio.run(
+                agent.process(
+                    "帮我推荐一部电影",
+                    has_audio_input=True,
+                )
+            )
+
+        messages = execute_agent.await_args.args[0]
+        payload = json.loads(messages[-1].content[0]["text"])
+        self.assertEqual(payload["message"], "帮我推荐一部电影")
+        self.assertEqual(payload["input"]["mode"], "voice")
+        self.assertTrue(payload["input"]["transcribed"])
 
     def test_llm_supports_image_input_respects_explicit_override(self):
         with patch.object(settings, "LLM_SUPPORT_IMAGE_INPUT", False):
@@ -423,7 +453,8 @@ class AgentImageSupportTest(unittest.TestCase):
         ) as prepare_files, patch(
             "app.chain.message.agent_manager.process_message", new_callable=AsyncMock
         ) as process_message, patch(
-            "app.chain.message.asyncio.run_coroutine_threadsafe"
+            "app.chain.message.asyncio.run_coroutine_threadsafe",
+            side_effect=lambda coro, _loop: coro.close(),
         ) as run_coroutine_threadsafe:
             chain._handle_ai_message(
                 text="/ai 帮我看看这张图",
@@ -445,6 +476,29 @@ class AgentImageSupportTest(unittest.TestCase):
             process_message.call_args.kwargs["files"][0]["local_path"],
             "/tmp/image_1.jpg",
         )
+
+    def test_handle_ai_message_forwards_voice_input_to_agent_manager(self):
+        """AI消息入队时应保留语音输入标记。"""
+        chain = MessageChain()
+
+        with patch.object(settings, "AI_AGENT_ENABLE", True), patch.object(
+            chain, "_get_or_create_session_id", return_value="session-1"
+        ), patch(
+            "app.chain.message.agent_manager.process_message", new_callable=AsyncMock
+        ) as process_message, patch(
+            "app.chain.message.asyncio.run_coroutine_threadsafe",
+            side_effect=lambda coro, _loop: coro.close(),
+        ):
+            chain._handle_ai_message(
+                text="帮我推荐一部电影",
+                channel=MessageChannel.Telegram,
+                source="telegram-test",
+                userid="10001",
+                username="tester",
+                has_audio_input=True,
+            )
+
+        self.assertTrue(process_message.call_args.kwargs["has_audio_input"])
 
     def test_slack_images_use_authenticated_data_url_download(self):
         chain = MessageChain()
@@ -509,15 +563,101 @@ class AgentImageSupportTest(unittest.TestCase):
 
     def test_send_message_input_accepts_image_only_payload(self):
         payload = SendMessageInput(
-            explanation="send poster image",
             image_url="https://example.com/poster.png",
         )
 
         self.assertEqual(payload.image_url, "https://example.com/poster.png")
 
+    def test_send_message_tool_uses_regular_notification_type(self):
+        """发送消息工具应按普通通知消息登记。"""
+
+        async def _run():
+            tool = SendMessageTool(session_id="session-1", user_id="10001")
+            tool.set_message_attr(
+                channel=MessageChannel.Telegram.value,
+                source="telegram-test",
+                username="tester",
+            )
+
+            with patch(
+                "app.agent.tools.base.ToolChain.async_post_message",
+                new_callable=AsyncMock,
+            ) as async_post_message:
+                result = await tool.run(
+                    message="处理完成",
+                    title="智能体通知",
+                    image_url="https://example.com/poster.png",
+                )
+            return result, async_post_message
+
+        result, async_post_message = asyncio.run(_run())
+        notification = async_post_message.await_args.args[0]
+
+        self.assertEqual(result, "消息已发送")
+        self.assertEqual(notification.mtype, NotificationType.Other)
+        self.assertEqual(notification.channel, MessageChannel.Telegram)
+        self.assertEqual(notification.source, "telegram-test")
+        self.assertEqual(notification.title, "智能体通知")
+        self.assertEqual(notification.text, "处理完成")
+        self.assertEqual(notification.image, "https://example.com/poster.png")
+        self.assertIsNone(notification.parse_mode)
+
+    def test_send_message_tool_ignores_parse_mode_argument(self):
+        """发送消息工具不再支持由 Agent 指定 Telegram parse_mode。"""
+
+        async def _run():
+            tool = SendMessageTool(session_id="session-1", user_id="10001")
+            tool.set_message_attr(
+                channel=MessageChannel.Telegram.value,
+                source="telegram-test",
+                username="tester",
+            )
+
+            with patch(
+                "app.agent.tools.base.ToolChain.async_post_message",
+                new_callable=AsyncMock,
+            ) as async_post_message:
+                result = await tool.run(
+                    message="<b>处理完成</b>",
+                    parse_mode="HTML",
+                )
+            return result, async_post_message
+
+        result, async_post_message = asyncio.run(_run())
+        notification = async_post_message.await_args.args[0]
+
+        self.assertEqual(result, "消息已发送")
+        self.assertEqual(notification.text, "<b>处理完成</b>")
+        self.assertIsNone(notification.parse_mode)
+
+    def test_send_message_tool_marks_reply_sent_after_dispatch(self):
+        """发送消息工具成功发送后应终止本轮回复。"""
+
+        async def _run():
+            tool = SendMessageTool(session_id="session-1", user_id="10001")
+            agent_context = {}
+            tool.set_agent_context(agent_context)
+            tool.set_message_attr(
+                channel=MessageChannel.Telegram.value,
+                source="telegram-test",
+                username="tester",
+            )
+
+            with patch(
+                "app.agent.tools.base.ToolChain.async_post_message",
+                new_callable=AsyncMock,
+            ):
+                result = await tool.run(message="处理完成")
+            return result, agent_context
+
+        result, agent_context = asyncio.run(_run())
+
+        self.assertEqual(result, "消息已发送")
+        self.assertTrue(agent_context["user_reply_sent"])
+        self.assertEqual(agent_context["reply_mode"], "send_message")
+
     def test_send_local_file_input_accepts_file_payload(self):
         payload = SendLocalFileInput(
-            explanation="send generated report",
             file_path="/tmp/report.txt",
             message="请下载查看",
         )
@@ -1237,6 +1377,3 @@ class AgentImageSupportTest(unittest.TestCase):
                 )
 
         client.send_file.assert_called_once()
-
-if __name__ == "__main__":
-    unittest.main()

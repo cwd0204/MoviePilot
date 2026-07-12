@@ -18,6 +18,11 @@ class ScrapeFileAction(BaseAction):
     刮削文件
     """
 
+    contract = {
+        "inputs": [{"name": "fileitems", "label": "文件", "kind": "list"}],
+        "outputs": [{"name": "fileitems", "label": "文件", "kind": "list"}],
+    }
+
     def __init__(self, action_id: str):
         super().__init__(action_id)
         self._scraped_files = []
@@ -61,18 +66,18 @@ class ScrapeFileAction(BaseAction):
                 logger.info(f"{fileitem.path} 已刮削过，跳过")
                 continue
             mediachain = MediaChain()
-            context = mediachain.recognize_by_path(
+            media_context = mediachain.recognize_by_path(
                 fileitem.path,
                 obtain_images=True,
             )
-            if not context or not context.media_info:
+            if not media_context or not media_context.media_info:
                 _failed_count += 1
                 logger.info(f"{fileitem.path} 未识别到媒体信息，无法刮削")
                 continue
             mediachain.scrape_metadata(
                 fileitem=fileitem,
-                meta=context.meta_info,
-                mediainfo=context.media_info
+                meta=media_context.meta_info,
+                mediainfo=media_context.media_info
             )
             self._scraped_files.append(fileitem)
             # 保存缓存

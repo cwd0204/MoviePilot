@@ -84,13 +84,12 @@ class ScrapingOption:
 class ScrapingConfig:
     """媒体刮削配置"""
 
-    _policies: dict[tuple[str], ScrapingOption] = {}
-
     def __init__(self, config_dict: dict[str, str] = None):
         """
         初始化配置对象
         :param config_dict: 用户配置字典（扁平化格式），为 None 时使用默认配置
         """
+        self._policies: dict[tuple[str, str], ScrapingOption] = {}
         # 合并用户配置和默认配置
         if config_dict is None:
             config_dict = {}
@@ -136,10 +135,10 @@ class ScrapingConfig:
             for mt, mds in [
                 (
                     "movie",
-                    ["nfo", "poster", "backdrop", "logo", "disc", "banner", "thumb"],
+                    ["nfo", "poster", "backdrop", "logo", "disc", "banner", "thumb", "clearart", "landscape"],
                 ),
-                ("tv", ["nfo", "poster", "backdrop", "logo", "banner", "thumb"]),
-                ("season", ["nfo", "poster", "banner", "thumb"]),
+                ("tv", ["nfo", "poster", "backdrop", "logo", "banner", "thumb", "clearart", "landscape"]),
+                ("season", ["nfo", "poster", "backdrop", "banner", "thumb", "landscape"]),
                 ("episode", ["nfo", "thumb"]),
             ]
             for md in mds
@@ -164,6 +163,15 @@ class MediaChain(ChainBase, ConfigReloadMixin, metaclass=Singleton):
         "cdart": ScrapingMetadata.DISC,
         "banner": ScrapingMetadata.BANNER,
         "thumb": ScrapingMetadata.THUMB,
+        "landscape": ScrapingMetadata.LANDSCAPE,
+        "clearart": ScrapingMetadata.CLEARART,
+    }
+
+    IMAGE_ALIASES = {
+        "backdrop": ["fanart"],
+        "fanart": ["backdrop"],
+        "thumb": ["landscape"],
+        "landscape": ["thumb"],
     }
 
     def __init__(self):
@@ -173,6 +181,20 @@ class MediaChain(ChainBase, ConfigReloadMixin, metaclass=Singleton):
 
     def on_config_changed(self):
         self.scraping_policies = ScrapingConfig.from_system_config()
+
+    @staticmethod
+    def _cleanup_temp_file(path: Optional[Path]):
+        """
+        清理临时刮削文件
+
+        :param path: 临时文件路径
+        """
+        if not path or not path.exists():
+            return
+        try:
+            path.unlink()
+        except OSError as err:
+            logger.warn(f"临时文件清理失败：{path} - {err}")
 
     @staticmethod
     def _should_scrape(
@@ -223,18 +245,17 @@ class MediaChain(ChainBase, ConfigReloadMixin, metaclass=Singleton):
         """
         if not fileitem or not content or not path:
             return
-        # 使用tempfile创建临时文件
-        with NamedTemporaryFile(
-                delete=True, delete_on_close=False, suffix=path.suffix
-        ) as tmp_file:
-            tmp_file_path = Path(tmp_file.name)
-            # 写入内容
-            if isinstance(content, bytes):
-                tmp_file.write(content)
-            else:
-                tmp_file.write(content.encode("utf-8"))
-            tmp_file.flush()
-            tmp_file.close()  # 关闭文件句柄
+        tmp_file_path = None
+        try:
+            # delete_on_close 是 Python 3.12 才支持的参数，使用 delete=False 后手动清理以兼容低版本。
+            with NamedTemporaryFile(delete=False, suffix=path.suffix) as tmp_file:
+                tmp_file_path = Path(tmp_file.name)
+                # 写入内容
+                if isinstance(content, bytes):
+                    tmp_file.write(content)
+                else:
+                    tmp_file.write(content.encode("utf-8"))
+                tmp_file.flush()
 
             # 刮削文件只需要读写权限
             tmp_file_path.chmod(0o666 & ~current_umask)
@@ -247,6 +268,8 @@ class MediaChain(ChainBase, ConfigReloadMixin, metaclass=Singleton):
                 logger.info(f"已保存文件：{item.path}")
             else:
                 logger.warn(f"文件保存失败：{path}")
+        finally:
+            self._cleanup_temp_file(tmp_file_path)
 
     def _download_and_save_image(
             self, fileitem: schemas.FileItem, path: Path, url: str
@@ -267,17 +290,16 @@ class MediaChain(ChainBase, ConfigReloadMixin, metaclass=Singleton):
             )
             with request_utils.get_stream(url=url) as r:
                 if r and r.status_code == 200:
-                    # 使用tempfile创建临时文件，自动删除
-                    with NamedTemporaryFile(
-                            delete=True, delete_on_close=False, suffix=path.suffix
-                    ) as tmp_file:
-                        tmp_file_path = Path(tmp_file.name)
-                        # 流式写入文件
-                        for chunk in r.iter_content(chunk_size=8192):
-                            if chunk:
-                                tmp_file.write(chunk)
-                        tmp_file.flush()
-                        tmp_file.close()  # 关闭文件句柄
+                    tmp_file_path = None
+                    try:
+                        # delete_on_close 是 Python 3.12 才支持的参数，使用 delete=False 后手动清理以兼容低版本。
+                        with NamedTemporaryFile(delete=False, suffix=path.suffix) as tmp_file:
+                            tmp_file_path = Path(tmp_file.name)
+                            # 流式写入文件
+                            for chunk in r.iter_content(chunk_size=8192):
+                                if chunk:
+                                    tmp_file.write(chunk)
+                            tmp_file.flush()
 
                         # 刮削的图片只需要读写权限
                         tmp_file_path.chmod(0o666 & ~current_umask)
@@ -290,6 +312,8 @@ class MediaChain(ChainBase, ConfigReloadMixin, metaclass=Singleton):
                             logger.info(f"已保存图片：{item.path}")
                         else:
                             logger.warn(f"图片保存失败：{path}")
+                    finally:
+                        self._cleanup_temp_file(tmp_file_path)
                 else:
                     logger.info(f"{url} 图片下载失败")
         except Exception as err:
@@ -359,10 +383,21 @@ class MediaChain(ChainBase, ConfigReloadMixin, metaclass=Singleton):
                 ScrapingMetadata.POSTER: "poster",
                 ScrapingMetadata.BANNER: "banner",
                 ScrapingMetadata.THUMB: "thumb",
+                ScrapingMetadata.BACKDROP: "backdrop",
+                ScrapingMetadata.LANDSCAPE: "landscape",
             }
             if season_image_name := season_image_name_map.get(metadata_type):
                 hint_ext = Path(filename_hint).suffix if filename_hint else ".jpg"
                 final_filename = f"{season_image_name}{hint_ext}"
+        elif item_type == ScrapingTarget.MOVIE and current_fileitem.type == "file":
+            # 电影文件的图片应与视频文件同级保存，避免把图片路径拼到文件名下面。
+            target_dir_item = parent_fileitem or self.storagechain.get_parent_item(
+                current_fileitem
+            )
+            if not target_dir_item:
+                logger.error(f"无法获取文件 {current_fileitem.path} 的父目录项。")
+                return current_fileitem, None
+            target_dir_path = Path(target_dir_item.path)
         # 如果是 EPISODE 类型的图片（如thumb），通常也是放在文件同级目录，文件名与视频文件一致
         elif (
                 metadata_type in [ScrapingMetadata.THUMB]
@@ -390,6 +425,87 @@ class MediaChain(ChainBase, ConfigReloadMixin, metaclass=Singleton):
         target_full_path = target_dir_path / final_filename
         return target_dir_item, target_full_path
 
+    def _get_target_fileitems_and_paths(
+            self,
+            current_fileitem: schemas.FileItem,
+            item_type: ScrapingTarget,
+            metadata_type: ScrapingMetadata,
+            filename_hint: Optional[str] = None,
+            parent_fileitem: Optional[schemas.FileItem] = None,
+    ) -> List[Tuple[schemas.FileItem, Path]]:
+        """
+        根据刮削上下文生成一个或多个保存目标。
+        季图片需要同时兼容根目录 seasonxx-poster 和季目录 poster 两种命名。
+        """
+        target_item, target_path = self._get_target_fileitem_and_path(
+            current_fileitem=current_fileitem,
+            item_type=item_type,
+            metadata_type=metadata_type,
+            filename_hint=filename_hint,
+            parent_fileitem=parent_fileitem,
+        )
+        targets = [(target_item, target_path)] if target_path else []
+
+        if (
+                item_type != ScrapingTarget.SEASON
+                or not filename_hint
+                or not filename_hint.lower().startswith("season")
+                or metadata_type not in {
+                    ScrapingMetadata.POSTER,
+                    ScrapingMetadata.BANNER,
+                    ScrapingMetadata.THUMB,
+                    ScrapingMetadata.BACKDROP,
+                    ScrapingMetadata.LANDSCAPE,
+                }
+        ):
+            return targets
+
+        season_parent_item = parent_fileitem or self.storagechain.get_parent_item(
+            current_fileitem
+        )
+        if not season_parent_item:
+            logger.warn(f"无法获取季目录 {current_fileitem.path} 的父目录项，跳过根目录季图片")
+            return targets
+
+        season_root_path = Path(current_fileitem.path).with_name(filename_hint)
+        root_target = (season_parent_item, season_root_path)
+        if root_target not in targets:
+            targets.insert(0, root_target)
+        return targets
+
+    def _expand_with_aliases(
+            self,
+            targets: List[Tuple[schemas.FileItem, Path]],
+            item_type: ScrapingTarget,
+    ) -> List[Tuple[schemas.FileItem, Path]]:
+        """
+        为兼容多媒体服务器，扩展图片保存目标列表，添加别名文件。
+        例如 backdrop.jpg 同时保存为 fanart.jpg，thumb.jpg 同时保存为 landscape.jpg。
+        """
+        expanded = list(targets)
+        for base_item, image_path in list(targets):
+            if not image_path:
+                continue
+            stem = image_path.stem.lower()
+            ext = image_path.suffix
+            # 跳过 season 前缀文件（如 season01-poster.jpg）
+            if stem.startswith("season"):
+                continue
+            aliases = self.IMAGE_ALIASES.get(stem)
+            if not aliases:
+                continue
+            for alias in aliases:
+                alias_meta_type = self.IMAGE_METADATA_MAP.get(alias)
+                if alias_meta_type:
+                    alias_option = self.scraping_policies.option(item_type, alias_meta_type)
+                    if alias_option.is_skip:
+                        continue
+                alias_path = image_path.with_name(f"{alias}{ext}")
+                alias_target = (base_item, alias_path)
+                if alias_target not in expanded:
+                    expanded.append(alias_target)
+        return expanded
+
     def metadata_nfo(
             self,
             meta: MetaBase,
@@ -413,6 +529,32 @@ class MediaChain(ChainBase, ConfigReloadMixin, metaclass=Singleton):
             episode=episode,
         )
 
+    def metadata_img(
+            self,
+            mediainfo: MediaInfo,
+            season: Optional[int] = None,
+            episode: Optional[int] = None,
+    ) -> Optional[dict]:
+        """
+        获取图片名称和url，合并所有模块的结果。
+        优先使用高优先级模块的图片，低优先级模块补充缺失的图片类型。
+        """
+        merged = {}
+        for module in sorted(
+            self.modulemanager.get_running_modules("metadata_img"),
+            key=lambda x: x.get_priority(),
+        ):
+            try:
+                result = module.metadata_img(
+                    mediainfo=mediainfo, season=season, episode=episode
+                )
+                if result and isinstance(result, dict):
+                    for name, url in result.items():
+                        merged.setdefault(name, url)
+            except Exception as err:
+                logger.error(f"获取 {module.get_name()} 图片失败：{str(err)}")
+        return merged or None
+
     @staticmethod
     def select_recognize_source(
             log_name: str, log_context: str, native_fn, plugin_fn
@@ -429,20 +571,20 @@ class MediaChain(ChainBase, ConfigReloadMixin, metaclass=Singleton):
         plugin_available = eventmanager.check(ChainEventType.NameRecognize)
         if settings.RECOGNIZE_PLUGIN_FIRST and plugin_available:
             # 插件优先
-            logger.info(f"插件优先模式已开启。请求辅助识别，标题：{log_name} ...")
+            logger.info(f"插件识别优先模式已开启。请求辅助识别，标题：{log_name} ...")
             mediainfo = plugin_fn()
             if not mediainfo:
                 logger.info(
-                    f"辅助识别未识别到 {log_context} 的媒体信息，尝试使用原生识别"
+                    f"辅助识别未识别到 {log_context} 的媒体信息，尝试使用原生识别 ..."
                 )
                 mediainfo = native_fn()
         else:
             # 原生优先
-            logger.info(f"插件优先模式未开启。尝试原生识别，标题：{log_name} ...")
+            logger.info(f"开始识别标题：{log_name} ...")
             mediainfo = native_fn()
             if not mediainfo and plugin_available:
                 logger.info(
-                    f"原生识别未识别到 {log_context} 的媒体信息，尝试使用辅助识别"
+                    f"未识别到 {log_context} 的媒体信息，尝试使用辅助识别 ..."
                 )
                 mediainfo = plugin_fn()
         return mediainfo
@@ -773,7 +915,7 @@ class MediaChain(ChainBase, ConfigReloadMixin, metaclass=Singleton):
                 self.scrape_metadata(
                     fileitem=fileitem,
                     mediainfo=mediainfo,
-                    init_folder=False,
+                    init_folder=True,
                     parent=self.storagechain.get_parent_item(fileitem),
                     overwrite=overwrite,
                 )
@@ -985,8 +1127,8 @@ class MediaChain(ChainBase, ConfigReloadMixin, metaclass=Singleton):
                         )
                         continue
 
-                # 获取目标 FileItem (`base_item`) 和 Path (`image_path`)
-                base_item, image_path = self._get_target_fileitem_and_path(
+                # 获取目标 FileItem 和 Path，季图片会同时写根目录和季目录。
+                image_targets = self._get_target_fileitems_and_paths(
                     current_fileitem=current_fileitem,
                     item_type=item_type,
                     metadata_type=metadata_type,
@@ -994,19 +1136,23 @@ class MediaChain(ChainBase, ConfigReloadMixin, metaclass=Singleton):
                     parent_fileitem=parent_fileitem,
                 )
 
-                if not image_path:
-                    continue
+                # 扩展别名目标（如 backdrop→fanart, thumb→landscape）
+                image_targets = self._expand_with_aliases(image_targets, item_type)
 
-                # 文件存在检查
-                file_exists = self.storagechain.get_file_item(
-                    storage=base_item.storage, path=image_path
-                )
+                for base_item, image_path in image_targets:
+                    if not image_path:
+                        continue
 
-                # 刮削决策
-                if self._should_scrape(option, bool(file_exists), overwrite):
-                    self._download_and_save_image(
-                        fileitem=base_item, path=image_path, url=image_url
+                    # 文件存在检查
+                    file_exists = self.storagechain.get_file_item(
+                        storage=base_item.storage, path=image_path
                     )
+
+                    # 刮削决策
+                    if self._should_scrape(option, bool(file_exists), overwrite):
+                        self._download_and_save_image(
+                            fileitem=base_item, path=image_path, url=image_url
+                        )
             else:
                 logger.debug(
                     f"未找到图片类型 {image_name} 对应的 ScrapingMetadata，跳过。"
@@ -1092,7 +1238,7 @@ class MediaChain(ChainBase, ConfigReloadMixin, metaclass=Singleton):
         处理电影刮削
         """
         if fileitem.type == "file":
-            # 电影文件：仅处理 NFO
+            # 电影文件始终处理 NFO，直接初始化文件时再补同级目录图片。
             self._scrape_nfo_generic(
                 current_fileitem=fileitem,
                 meta=meta,
@@ -1101,6 +1247,14 @@ class MediaChain(ChainBase, ConfigReloadMixin, metaclass=Singleton):
                 parent_fileitem=parent,
                 overwrite=overwrite,
             )
+            if init_folder:
+                self._scrape_images_generic(
+                    current_fileitem=fileitem,
+                    mediainfo=mediainfo,
+                    item_type=ScrapingTarget.MOVIE,
+                    parent_fileitem=parent,
+                    overwrite=overwrite,
+                )
         else:
             # 电影目录：递归处理文件并初始化目录
             self._handle_movie_directory(

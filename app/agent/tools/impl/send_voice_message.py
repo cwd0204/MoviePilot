@@ -1,12 +1,11 @@
 """发送语音消息工具。"""
-
-import asyncio
 from typing import Optional, Type
 
 from pydantic import BaseModel, Field
 
 from app.agent.llm.capability import AgentCapabilityManager
-from app.agent.tools.base import MoviePilotTool, ToolChain
+from app.agent.tools.base import MoviePilotTool
+from app.agent.tools.tags import ToolTag
 from app.core.config import settings
 from app.log import logger
 from app.schemas import Notification, NotificationType
@@ -15,10 +14,6 @@ from app.schemas import Notification, NotificationType
 class SendVoiceMessageInput(BaseModel):
     """发送语音消息工具输入。"""
 
-    explanation: str = Field(
-        ...,
-        description="Clear explanation of why a voice reply is the best fit in the current context",
-    )
     message: str = Field(
         ...,
         description="The spoken content to send back to the user",
@@ -26,24 +21,35 @@ class SendVoiceMessageInput(BaseModel):
 
 
 class SendVoiceMessageTool(MoviePilotTool):
+    """发送 Agent 语音回复的工具。"""
+
     name: str = "send_voice_message"
+    tags: list[str] = [
+        ToolTag.Write,
+        ToolTag.Message,
+        ToolTag.TerminalResponse,
+    ]
     sends_message: bool = True
+    return_direct: bool = True
     description: str = (
         "Send a voice reply to the current user. Use this only when the user explicitly asks for "
         "a voice reply or when spoken playback is clearly better than plain text. On channels "
         "without voice support or when TTS is unavailable, it automatically falls back to sending "
-        "the same content as plain text."
+        "the same content as plain text. This is a terminal response tool: put the complete "
+        "user-facing reply in `message`; after this tool runs, do not send another text reply "
+        "or call `send_message` with the same content."
     )
     args_schema: Type[BaseModel] = SendVoiceMessageInput
-    require_admin: bool = False
 
     def get_tool_message(self, **kwargs) -> Optional[str]:
+        """生成语音回复工具的执行提示。"""
         message = kwargs.get("message") or ""
         if len(message) > 40:
             message = message[:40] + "..."
         return f"发送语音回复: {message}"
 
     async def run(self, message: str, **kwargs) -> str:
+        """合成语音并发送到当前对话渠道，不支持时回退为文字。"""
         if not message:
             return "语音回复内容不能为空"
 
@@ -61,7 +67,8 @@ class SendVoiceMessageTool(MoviePilotTool):
             reply_mode == AgentCapabilityManager.REPLY_MODE_NATIVE
             and AgentCapabilityManager.is_audio_output_available()
         ):
-            voice_file = await asyncio.to_thread(
+            voice_file = await self.run_blocking(
+                "default",
                 AgentCapabilityManager.synthesize_speech, message
             )
             if voice_file:
@@ -71,14 +78,11 @@ class SendVoiceMessageTool(MoviePilotTool):
             fallback_reason = "当前未配置可用的语音合成能力"
 
         logger.info(
-            "执行工具: %s, channel=%s, use_voice=%s, text_len=%s",
-            self.name,
-            channel,
-            used_voice,
-            len(message),
+            f"执行工具: {self.name}, channel={channel}, "
+            f"use_voice={used_voice}, text_len={len(message)}"
         )
 
-        await ToolChain().async_post_message(
+        await self.send_notification_message(
             Notification(
                 channel=self._channel,
                 source=self._source,
@@ -92,6 +96,7 @@ class SendVoiceMessageTool(MoviePilotTool):
                     if voice_path and settings.AUDIO_OUTPUT_INCLUDE_TEXT
                     else None
                 ),
+                save_history=False,
             )
         )
         self._agent_context["user_reply_sent"] = True

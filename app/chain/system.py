@@ -27,8 +27,12 @@ class SystemChain(ChainBase):
         清理系统缓存
         """
         self.clear_cache()
-        self.post_message(Notification(channel=channel, source=source,
-                                       title=f"缓存清理完成！", userid=userid))
+        self.post_message(Notification(
+            channel=channel,
+            source=source,
+            title=f"缓存清理完成！",
+            userid=userid,
+            save_history=False))
 
     def restart(self, channel: MessageChannel, userid: Union[int, str], source: Optional[str] = None):
         """
@@ -37,8 +41,12 @@ class SystemChain(ChainBase):
         from app.core.config import global_vars
 
         if channel and userid:
-            self.post_message(Notification(channel=channel, source=source,
-                                           title="系统正在重启，请耐心等候！", userid=userid))
+            self.post_message(Notification(
+                channel=channel,
+                source=source,
+                title="系统正在重启，请耐心等候！",
+                userid=userid,
+                save_history=False))
             # 保存重启信息
             self.save_cache({
                 "channel": channel.value,
@@ -88,7 +96,7 @@ class SystemChain(ChainBase):
                     if target_path.exists():
                         continue
                     shutil.copytree(item, target_path)
-                    logger.info(f"已备份插件目录: {item.name}")
+                    logger.debug(f"已备份插件目录: {item.name}")
                 # 如果是文件
                 elif item.is_file():
                     if target_path.exists():
@@ -135,12 +143,12 @@ class SystemChain(ChainBase):
                         if target_path.exists():
                             shutil.rmtree(target_path)
                         shutil.copytree(item, target_path)
-                        logger.info(f"已恢复插件目录: {item.name}")
+                        logger.debug(f"已恢复插件目录: {item.name}")
                         restored_count += 1
                     # 如果是文件
                     elif item.is_file():
                         shutil.copy2(item, target_path)
-                        logger.info(f"已恢复插件文件: {item.name}")
+                        logger.debug(f"已恢复插件文件: {item.name}")
                         restored_count += 1
                 except Exception as e:
                     logger.error(f"恢复插件 {item.name} 时发生错误: {str(e)}")
@@ -180,9 +188,12 @@ class SystemChain(ChainBase):
         """
         查看当前版本、远程版本
         """
-        self.post_message(Notification(channel=channel, source=source,
-                                       title=self.__get_version_message(),
-                                       userid=userid))
+        self.post_message(Notification(
+            channel=channel,
+            source=source,
+            title=self.__get_version_message(),
+            userid=userid,
+            save_history=False))
 
     def restart_finish(self):
         """
@@ -202,9 +213,11 @@ class SystemChain(ChainBase):
 
             # 版本号
             title = self.__get_version_message()
-            self.post_message(Notification(channel=channel,
-                                           title=f"系统已重启完成！\n{title}",
-                                           userid=userid))
+            self.post_message(Notification(
+                channel=channel,
+                title=f"系统已重启完成！\n{title}",
+                userid=userid,
+                save_history=False))
             self.remove_cache(self._restart_file)
 
     @staticmethod
@@ -279,7 +292,7 @@ class SystemChain(ChainBase):
             version_file = Path(settings.FRONTEND_PATH) / "version.txt"
         if version_file.exists():
             try:
-                with open(version_file, 'r') as f:
+                with open(version_file, 'r', encoding='utf-8', errors='replace') as f:
                     version = str(f.read()).strip()
                 return version
             except Exception as err:

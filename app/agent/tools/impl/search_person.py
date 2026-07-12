@@ -6,18 +6,22 @@ from typing import Optional, Type
 from pydantic import BaseModel, Field
 
 from app.agent.tools.base import MoviePilotTool
+from app.agent.tools.tags import ToolTag
 from app.chain.media import MediaChain
 from app.log import logger
 
 
 class SearchPersonInput(BaseModel):
     """搜索人物工具的输入参数模型"""
-    explanation: str = Field(..., description="Clear explanation of why this tool is being used in the current context")
     name: str = Field(..., description="The name of the person to search for (e.g., 'Tom Hanks', '周杰伦')")
 
 
 class SearchPersonTool(MoviePilotTool):
     name: str = "search_person"
+    tags: list[str] = [
+        ToolTag.Read,
+        ToolTag.Media,
+    ]
     description: str = "Search for person information including actors, directors, etc. Supports searching by name. Returns detailed person information from TMDB, Douban, or Bangumi database."
     args_schema: Type[BaseModel] = SearchPersonInput
 

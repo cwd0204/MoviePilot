@@ -173,6 +173,7 @@ class Jellyfin:
                     name=library.get("Name"),
                     path=library.get("Path"),
                     type=library_type,
+                    item_count=self.get_items_count(library.get("Id")),
                     image=image,
                     link=link,
                     server_type="jellyfin"
@@ -502,18 +503,17 @@ class Jellyfin:
         try:
             res = RequestUtils(timeout=10).get_res(url, params)
             if res:
-                images = res.json().get("Images")
+                images = res.json().get("Images") or []
                 for image in images:
                     if image.get("ProviderName") == "TheMovieDb" and image.get("Type") == image_type:
                         return image.get("Url")
-                # return images[0].get("Url") # 首选无则返回第一张
+                # TMDB 无匹配时回退本地图片
+                logger.info(f"未找到 TMDB {image_type}，回退本地图片")
             else:
                 logger.info(f"Items/RemoteImages 未获取到返回数据，采用本地图片")
-                return self.generate_image_link(item_id, image_type, True)
         except Exception as e:
             logger.error(f"连接Items/Id/RemoteImages出错：" + str(e))
-            return None
-        return None
+        return self.generate_image_link(item_id, image_type, True)
 
     def get_item_path_by_id(self, item_id: str) -> Optional[str]:
         """
@@ -808,6 +808,33 @@ class Jellyfin:
         except Exception as e:
             logger.error(f"连接Users/{self.user}/Items/{itemid}：" + str(e))
         return None
+
+    def get_items_count(self, parent: Union[str, int]) -> Optional[int]:
+        """
+        获取指定媒体库可同步的电影和剧集总数
+
+        :param parent: 媒体库ID
+        :return: 媒体条目总数，查询失败时返回None
+        """
+        if not parent or not self._host or not self._apikey or not self.user:
+            return None
+        url = f"{self._host}Users/{self.user}/Items"
+        params = {
+            "ParentId": parent,
+            "Recursive": "true",
+            "IncludeItemTypes": "Movie,Series",
+            "Limit": 0,
+            "api_key": self._apikey,
+        }
+        try:
+            res = RequestUtils().get_res(url, params)
+            if not res or res.status_code != 200:
+                return None
+            total_count = res.json().get("TotalRecordCount")
+            return int(total_count) if total_count is not None else None
+        except Exception as e:
+            logger.error(f"查询媒体库 {parent} 的媒体总数出错：{str(e)}")
+            return None
 
     def get_items(self, parent: Union[str, int], start_index: Optional[int] = 0, limit: Optional[int] = -1) \
             -> Generator[MediaServerItem | None | Any, Any, None]:

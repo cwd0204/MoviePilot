@@ -6,6 +6,7 @@ from typing import Optional, Type
 from pydantic import BaseModel, Field
 
 from app.agent.tools.base import MoviePilotTool
+from app.agent.tools.tags import ToolTag
 from app.core.event import eventmanager
 from app.log import logger
 from app.schemas.types import EventType, MessageChannel
@@ -14,10 +15,6 @@ from app.schemas.types import EventType, MessageChannel
 class RunSlashCommandInput(BaseModel):
     """运行斜杠命令工具的输入参数模型"""
 
-    explanation: str = Field(
-        ...,
-        description="Clear explanation of why this tool is being used in the current context",
-    )
     command: str = Field(
         ...,
         description="The slash command to execute, e.g. '/cookiecloud'. "
@@ -29,6 +26,11 @@ class RunSlashCommandInput(BaseModel):
 
 class RunSlashCommandTool(MoviePilotTool):
     name: str = "run_slash_command"
+    tags: list[str] = [
+        ToolTag.Write,
+        ToolTag.SlashCommand,
+        ToolTag.Admin,
+    ]
     description: str = (
         "Execute a slash command (system or plugin) by sending a CommandExcute event. "
         "This tool supports ALL registered slash commands, including: "

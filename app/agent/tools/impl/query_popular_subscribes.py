@@ -7,8 +7,9 @@ import cn2an
 from pydantic import BaseModel, Field
 
 from app.agent.tools.base import MoviePilotTool
+from app.agent.tools.tags import ToolTag
 from app.core.context import MediaInfo
-from app.helper.subscribe import SubscribeHelper
+from app.helper.server import MoviePilotServerHelper
 from app.log import logger
 from app.schemas.types import MediaType, media_type_to_agent
 
@@ -17,7 +18,6 @@ MAX_PAGE_SIZE = 50
 
 class QueryPopularSubscribesInput(BaseModel):
     """查询热门订阅工具的输入参数模型"""
-    explanation: str = Field(..., description="Clear explanation of why this tool is being used in the current context")
     media_type: str = Field(..., description="Allowed values: movie, tv")
     page: Optional[int] = Field(1, description="Page number for pagination (default: 1)")
     count: Optional[int] = Field(30, description="Number of items per page (default: 30, max: 50)")
@@ -30,6 +30,11 @@ class QueryPopularSubscribesInput(BaseModel):
 
 class QueryPopularSubscribesTool(MoviePilotTool):
     name: str = "query_popular_subscribes"
+    tags: list[str] = [
+        ToolTag.Read,
+        ToolTag.Subscription,
+        ToolTag.Recommendation,
+    ]
     description: str = "Query popular subscriptions based on user shared data. Shows media with the most subscribers, supports filtering by genre, rating, minimum subscribers, and pagination."
     args_schema: Type[BaseModel] = QueryPopularSubscribesInput
 
@@ -77,8 +82,7 @@ class QueryPopularSubscribesTool(MoviePilotTool):
             if not media_type_enum:
                 return f"错误：无效的媒体类型 '{media_type}'，支持的类型：'movie', 'tv'"
 
-            subscribe_helper = SubscribeHelper()
-            subscribes = await subscribe_helper.async_get_statistic(
+            subscribes = await MoviePilotServerHelper.async_get_subscribe_statistic(
                 stype=media_type_enum.to_agent(),
                 page=page,
                 count=count,

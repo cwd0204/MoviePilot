@@ -6,6 +6,7 @@ from typing import Optional, Type, List
 from pydantic import BaseModel, Field
 
 from app.agent.tools.base import MoviePilotTool
+from app.agent.tools.tags import ToolTag
 from app.agent.tools.impl._filter_rule_utils import (
     collect_custom_rule_group_refs,
     get_custom_rules,
@@ -18,10 +19,6 @@ from app.log import logger
 class QueryCustomFilterRulesInput(BaseModel):
     """查询自定义过滤规则工具的输入参数模型"""
 
-    explanation: str = Field(
-        ...,
-        description="Clear explanation of why this tool is being used in the current context",
-    )
     rule_ids: Optional[List[str]] = Field(
         None,
         description="Optional list of custom rule IDs to query. If omitted, return all custom rules.",
@@ -34,6 +31,10 @@ class QueryCustomFilterRulesInput(BaseModel):
 
 class QueryCustomFilterRulesTool(MoviePilotTool):
     name: str = "query_custom_filter_rules"
+    tags: list[str] = [
+        ToolTag.Read,
+        ToolTag.FilterRule,
+    ]
     description: str = (
         "Query custom filter rules stored in CustomFilterRules. "
         "Custom rules can be referenced from rule_string expressions in filter rule groups. "

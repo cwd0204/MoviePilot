@@ -5,7 +5,8 @@ from typing import Optional, Type
 
 from pydantic import BaseModel, Field, model_validator
 
-from app.agent.tools.base import MoviePilotTool, ToolChain
+from app.agent.tools.base import MoviePilotTool
+from app.agent.tools.tags import ToolTag
 from app.log import logger
 from app.schemas import Notification, NotificationType
 from app.schemas.message import ChannelCapabilityManager, ChannelCapability
@@ -15,10 +16,6 @@ from app.schemas.types import MessageChannel
 class SendLocalFileInput(BaseModel):
     """发送本地附件工具输入。"""
 
-    explanation: str = Field(
-        ...,
-        description="Clear explanation of why sending this local file helps the user",
-    )
     file_path: str = Field(
         ...,
         description="Absolute path to the local image or file to send to the user",
@@ -45,13 +42,18 @@ class SendLocalFileInput(BaseModel):
 
 class SendLocalFileTool(MoviePilotTool):
     name: str = "send_local_file"
+    tags: list[str] = [
+        ToolTag.Write,
+        ToolTag.Message,
+        ToolTag.File,
+    ]
     sends_message: bool = True
     description: str = (
         "Send a local image or file from the server filesystem to the current user. "
         "Use this when you have generated or identified a local file the user should download."
     )
     args_schema: Type[BaseModel] = SendLocalFileInput
-    require_admin: bool = False
+    require_admin: bool = True
 
     def get_tool_message(self, **kwargs) -> Optional[str]:
         file_path = kwargs.get("file_path", "")
@@ -92,7 +94,7 @@ class SendLocalFileTool(MoviePilotTool):
             resolved_path,
         )
 
-        await ToolChain().async_post_message(
+        await self.send_notification_message(
             Notification(
                 channel=channel,
                 source=self._source,
@@ -103,6 +105,7 @@ class SendLocalFileTool(MoviePilotTool):
                 text=message,
                 file_path=str(resolved_path),
                 file_name=file_name or resolved_path.name,
+                save_history=False,
             )
         )
         return "本地附件已发送"

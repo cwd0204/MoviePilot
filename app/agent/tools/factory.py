@@ -1,6 +1,6 @@
-from typing import List, Callable
+from typing import Callable, List, Optional, Type
 
-from app.agent.tools.impl.add_download import AddDownloadTool
+from app.agent.tools.impl.add_download_tasks import AddDownloadTasksTool
 from app.agent.tools.impl.add_subscribe import AddSubscribeTool
 from app.agent.tools.impl.update_subscribe import UpdateSubscribeTool
 from app.agent.tools.impl.search_subscribe import SearchSubscribeTool
@@ -37,6 +37,7 @@ from app.agent.tools.impl.query_media_detail import QueryMediaDetailTool
 from app.agent.tools.impl.search_torrents import SearchTorrentsTool
 from app.agent.tools.impl.get_search_results import GetSearchResultsTool
 from app.agent.tools.impl.search_web import SearchWebTool
+from app.agent.tools.impl.recognize_captcha import RecognizeCaptchaTool
 from app.agent.tools.impl.send_message import SendMessageTool
 from app.agent.tools.impl.ask_user_choice import AskUserChoiceTool
 from app.agent.tools.impl.send_local_file import SendLocalFileTool
@@ -49,10 +50,10 @@ from app.agent.tools.impl.query_personas import QueryPersonasTool
 from app.agent.tools.impl.switch_persona import SwitchPersonaTool
 from app.agent.tools.impl.update_persona_definition import UpdatePersonaDefinitionTool
 from app.agent.tools.impl.update_site_cookie import UpdateSiteCookieTool
-from app.agent.tools.impl.delete_download import DeleteDownloadTool
+from app.agent.tools.impl.delete_download_tasks import DeleteDownloadTasksTool
 from app.agent.tools.impl.delete_download_history import DeleteDownloadHistoryTool
 from app.agent.tools.impl.delete_transfer_history import DeleteTransferHistoryTool
-from app.agent.tools.impl.modify_download import ModifyDownloadTool
+from app.agent.tools.impl.update_download_tasks import UpdateDownloadTasksTool
 from app.agent.tools.impl.query_directory_settings import QueryDirectorySettingsTool
 from app.agent.tools.impl.list_directory import ListDirectoryTool
 from app.agent.tools.impl.query_transfer_history import QueryTransferHistoryTool
@@ -74,6 +75,7 @@ from app.agent.tools.impl.uninstall_plugin import UninstallPluginTool
 from app.agent.tools.impl.run_slash_command import RunSlashCommandTool
 from app.agent.tools.impl.list_slash_commands import ListSlashCommandsTool
 from app.agent.tools.impl.query_custom_identifiers import QueryCustomIdentifiersTool
+from app.agent.tools.impl.query_doctor_report import QueryDoctorReportTool
 from app.agent.tools.impl.update_custom_identifiers import UpdateCustomIdentifiersTool
 from app.agent.tools.impl.query_system_settings import QuerySystemSettingsTool
 from app.agent.tools.impl.update_system_settings import UpdateSystemSettingsTool
@@ -90,8 +92,87 @@ class MoviePilotToolFactory:
     MoviePilot工具工厂
     """
 
+    BUILTIN_TOOL_CLASSES: tuple[Type[MoviePilotTool], ...] = (
+        SearchMediaTool,
+        SearchPersonTool,
+        SearchPersonCreditsTool,
+        RecognizeMediaTool,
+        ScrapeMetadataTool,
+        QueryEpisodeScheduleTool,
+        QueryMediaDetailTool,
+        AddSubscribeTool,
+        UpdateSubscribeTool,
+        SearchSubscribeTool,
+        SearchTorrentsTool,
+        GetSearchResultsTool,
+        SearchWebTool,
+        RecognizeCaptchaTool,
+        AddDownloadTasksTool,
+        QuerySubscribesTool,
+        QuerySubscribeSharesTool,
+        QueryPopularSubscribesTool,
+        QueryBuiltinFilterRulesTool,
+        QueryCustomFilterRulesTool,
+        QueryRuleGroupsTool,
+        AddCustomFilterRuleTool,
+        UpdateCustomFilterRuleTool,
+        DeleteCustomFilterRuleTool,
+        AddRuleGroupTool,
+        UpdateRuleGroupTool,
+        DeleteRuleGroupTool,
+        QuerySubscribeHistoryTool,
+        DeleteSubscribeTool,
+        QueryDownloadTasksTool,
+        DeleteDownloadTasksTool,
+        DeleteDownloadHistoryTool,
+        DeleteTransferHistoryTool,
+        UpdateDownloadTasksTool,
+        QueryDownloadersTool,
+        QuerySitesTool,
+        UpdateSiteTool,
+        QuerySiteUserdataTool,
+        TestSiteTool,
+        UpdateSiteCookieTool,
+        GetRecommendationsTool,
+        QueryLibraryExistsTool,
+        QueryLibraryLatestTool,
+        QueryDirectorySettingsTool,
+        ListDirectoryTool,
+        QueryTransferHistoryTool,
+        TransferFileTool,
+        SendMessageTool,
+        QuerySchedulersTool,
+        RunSchedulerTool,
+        QueryWorkflowsTool,
+        RunWorkflowTool,
+        QueryPersonasTool,
+        SwitchPersonaTool,
+        UpdatePersonaDefinitionTool,
+        ExecuteCommandTool,
+        EditFileTool,
+        WriteFileTool,
+        ReadFileTool,
+        BrowseWebpageTool,
+        QueryInstalledPluginsTool,
+        QueryMarketPluginsTool,
+        QueryPluginCapabilitiesTool,
+        QueryPluginConfigTool,
+        UpdatePluginConfigTool,
+        ReloadPluginTool,
+        QueryPluginDataTool,
+        InstallPluginTool,
+        UninstallPluginTool,
+        RunSlashCommandTool,
+        ListSlashCommandsTool,
+        QueryDoctorReportTool,
+        QueryCustomIdentifiersTool,
+        UpdateCustomIdentifiersTool,
+        QuerySystemSettingsTool,
+        UpdateSystemSettingsTool,
+    )
+
     # 这些通用工具需要始终保留，避免大工具集裁剪后让 Agent 丢失基础的
-    # 文件系统、命令执行或交互确认能力。AskUserChoiceTool 仅在支持按钮
+    # 文件系统、命令执行、历史检索或交互确认能力。AskUserChoiceTool 仅在支持按钮
     # 的渠道中才会实际注入，因此后续会再按已加载工具做一次求交集。
     TOOL_SELECTOR_ALWAYS_INCLUDE_NAMES = (
         "list_directory",
@@ -103,7 +184,7 @@ class MoviePilotToolFactory:
     )
 
     @staticmethod
-    def _should_enable_choice_tool(channel: str = None) -> bool:
+    def _should_enable_choice_tool(channel: Optional[str] = None) -> bool:
         if not channel:
             return False
         try:
@@ -133,8 +214,24 @@ class MoviePilotToolFactory:
             if tool_name in available_tool_names
         ]
 
-    @staticmethod
+    @classmethod
+    def _get_builtin_tool_classes(
+        cls, channel: Optional[str] = None
+    ) -> list[Type[MoviePilotTool]]:
+        """
+        返回当前渠道可用的内置工具类清单。
+        """
+        tool_definitions = list(cls.BUILTIN_TOOL_CLASSES)
+        if cls._should_enable_choice_tool(channel):
+            tool_definitions.append(AskUserChoiceTool)
+        tool_definitions.append(SendLocalFileTool)
+        if AgentCapabilityManager.supports_audio_output():
+            tool_definitions.append(SendVoiceMessageTool)
+        return tool_definitions
+
+    @classmethod
     def create_tools(
+        cls,
         session_id: str,
         user_id: str,
         channel: str = None,
@@ -148,87 +245,7 @@ class MoviePilotToolFactory:
         创建MoviePilot工具列表
         """
         tools = []
-        tool_definitions = [
-            SearchMediaTool,
-            SearchPersonTool,
-            SearchPersonCreditsTool,
-            RecognizeMediaTool,
-            ScrapeMetadataTool,
-            QueryEpisodeScheduleTool,
-            QueryMediaDetailTool,
-            AddSubscribeTool,
-            UpdateSubscribeTool,
-            SearchSubscribeTool,
-            SearchTorrentsTool,
-            GetSearchResultsTool,
-            SearchWebTool,
-            AddDownloadTool,
-            QuerySubscribesTool,
-            QuerySubscribeSharesTool,
-            QueryPopularSubscribesTool,
-            QueryBuiltinFilterRulesTool,
-            QueryCustomFilterRulesTool,
-            QueryRuleGroupsTool,
-            AddCustomFilterRuleTool,
-            UpdateCustomFilterRuleTool,
-            DeleteCustomFilterRuleTool,
-            AddRuleGroupTool,
-            UpdateRuleGroupTool,
-            DeleteRuleGroupTool,
-            QuerySubscribeHistoryTool,
-            DeleteSubscribeTool,
-            QueryDownloadTasksTool,
-            DeleteDownloadTool,
-            DeleteDownloadHistoryTool,
-            DeleteTransferHistoryTool,
-            ModifyDownloadTool,
-            QueryDownloadersTool,
-            QuerySitesTool,
-            UpdateSiteTool,
-            QuerySiteUserdataTool,
-            TestSiteTool,
-            UpdateSiteCookieTool,
-            GetRecommendationsTool,
-            QueryLibraryExistsTool,
-            QueryLibraryLatestTool,
-            QueryDirectorySettingsTool,
-            ListDirectoryTool,
-            QueryTransferHistoryTool,
-            TransferFileTool,
-            SendMessageTool,
-            QuerySchedulersTool,
-            RunSchedulerTool,
-            QueryWorkflowsTool,
-            RunWorkflowTool,
-            QueryPersonasTool,
-            SwitchPersonaTool,
-            UpdatePersonaDefinitionTool,
-            ExecuteCommandTool,
-            EditFileTool,
-            WriteFileTool,
-            ReadFileTool,
-            BrowseWebpageTool,
-            QueryInstalledPluginsTool,
-            QueryMarketPluginsTool,
-            QueryPluginCapabilitiesTool,
-            QueryPluginConfigTool,
-            UpdatePluginConfigTool,
-            ReloadPluginTool,
-            QueryPluginDataTool,
-            InstallPluginTool,
-            UninstallPluginTool,
-            RunSlashCommandTool,
-            ListSlashCommandsTool,
-            QueryCustomIdentifiersTool,
-            UpdateCustomIdentifiersTool,
-            QuerySystemSettingsTool,
-            UpdateSystemSettingsTool,
-        ]
-        if MoviePilotToolFactory._should_enable_choice_tool(channel):
-            tool_definitions.append(AskUserChoiceTool)
-        tool_definitions.append(SendLocalFileTool)
-        if AgentCapabilityManager.supports_audio_output():
-            tool_definitions.append(SendVoiceMessageTool)
+        tool_definitions = cls._get_builtin_tool_classes(channel)
         # 创建内置工具
         for ToolClass in tool_definitions:
             tool = ToolClass(session_id=session_id, user_id=user_id)
@@ -275,9 +292,9 @@ class MoviePilotToolFactory:
 
         builtin_tools_count = len(tool_definitions)
         if plugin_tools_count > 0:
-            logger.info(
+            logger.debug(
                 f"成功创建 {len(tools)} 个MoviePilot工具（内置工具: {builtin_tools_count} 个，插件工具: {plugin_tools_count} 个）"
             )
         else:
-            logger.info(f"成功创建 {len(tools)} 个MoviePilot工具")
+            logger.debug(f"成功创建 {len(tools)} 个MoviePilot工具")
         return tools

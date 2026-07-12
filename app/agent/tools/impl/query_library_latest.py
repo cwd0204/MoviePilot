@@ -7,6 +7,7 @@ from typing import Optional, Type
 from pydantic import BaseModel, Field
 
 from app.agent.tools.base import MoviePilotTool
+from app.agent.tools.tags import ToolTag
 from app.chain.mediaserver import MediaServerChain
 from app.helper.service import ServiceConfigHelper
 from app.log import logger
@@ -17,10 +18,6 @@ PAGE_SIZE = 20
 class QueryLibraryLatestInput(BaseModel):
     """查询媒体服务器最近入库影片工具的输入参数模型"""
 
-    explanation: str = Field(
-        ...,
-        description="Clear explanation of why this tool is being used in the current context",
-    )
     server: Optional[str] = Field(
         None,
         description="Media server name (optional, if not specified queries all enabled media servers)",
@@ -32,6 +29,11 @@ class QueryLibraryLatestInput(BaseModel):
 
 class QueryLibraryLatestTool(MoviePilotTool):
     name: str = "query_library_latest"
+    tags: list[str] = [
+        ToolTag.Read,
+        ToolTag.Library,
+        ToolTag.Media,
+    ]
     description: str = "Query the latest media items added to the media server (Plex, Emby, Jellyfin). Returns recently added movies and TV series with their titles, images, links, and other metadata. Supports pagination with 20 items per page."
     args_schema: Type[BaseModel] = QueryLibraryLatestInput
 

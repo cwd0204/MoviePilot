@@ -8,6 +8,7 @@ from typing import Optional, Type
 from pydantic import BaseModel, Field
 
 from app.agent.tools.base import MoviePilotTool
+from app.agent.tools.tags import ToolTag
 from app.chain.storage import StorageChain
 from app.log import logger
 from app.schemas.file import FileItem
@@ -16,7 +17,6 @@ from app.utils.string import StringUtils
 
 class ListDirectoryInput(BaseModel):
     """查询文件系统目录内容工具的输入参数模型"""
-    explanation: str = Field(..., description="Clear explanation of why this tool is being used in the current context")
     path: str = Field(..., description="Directory path to list contents (e.g., '/home/user/downloads' or 'C:/Downloads')")
     storage: Optional[str] = Field("local", description="Storage type (default: 'local' for local file system, can be 'smb', 'alist', etc.)")
     sort_by: Optional[str] = Field("name", description="Sort order: 'name' for alphabetical sorting, 'time' for modification time sorting (default: 'name')")
@@ -24,6 +24,11 @@ class ListDirectoryInput(BaseModel):
 
 class ListDirectoryTool(MoviePilotTool):
     name: str = "list_directory"
+    tags: list[str] = [
+        ToolTag.Read,
+        ToolTag.Directory,
+        ToolTag.File,
+    ]
     description: str = "List actual files and folders in a file system directory (NOT configuration). Shows files and subdirectories with their names, types, sizes, and modification times. Returns up to 20 items and the total count if there are more items. Use 'query_directory_settings' to query directory configuration settings."
     args_schema: Type[BaseModel] = ListDirectoryInput
 
@@ -110,6 +115,13 @@ class ListDirectoryTool(MoviePilotTool):
         logger.info(f"执行工具: {self.name}, 参数: path={path}, storage={storage}, sort_by={sort_by}")
 
         try:
+            resolved_path, access_error = await self._check_local_storage_access(
+                path=path, storage=storage, operation="列出"
+            )
+            if access_error:
+                return access_error
+            if resolved_path:
+                path = str(resolved_path)
             return await self.run_blocking(
                 "storage", self._list_directory_sync, path, storage, sort_by
             )

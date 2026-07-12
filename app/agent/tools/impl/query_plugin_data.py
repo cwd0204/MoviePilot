@@ -6,6 +6,7 @@ from typing import Optional, Type
 from pydantic import BaseModel, Field
 
 from app.agent.tools.base import MoviePilotTool
+from app.agent.tools.tags import ToolTag
 from app.agent.tools.impl._plugin_tool_utils import (
     PLUGIN_DATA_KEY_PREVIEW_LIMIT,
     build_preview_payload,
@@ -18,10 +19,6 @@ from app.log import logger
 class QueryPluginDataInput(BaseModel):
     """查询插件数据工具的输入参数模型"""
 
-    explanation: str = Field(
-        ...,
-        description="Clear explanation of why this tool is being used in the current context",
-    )
     plugin_id: str = Field(
         ...,
         description="The plugin ID to query. Use query_installed_plugins first to discover valid plugin IDs.",
@@ -38,6 +35,11 @@ class QueryPluginDataInput(BaseModel):
 
 class QueryPluginDataTool(MoviePilotTool):
     name: str = "query_plugin_data"
+    tags: list[str] = [
+        ToolTag.Read,
+        ToolTag.Plugin,
+        ToolTag.Admin,
+    ]
     description: str = (
         "Query persisted data of an installed plugin. "
         "Optionally specify a key to read a single data item; otherwise all plugin data entries are returned. "

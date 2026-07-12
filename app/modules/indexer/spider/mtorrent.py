@@ -53,6 +53,13 @@ class MTorrentSpider:
         "7": "DIY 国配 中字"
     }
 
+    @classmethod
+    def get_search_page_size(cls, keyword: Optional[str] = None) -> Optional[int]:
+        """
+        获取搜索接口单页容量。
+        """
+        return cls._size
+
     def __init__(self, indexer: dict):
         self.systemconfig = SystemConfigOper()
         if indexer:
@@ -340,7 +347,7 @@ class MTorrentSpider:
                 return [item["id"] for item in result.get("data", []) if "id" in item]
             else:
                 logger.warn(
-                    f"{self._name} 获取字幕列表失败，返回：{result.get("message", "未知")}"
+                    f'{self._name} 获取字幕列表失败，返回：{result.get("message", "未知")}'
                 )
                 return None
         elif res is not None:
@@ -376,7 +383,7 @@ class MTorrentSpider:
                 return self._subtitle_download_url % (self._domain, result["data"])
             else:
                 logger.warn(
-                    f"{self._name} 获取字幕下载链接失败，返回：{result.get("message", "未知")}"
+                    f'{self._name} 获取字幕下载链接失败，返回：{result.get("message", "未知")}'
                 )
                 return None
         elif res is not None:

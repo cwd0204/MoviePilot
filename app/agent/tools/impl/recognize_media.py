@@ -6,6 +6,7 @@ from typing import Optional, Type
 from pydantic import BaseModel, Field
 
 from app.agent.tools.base import MoviePilotTool
+from app.agent.tools.tags import ToolTag
 from app.chain.media import MediaChain
 from app.core.context import Context
 from app.core.metainfo import MetaInfo
@@ -15,7 +16,6 @@ from app.schemas.types import media_type_to_agent
 
 class RecognizeMediaInput(BaseModel):
     """识别媒体信息工具的输入参数模型"""
-    explanation: str = Field(..., description="Clear explanation of why this tool is being used in the current context")
     title: Optional[str] = Field(None, description="The title of the torrent/media to recognize (required for torrent recognition)")
     subtitle: Optional[str] = Field(None, description="The subtitle or description of the torrent (optional, helps improve recognition accuracy)")
     path: Optional[str] = Field(None, description="The file path to recognize (required for file recognition, mutually exclusive with title)")
@@ -23,6 +23,11 @@ class RecognizeMediaInput(BaseModel):
 
 class RecognizeMediaTool(MoviePilotTool):
     name: str = "recognize_media"
+    tags: list[str] = [
+        ToolTag.Read,
+        ToolTag.Media,
+        ToolTag.Metadata,
+    ]
     description: str = "Extract/identify media information from torrent titles or file paths (NOT database search). Supports two modes: 1) Extract from torrent title and optional subtitle, 2) Extract from file path. Returns detailed media information. Use 'search_media' to search TMDB database, or 'scrape_metadata' to generate metadata files for existing files."
     args_schema: Type[BaseModel] = RecognizeMediaInput
 

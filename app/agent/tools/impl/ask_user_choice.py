@@ -4,7 +4,8 @@ from typing import List, Optional, Type
 
 from pydantic import BaseModel, Field, model_validator
 
-from app.agent.tools.base import MoviePilotTool, ToolChain
+from app.agent.tools.base import MoviePilotTool
+from app.agent.tools.tags import ToolTag
 from app.helper.interaction import (
     AgentInteractionOption,
     agent_interaction_manager,
@@ -26,9 +27,12 @@ class UserChoiceOptionInput(BaseModel):
 
     @model_validator(mode="after")
     def validate_option(self):
-        if not self.label.strip():
+        """校验按钮选项的文案和值不能为空。"""
+        label = str(self.label)
+        value = str(self.value)
+        if not label.strip():
             raise ValueError("label 不能为空")
-        if not self.value.strip():
+        if not value.strip():
             raise ValueError("value 不能为空")
         return self
 
@@ -36,10 +40,6 @@ class UserChoiceOptionInput(BaseModel):
 class AskUserChoiceInput(BaseModel):
     """按钮选择工具输入。"""
 
-    explanation: str = Field(
-        ...,
-        description="Clear explanation of why the agent needs the user to choose from buttons",
-    )
     message: str = Field(
         ...,
         description="Question or prompt shown to the user together with the buttons",
@@ -55,7 +55,9 @@ class AskUserChoiceInput(BaseModel):
 
     @model_validator(mode="after")
     def validate_payload(self):
-        if not self.message.strip():
+        """校验按钮选择工具必须提供问题和选项。"""
+        message = str(self.message)
+        if not message.strip():
             raise ValueError("message 不能为空")
         if not self.options:
             raise ValueError("options 至少需要提供一个")
@@ -63,16 +65,27 @@ class AskUserChoiceInput(BaseModel):
 
 
 class AskUserChoiceTool(MoviePilotTool):
+    """发送按钮选择并让当前 Agent 轮次等待用户回调消息。"""
+
     name: str = "ask_user_choice"
+    tags: list[str] = [
+        ToolTag.Write,
+        ToolTag.Message,
+        ToolTag.UserInteraction,
+        ToolTag.TerminalResponse,
+    ]
     sends_message: bool = True
+    return_direct: bool = True
     description: str = (
         "Ask the user to choose from button options on channels that support interactive buttons. "
-        "After the user clicks a button, the selected value will come back as the user's next message."
+        "This is a terminal interaction tool: put the full question and all options in this call, "
+        "then stop the current turn. After the user clicks a button, the selected value will come "
+        "back as the user's next message. Do not also send the same question as plain text."
     )
     args_schema: Type[BaseModel] = AskUserChoiceInput
-    require_admin: bool = False
 
     def get_tool_message(self, **kwargs) -> Optional[str]:
+        """生成工具执行提示文案。"""
         message = kwargs.get("message", "") or ""
         if len(message) > 40:
             message = message[:40] + "..."
@@ -80,11 +93,21 @@ class AskUserChoiceTool(MoviePilotTool):
 
     @staticmethod
     def _truncate_button_text(text: str, max_length: int) -> str:
+        """按渠道限制截断按钮文案。"""
         if max_length <= 0 or len(text) <= max_length:
             return text
         if max_length <= 3:
             return text[:max_length]
         return text[: max_length - 3] + "..."
+
+    def _blocked_by_feedback_quality_gate(self) -> bool:
+        """反馈 Issue 质量门槛拒绝后，禁止继续发按钮引导改写。
+
+        这是对 ``feedback-issue`` skill 的历史兜底：如果同一轮上下文已经
+        标记反馈内容被质量门槛拒绝，就不能再用按钮诱导用户把测试 / 占位
+        内容改写成“真实问题”。
+        """
+        return bool(self._agent_context.get("feedback_issue_rejected_quality"))
 
     async def run(
         self,
@@ -93,6 +116,25 @@ class AskUserChoiceTool(MoviePilotTool):
         title: Optional[str] = None,
         **kwargs,
     ) -> str:
+        """
+        发送按钮选择消息，并登记待回调的交互上下文。
+
+        :param message: 展示给用户的问题
+        :param options: 可点击的选项列表
+        :param title: 可选标题
+        :return: 工具执行结果描述
+        """
+        if self._blocked_by_feedback_quality_gate():
+            logger.warning(
+                "ask_user_choice blocked after feedback issue rejected_quality: "
+                "session_id=%s",
+                self._session_id,
+            )
+            return (
+                "反馈 Issue 已被质量门槛拒绝，不能继续发送按钮引导用户改写或重新提交。"
+                "请直接结束本次反馈流程。"
+            )
+
         if not self._channel or not self._source:
             return "当前不在可回传消息的会话中，无法发起按钮选择"
 
@@ -116,7 +158,8 @@ class AskUserChoiceTool(MoviePilotTool):
 
         choice_options = [
             AgentInteractionOption(
-                label=option.label.strip(), value=option.value.strip()
+                label=option.label.strip(),
+                value=option.value.strip(),
             )
             for option in options
         ]
@@ -156,7 +199,7 @@ class AskUserChoiceTool(MoviePilotTool):
             len(choice_options),
         )
 
-        await ToolChain().async_post_message(
+        await self.send_notification_message(
             Notification(
                 channel=channel,
                 source=self._source,
@@ -166,6 +209,7 @@ class AskUserChoiceTool(MoviePilotTool):
                 title=title,
                 text=message.strip(),
                 buttons=buttons,
+                save_history=False,
             )
         )
 

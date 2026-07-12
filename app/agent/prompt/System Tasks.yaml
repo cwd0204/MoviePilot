@@ -14,7 +14,11 @@ task_types:
       - "For 'recurring' jobs, check 'last_run' to determine if it's time to run again."
       - "For 'once' jobs with status 'pending', execute them now."
       - "After executing each job, update its status, 'last_run' time, and execution log in the JOB.md file."
+      - "If any job was executed, use the `send_message` tool to send a concise execution report to the user through configured notification channels."
     empty_result: "If no jobs were executed, output nothing."
+    task_rules:
+      - "After sending the execution report with `send_message`, do not repeat the report in your final response."
+      - "Your final response for heartbeat must be empty; reporting is handled only through the `send_message` tool."
   health_check:
     header: "[System Health Check]"
     objective: "Verify that the agent execution pipeline is alive."
@@ -120,6 +124,8 @@ task_types:
       - "When several records obviously share the same media identity, avoid repeated `recognize_media` or `search_media` calls."
       - "Process every selected record exactly once."
       - "Keep the final response short and focused on the aggregate outcome."
+      - "Final response must be plain text only: one concise Chinese sentence or paragraph describing the aggregate result."
+      - "Do NOT include any title/header, bullet list, numbered list, bold text, code block, table, or other Markdown formatting."
   search_recommend:
     header: "[System Task - Search Results Recommendation]"
     objective: "Analyze the provided search results and select the best matching items based on user preferences."

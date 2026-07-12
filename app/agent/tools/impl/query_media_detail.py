@@ -6,6 +6,7 @@ from typing import Optional, Type
 from pydantic import BaseModel, Field
 
 from app.agent.tools.base import MoviePilotTool
+from app.agent.tools.tags import ToolTag
 from app.chain.media import MediaChain
 from app.log import logger
 from app.schemas.types import MediaType
@@ -17,7 +18,6 @@ SEASON_PREVIEW_LIMIT = 100
 
 class QueryMediaDetailInput(BaseModel):
     """查询媒体详情工具的输入参数模型"""
-    explanation: str = Field(..., description="Clear explanation of why this tool is being used in the current context")
     tmdb_id: Optional[int] = Field(None, description="TMDB ID of the media (movie or TV series, can be obtained from search_media tool)")
     douban_id: Optional[str] = Field(None, description="Douban ID of the media (alternative to tmdb_id)")
     media_type: str = Field(..., description="Allowed values: movie, tv")
@@ -25,6 +25,10 @@ class QueryMediaDetailInput(BaseModel):
 
 class QueryMediaDetailTool(MoviePilotTool):
     name: str = "query_media_detail"
+    tags: list[str] = [
+        ToolTag.Read,
+        ToolTag.Media,
+    ]
     description: str = "Query supplementary media details from TMDB by ID and media_type. Accepts tmdb_id or douban_id (at least one required). media_type accepts 'movie' or 'tv'. Returns non-duplicated detail fields such as status, genres, directors, actors, and season info for TV series."
     args_schema: Type[BaseModel] = QueryMediaDetailInput
 

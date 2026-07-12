@@ -1,22 +1,19 @@
 """切换当前激活人格工具。"""
 
 import json
-from typing import Type
+from typing import Type, Optional
 
 from pydantic import BaseModel, Field
 
 from app.agent.runtime import agent_runtime_manager
 from app.agent.tools.base import MoviePilotTool
+from app.agent.tools.tags import ToolTag
 from app.log import logger
 
 
 class SwitchPersonaInput(BaseModel):
     """切换人格工具的输入参数模型。"""
 
-    explanation: str = Field(
-        ...,
-        description="Clear explanation of why this tool is being used in the current context",
-    )
     persona_id: str = Field(
         ...,
         description=(
@@ -28,6 +25,10 @@ class SwitchPersonaInput(BaseModel):
 
 class SwitchPersonaTool(MoviePilotTool):
     name: str = "switch_persona"
+    tags: list[str] = [
+        ToolTag.Write,
+        ToolTag.Persona,
+    ]
     description: str = (
         "Switch the active persona (人格) used by the agent runtime. "
         "This change is persistent for future turns. "

@@ -6,6 +6,7 @@ from typing import Optional, Type
 from pydantic import BaseModel, Field
 
 from app.agent.tools.base import MoviePilotTool
+from app.agent.tools.tags import ToolTag
 from app.agent.tools.impl._filter_rule_utils import (
     collect_custom_rule_group_refs,
     get_custom_rules,
@@ -22,10 +23,6 @@ from app.schemas.types import SystemConfigKey
 class UpdateCustomFilterRuleInput(BaseModel):
     """更新自定义过滤规则工具的输入参数模型"""
 
-    explanation: str = Field(
-        ...,
-        description="Clear explanation of why this tool is being used in the current context",
-    )
     current_rule_id: str = Field(
         ..., description="Existing custom rule ID to update."
     )
@@ -60,6 +57,11 @@ class UpdateCustomFilterRuleInput(BaseModel):
 
 class UpdateCustomFilterRuleTool(MoviePilotTool):
     name: str = "update_custom_filter_rule"
+    tags: list[str] = [
+        ToolTag.Write,
+        ToolTag.FilterRule,
+        ToolTag.Admin,
+    ]
     description: str = (
         "Update an existing custom filter rule. "
         "If the rule ID is renamed, all rule groups that reference the old ID are updated automatically."

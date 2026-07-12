@@ -5,7 +5,7 @@ import inspect
 import json
 import time
 from functools import wraps
-from typing import Any, List
+from typing import Any, List, Optional
 
 from langchain_core.messages import AIMessage, AIMessageChunk
 
@@ -32,29 +32,87 @@ class LLMTestTimeout(TimeoutError):
 def _patch_gemini_thought_signature():
     """
     修复 langchain-google-genai 中 Gemini 2.5 思考模型的 thought_signature 兼容问题。
-    langchain-google-genai 的 _is_gemini_3_or_later() 仅检查 "gemini-3"，
-    导致 Gemini 2.5 思考模型（如 gemini-2.5-flash、gemini-2.5-pro）在工具调用时
-    缺少 thought_signature 而报错 400。
-    此补丁将检查范围扩展到 Gemini 2.5 模型。
+
+    问题 1：_is_gemini_3_or_later() 仅检查 "gemini-3"，不包含 Gemini 2.5 模型，
+    导致 _parse_chat_history 的 thought_signature 强制注入逻辑被跳过。
+
+    问题 2：强制注入逻辑使用 first_fc_seen 标志，只给每个 model 消息中
+    第一个缺少 thought_signature 的 function_call 补 dummy，后续并行
+    function_call 仍缺失签名，导致 Gemini API 返回 400。
+
+    此补丁同时修复以上两个问题。
     """
     try:
         import langchain_google_genai.chat_models as _cm
+
+        # 检查版本：需要 >= 4.0 才支持 _is_gemini_3_or_later
+        try:
+            from importlib.metadata import version
+            _version = version("langchain-google-genai") or ""
+        except Exception:
+            _version = ""
+        try:
+            _major = int(_version.split(".")[0]) if _version else 0
+        except (ValueError, TypeError):
+            _major = 0
+        if _major < 4:
+            logger.error(
+                f"langchain-google-genai 版本 {_version or '未知'} 过旧，"
+                f"不支持 Gemini 2.5+ 模型的 thought_signature 处理，"
+                f"请升级到 4.2.3+：pip install langchain-google-genai~=4.2.3"
+            )
+            return
 
         # 仅在未修补时执行
         if getattr(_cm, "_thought_signature_patched", False):
             return
 
+        if not hasattr(_cm, "_is_gemini_3_or_later"):
+            logger.error(
+                "langchain-google-genai 缺少 _is_gemini_3_or_later，"
+                "无法修补 thought_signature 兼容性，请检查包版本"
+            )
+            return
+
+        # 补丁 1：扩展 _is_gemini_3_or_later，使 Gemini 2.5 模型也能触发
+        # _parse_chat_history 中的 thought_signature 强制注入逻辑
         def _patched_is_gemini_3_or_later(model_name: str) -> bool:
             if not model_name:
                 return False
             name = model_name.lower().replace("models/", "")
-            # Gemini 2.5 思考模型也需要 thought_signature 支持
             return "gemini-3" in name or "gemini-2.5" in name
 
         _cm._is_gemini_3_or_later = _patched_is_gemini_3_or_later
+
+        # 补丁 2：修复 _parse_chat_history 中 first_fc_seen 只修复第一个
+        # function_call 的问题。用 wrapper 在原函数返回后，确保所有 model
+        # 消息中所有 function_call 都带有 thought_signature。
+        _original_parse_chat_history = _cm._parse_chat_history  # noqa
+
+        def _patched_parse_chat_history(*args, **kwargs):
+            result = _original_parse_chat_history(*args, **kwargs)
+            system_instruction, formatted_messages = result
+
+            # 从参数中提取 model 名称
+            model = kwargs.get("model")
+            if model is None and len(args) >= 4:
+                model = args[3]
+
+            if model and _patched_is_gemini_3_or_later(model):
+                dummy = _cm.DUMMY_THOUGHT_SIGNATURE
+                for content_msg in formatted_messages:
+                    if content_msg.role == "model":
+                        for part in content_msg.parts or []:
+                            if part.function_call and not part.thought_signature:
+                                part.thought_signature = dummy
+
+            return result
+
+        _cm._parse_chat_history = _patched_parse_chat_history
         _cm._thought_signature_patched = True
         logger.debug(
-            "已修补 langchain-google-genai thought_signature 兼容性（覆盖 Gemini 2.5 模型）"
+            "已修补 langchain-google-genai thought_signature 兼容性"
+            "（覆盖 Gemini 2.5 模型 + 修复并行 function_call 签名缺失）"
         )
     except Exception as e:
         logger.warning(f"修补 langchain-google-genai thought_signature 失败: {e}")
@@ -77,6 +135,57 @@ def _get_httpx_proxy_key() -> str:
     except Exception as e:
         logger.warning(f"检测 httpx 代理参数失败，默认使用 'proxies'：{e}")
         return "proxies"
+
+
+def _resolve_llm_proxy(use_proxy: bool | None = None) -> str | None:
+    """
+    解析本次 LLM 调用应使用的系统代理地址。
+    """
+    should_use_proxy = settings.LLM_USE_PROXY if use_proxy is None else use_proxy
+    return settings.PROXY_HOST if should_use_proxy and settings.PROXY_HOST else None
+
+
+def _build_httpx_proxy_kwargs(proxy_url: str | None) -> dict[str, str]:
+    """
+    构造兼容当前 httpx 版本的代理参数。
+    """
+    if not proxy_url:
+        return {}
+    return {_get_httpx_proxy_key(): proxy_url}
+
+
+def _build_google_client_args(proxy_url: str | None) -> dict[str, Any]:
+    """
+    构造 Google SDK 透传给 httpx 的客户端参数。
+    """
+    return {
+        "trust_env": False,
+        **_build_httpx_proxy_kwargs(proxy_url),
+    }
+
+
+def _build_httpx_client(
+        proxy_url: str | None,
+        *,
+        async_client: bool = False,
+        timeout: float | None = None,
+):
+    """
+    构造显式代理策略的 httpx 客户端。
+
+    当关闭 LLM 代理时也返回 trust_env=False 的客户端，避免 httpx 自动读取
+    进程环境变量中的代理配置。
+    """
+    import httpx
+
+    client_cls = httpx.AsyncClient if async_client else httpx.Client
+    kwargs: dict[str, Any] = {
+        "trust_env": False,
+        **_build_httpx_proxy_kwargs(proxy_url),
+    }
+    if timeout is not None:
+        kwargs["timeout"] = timeout
+    return client_cls(**kwargs)
 
 
 def _deepseek_thinking_toggle(extra_body: Any) -> bool | None:
@@ -296,6 +405,7 @@ def _patch_openai_responses_instructions_support():
         return
 
     _patch_openai_interleaved_reasoning_content_support()
+    _patch_openai_responses_empty_output_support()
 
     if getattr(ChatOpenAI, "_moviepilot_responses_instructions_patched", False):
         return
@@ -353,6 +463,64 @@ def _patch_openai_responses_instructions_support():
     ChatOpenAI._get_request_payload = _patched_get_request_payload
     ChatOpenAI._moviepilot_responses_instructions_patched = True
     logger.debug("已修补 langchain-openai responses API 的 instructions 兼容性")
+
+
+def _patch_openai_responses_empty_output_support():
+    """
+    修补 langchain-openai Responses API 流式完成事件 output 为空的兼容性。
+
+    ChatGPT Codex 后端有时会在 `response.completed` chunk 里返回
+    `response.output = None`，但前面的 delta chunk 已经包含实际文本。
+    langchain-openai 在收尾阶段遍历 output 会抛出 TypeError，这里将缺失
+    output 规整为空列表，让收尾 chunk 只承载 usage/metadata。
+    """
+    try:
+        import langchain_openai.chat_models.base as _openai_base
+    except Exception as err:
+        logger.debug(f"跳过 langchain-openai responses output 修补：{err}")
+        return
+
+    if getattr(_openai_base, "_moviepilot_responses_empty_output_patched", False):
+        return
+
+    original_construct = getattr(
+        _openai_base, "_construct_lc_result_from_responses_api", None
+    )
+    if not callable(original_construct):
+        logger.warning("langchain-openai 缺少 Responses API 结果构造函数，无法修补 output")
+        return
+
+    def _clone_response_with_empty_output(response):
+        """
+        复制 Responses 对象，把缺失 output 规整为空列表。
+        """
+        model_copy = getattr(response, "model_copy", None)
+        if callable(model_copy):
+            try:
+                return model_copy(update={"output": []})
+            except Exception as e:
+                logger.debug(f"复制 Responses 对象失败，回退原地修补 output：{e}")
+
+        try:
+            setattr(response, "output", [])
+        except Exception as e:
+            logger.debug(f"原地修补 Responses output 失败：{e}")
+        return response
+
+    @wraps(original_construct)
+    def _patched_construct_lc_result_from_responses_api(response, *args, **kwargs):
+        """
+        在 Responses API 收尾 chunk 缺少 output 时跳过空内容遍历。
+        """
+        if hasattr(response, "output") and getattr(response, "output", None) is None:
+            response = _clone_response_with_empty_output(response)
+        return original_construct(response, *args, **kwargs)
+
+    _openai_base._construct_lc_result_from_responses_api = (
+        _patched_construct_lc_result_from_responses_api
+    )
+    _openai_base._moviepilot_responses_empty_output_patched = True
+    logger.debug("已修补 langchain-openai responses API 空 output 兼容性")
 
 
 class LLMHelper:
@@ -532,11 +700,85 @@ class LLMHelper:
         return {}
 
     @staticmethod
-    def supports_image_input() -> bool:
+    def _metadata_supports_image_input(metadata: Any) -> Optional[bool]:
+        """从模型元数据中读取图片输入能力，未知时返回 None。"""
+        if not isinstance(metadata, dict):
+            return None
+
+        modalities = metadata.get("modalities") or {}
+        input_modalities = modalities.get("input")
+        if isinstance(input_modalities, str):
+            input_modalities = [input_modalities]
+        if isinstance(input_modalities, list):
+            normalized_modalities = {
+                str(item or "").strip().lower() for item in input_modalities
+            }
+            return "image" in normalized_modalities
+        return None
+
+    @classmethod
+    def _resolve_catalog_image_input_support(
+            cls,
+            provider: Optional[str] = None,
+            model: Optional[str] = None,
+            base_url: Optional[str] = None,
+            base_url_preset: Optional[str] = None,
+    ) -> Optional[bool]:
+        """复用 provider 目录缓存解析当前模型是否支持图片输入。"""
+        provider_name = str(provider if provider is not None else settings.LLM_PROVIDER).strip()
+        model_name = str(model if model is not None else settings.LLM_MODEL).strip()
+        if not provider_name or not model_name:
+            return None
+
+        try:
+            from app.agent.llm.provider import LLMProviderManager
+
+            metadata = LLMProviderManager().resolve_cached_model_metadata(
+                provider_id=provider_name,
+                model_id=model_name,
+                base_url=base_url if base_url is not None else settings.LLM_BASE_URL,
+                base_url_preset_id=(
+                    base_url_preset
+                    if base_url_preset is not None
+                    else settings.LLM_BASE_URL_PRESET
+                ),
+            )
+        except Exception as err:
+            logger.debug(f"解析模型图片能力失败: {err}")
+            return None
+
+        return cls._metadata_supports_image_input(metadata)
+
+    @classmethod
+    def supports_image_input(
+            cls,
+            provider: Optional[str] = None,
+            model: Optional[str] = None,
+            base_url: Optional[str] = None,
+            base_url_preset: Optional[str] = None,
+    ) -> bool:
         """
         判断当前模型是否启用了图片输入能力。
+
+        用户开关为总开关；当内置模型目录明确标注当前模型不支持 image 输入时，
+        即使总开关开启也降级为纯文本，避免文本模型收到 `image_url` 内容块后
+        被兼容端点以 400 拒绝。无参调用保持旧版“只读总开关”语义，
+        未知自定义模型也保持原有开关语义。
         """
-        return bool(settings.LLM_SUPPORT_IMAGE_INPUT)
+        if not settings.LLM_SUPPORT_IMAGE_INPUT:
+            return False
+        if provider is None and model is None:
+            return True
+
+        image_support = cls._resolve_catalog_image_input_support(
+            provider=provider,
+            model=model,
+            base_url=base_url,
+            base_url_preset=base_url_preset,
+        )
+        if image_support is not None:
+            return image_support
+        return True
 
     @staticmethod
     def _build_legacy_runtime(
@@ -544,6 +786,7 @@ class LLMHelper:
             model_name: str | None,
             api_key: str | None = None,
             base_url: str | None = None,
+            user_agent: str | None = None,
     ) -> dict[str, Any]:
         """
         在 provider 目录不可用时回退到旧的直接构造逻辑。
@@ -567,11 +810,102 @@ class LLMHelper:
             "model_id": model_name,
             "api_key": api_key_value,
             "base_url": base_url_value,
-            "default_headers": None,
+            "default_headers": LLMHelper._build_openai_default_headers(
+                None,
+                user_agent=user_agent,
+            ),
             "use_responses_api": None,
             "model_record": None,
             "model_metadata": None,
         }
+
+    @staticmethod
+    def _build_openai_default_headers(
+            default_headers: dict[str, str] | None = None,
+            user_agent: str | None = None,
+    ) -> dict[str, str] | None:
+        """
+        合并 OpenAI 兼容接口默认请求头。
+
+        :param default_headers: provider 运行时已解析的默认请求头
+        :param user_agent: 用户配置的 User-Agent，非空时写入标准请求头
+        :return: 可传给 OpenAI SDK 的请求头字典
+        """
+        headers = dict(default_headers or {})
+        normalized_user_agent = str(user_agent or "").strip()
+        if normalized_user_agent:
+            for key in list(headers.keys()):
+                if key.lower() == "user-agent":
+                    headers.pop(key)
+            headers["User-Agent"] = normalized_user_agent
+        return headers or None
+
+    @classmethod
+    def _should_use_openai_responses_api(
+            cls,
+            provider: str,
+            model: str | None,
+            runtime: dict[str, Any],
+    ) -> bool | None:
+        """
+        判断官方 ChatGPT API Key 模式是否应使用 Responses API。
+
+        GPT-5/o 系推理模型在 Chat Completions 中组合 function tools 与
+        reasoning_effort 时会被官方端点拒绝，因此 ChatGPT 官方 API Key
+        模式需要显式切到 Responses API；通用 OpenAI-compatible 入口保持
+        provider 目录解析出的默认行为，避免误伤第三方兼容服务。
+        """
+        runtime_use_responses_api = runtime.get("use_responses_api")
+        if runtime_use_responses_api is not None:
+            return bool(runtime_use_responses_api)
+
+        provider_name = (provider or "").strip().lower()
+        if provider_name != "chatgpt":
+            return None
+
+        base_url = str(runtime.get("base_url") or "").strip().lower()
+        if "api.openai.com" not in base_url:
+            return None
+
+        model_name = cls._normalize_model_name(model)
+        if model_name.startswith(("gpt-5", "o1", "o3", "o4")):
+            return True
+        return None
+
+    @staticmethod
+    def _attach_runtime_metadata(model: Any, runtime: dict[str, Any]) -> None:
+        """
+        将 MoviePilot 已解析出的 provider 运行时信息挂到模型实例上。
+
+        这些字段只供内部中间件识别协议能力，不参与 LangChain 请求序列化。
+        """
+        runtime_metadata = {
+            "runtime": runtime.get("runtime"),
+            "provider_id": runtime.get("provider_id"),
+            "base_url": runtime.get("base_url"),
+        }
+
+        def _set_metadata_attr(name: str, value: Any) -> None:
+            try:
+                setattr(model, name, value)
+            except Exception:
+                object.__setattr__(model, name, value)
+
+        try:
+            _set_metadata_attr("_moviepilot_llm_runtime", runtime_metadata["runtime"])
+            _set_metadata_attr(
+                "_moviepilot_llm_provider_id",
+                runtime_metadata["provider_id"],
+            )
+            _set_metadata_attr("_moviepilot_llm_base_url", runtime_metadata["base_url"])
+        except Exception as err:
+            logger.debug(f"LLM运行时元数据附加失败: {str(err)}")
+
+        profile = getattr(model, "profile", None)
+        if isinstance(profile, dict):
+            profile["moviepilot_runtime"] = runtime_metadata["runtime"]
+            profile["moviepilot_provider_id"] = runtime_metadata["provider_id"]
+            profile["moviepilot_base_url"] = runtime_metadata["base_url"]
 
     @classmethod
     def _resolve_thinking_level(
@@ -617,6 +951,9 @@ class LLMHelper:
             api_key: str | None = None,
             base_url: str | None = None,
             base_url_preset: str | None = None,
+            user_agent: str | None = None,
+            temperature: Optional[float] = None,
+            use_proxy: bool | None = None,
     ):
         """
         获取LLM实例
@@ -630,6 +967,9 @@ class LLMHelper:
         :param api_key: API Key。未显式传入时使用当前配置项 LLM_API_KEY。对于某些提供商（如 DeepSeek），可能需要同时提供 base_url。
         :param base_url: API Base URL。未显式传入时使用当前配置项 LLM_BASE_URL。
         :param base_url_preset: Base URL 预设。未显式传入时使用当前配置项 LLM_BASE_URL_PRESET。
+        :param user_agent: OpenAI兼容接口请求 User-Agent。未显式传入时使用配置项 LLM_USER_AGENT。
+        :param temperature: LLM 温度参数。未显式传入时使用配置项 LLM_TEMPERATURE。
+        :param use_proxy: 是否为本次 LLM 调用使用系统代理。未显式传入时使用配置项 LLM_USE_PROXY。
         :return: LLM实例
         """
         provider_name = str(provider if provider is not None else settings.LLM_PROVIDER).lower()
@@ -639,6 +979,8 @@ class LLMHelper:
         base_url_preset_value = (
             base_url_preset if base_url_preset is not None else settings.LLM_BASE_URL_PRESET
         )
+        user_agent_value = user_agent if user_agent is not None else settings.LLM_USER_AGENT
+        temperature_value = temperature if temperature is not None else settings.LLM_TEMPERATURE
         normalized_thinking_level = cls._resolve_thinking_level(
             thinking_level=thinking_level,
         )
@@ -653,6 +995,8 @@ class LLMHelper:
                 api_key=api_key_value,
                 base_url=base_url_value,
                 base_url_preset_id=base_url_preset_value,
+                user_agent=user_agent_value,
+                use_proxy=use_proxy,
             )
         except Exception as err:
             logger.debug(f"LLM provider 目录不可用，回退到旧运行时逻辑: {err}")
@@ -661,13 +1005,24 @@ class LLMHelper:
                 model_name=model_name,
                 api_key=api_key_value,
                 base_url=base_url_value,
+                user_agent=user_agent_value,
             )
         model_name = runtime.get("model_id") or model_name
+        default_headers = cls._build_openai_default_headers(
+            runtime.get("default_headers"),
+            user_agent=user_agent_value,
+        )
         thinking_kwargs = cls._build_thinking_kwargs(
             provider=provider_name,
             model=model_name,
             thinking_level=normalized_thinking_level,
         )
+        use_responses_api = cls._should_use_openai_responses_api(
+            provider=provider_name,
+            model=model_name,
+            runtime=runtime,
+        )
+        llm_proxy = _resolve_llm_proxy(use_proxy)
 
         if runtime["runtime"] == "google":
             # 修补 Gemini 2.5 思考模型的 thought_signature 兼容性
@@ -678,18 +1033,13 @@ class LLMHelper:
             # 会导致工具调用时报错 400
             from langchain_google_genai import ChatGoogleGenerativeAI
 
-            client_args = None
-            if settings.PROXY_HOST:
-                proxy_key = _get_httpx_proxy_key()
-                client_args = {proxy_key: settings.PROXY_HOST}
-
             model = ChatGoogleGenerativeAI(
                 model=model_name,
                 api_key=runtime["api_key"],
                 retries=3,
-                temperature=settings.LLM_TEMPERATURE,
+                temperature=temperature_value,
                 streaming=streaming,
-                client_args=client_args,
+                client_args=_build_google_client_args(llm_proxy),
                 **thinking_kwargs,
             )
         elif runtime["runtime"] == "deepseek":
@@ -701,9 +1051,11 @@ class LLMHelper:
                 api_key=runtime["api_key"],
                 api_base=runtime["base_url"],
                 max_retries=3,
-                temperature=settings.LLM_TEMPERATURE,
+                temperature=temperature_value,
                 streaming=streaming,
                 stream_usage=True,
+                http_client=_build_httpx_client(llm_proxy),
+                http_async_client=_build_httpx_client(llm_proxy, async_client=True),
                 **thinking_kwargs,
             )
         elif runtime["runtime"] in {"anthropic_compatible", "copilot_anthropic"}:
@@ -714,11 +1066,11 @@ class LLMHelper:
                 api_key=runtime["api_key"],
                 base_url=runtime["base_url"],
                 max_retries=3,
-                temperature=settings.LLM_TEMPERATURE,
+                temperature=temperature_value,
                 streaming=streaming,
                 stream_usage=True,
-                anthropic_proxy=settings.PROXY_HOST,
-                default_headers=runtime.get("default_headers"),
+                anthropic_proxy=llm_proxy,
+                default_headers=default_headers,
                 **thinking_kwargs,
             )
         else:
@@ -735,12 +1087,20 @@ class LLMHelper:
                 api_key=runtime["api_key"],
                 max_retries=3,
                 base_url=runtime.get("base_url"),
-                temperature=settings.LLM_TEMPERATURE,
+                temperature=temperature_value,
                 streaming=streaming,
                 stream_usage=True,
-                openai_proxy=settings.PROXY_HOST,
-                default_headers=runtime.get("default_headers"),
-                use_responses_api=runtime.get("use_responses_api"),
+                openai_proxy=llm_proxy,
+                **(
+                    {}
+                    if llm_proxy
+                    else {
+                        "http_client": _build_httpx_client(llm_proxy),
+                        "http_async_client": _build_httpx_client(llm_proxy, async_client=True),
+                    }
+                ),
+                default_headers=default_headers,
+                use_responses_api=use_responses_api,
                 **thinking_kwargs,
             )
 
@@ -763,12 +1123,17 @@ class LLMHelper:
                 "max_input_tokens": int(max_input_tokens),
             }
 
+        cls._attach_runtime_metadata(model, runtime)
         return model
 
     @staticmethod
-    def _extract_text_content(content) -> str:
+    def extract_text_content(content: Any, fallback_to_string: bool = False) -> str:
         """
         从响应内容中提取纯文本，仅保留真实文本块。
+
+        :param content: 模型响应内容，可能是字符串、字典或内容块列表
+        :param fallback_to_string: 未识别为文本内容时是否回退为字符串
+        :return: 提取后的纯文本内容
         """
         if content is None:
             return ""
@@ -803,7 +1168,7 @@ class LLMHelper:
                 return content.get("text", "")
             if not content.get("type") and isinstance(content.get("text"), str):
                 return content.get("text", "")
-        return ""
+        return str(content) if fallback_to_string else ""
 
     @staticmethod
     async def test_current_settings(
@@ -815,22 +1180,33 @@ class LLMHelper:
             api_key: str | None = None,
             base_url: str | None = None,
             base_url_preset: str | None = None,
+            user_agent: str | None = None,
+            temperature: Optional[float] = None,
+            use_proxy: bool | None = None,
     ) -> dict:
         """
-        使用当前已保存配置执行一次最小 LLM 调用。
+        使用当前配置或显式传入的临时配置执行一次最小 LLM 调用。
+
+        :param temperature: LLM 温度参数。未显式传入时沿用已保存配置。
         """
         provider_name = provider if provider is not None else settings.LLM_PROVIDER
         model_name = model if model is not None else settings.LLM_MODEL
         start = time.perf_counter()
-        llm = await LLMHelper.get_llm(
-            streaming=False,
-            provider=provider_name,
-            model=model_name,
-            thinking_level=thinking_level,
-            api_key=api_key,
-            base_url=base_url,
-            base_url_preset=base_url_preset,
-        )
+        llm_kwargs = {
+            "streaming": False,
+            "provider": provider_name,
+            "model": model_name,
+            "thinking_level": thinking_level,
+            "api_key": api_key,
+            "base_url": base_url,
+            "base_url_preset": base_url_preset,
+            "user_agent": user_agent,
+            "use_proxy": use_proxy,
+        }
+        if temperature is not None:
+            llm_kwargs["temperature"] = temperature
+
+        llm = await LLMHelper.get_llm(**llm_kwargs)
         try:
             response = await asyncio.wait_for(llm.ainvoke(prompt), timeout=timeout)
         except TimeoutError as err:
@@ -840,7 +1216,7 @@ class LLMHelper:
             duration_ms = round((time.perf_counter() - start) * 1000)
             raise LLMTestError(str(err), duration_ms=duration_ms) from err
 
-        reply_text = LLMHelper._extract_text_content(
+        reply_text = LLMHelper.extract_text_content(
             getattr(response, "content", response)
         ).strip()
         duration_ms = round((time.perf_counter() - start) * 1000)
@@ -860,6 +1236,8 @@ class LLMHelper:
             api_key: str | None = None,
             base_url: str | None = None,
             base_url_preset: str | None = None,
+            user_agent: str | None = None,
+            use_proxy: bool | None = None,
             force_refresh: bool = False,
     ) -> List[dict[str, Any]]:
         """
@@ -877,6 +1255,8 @@ class LLMHelper:
                 api_key=api_key,
                 base_url=base_url,
                 base_url_preset_id=base_url_preset,
+                user_agent=user_agent,
+                use_proxy=use_proxy,
                 force_refresh=force_refresh,
             )
         except Exception as err:
@@ -884,7 +1264,10 @@ class LLMHelper:
             if provider == "google":
                 return [
                     {"id": model_id, "name": model_id}
-                    for model_id in await self._get_google_models(api_key or "")
+                    for model_id in await self._get_google_models(
+                        api_key or "",
+                        use_proxy=use_proxy,
+                    )
                 ]
             try:
                 from app.agent.llm.provider import LLMProviderManager
@@ -905,24 +1288,24 @@ class LLMHelper:
                     provider,
                     api_key or "",
                     model_list_base_url,
+                    user_agent=user_agent,
+                    use_proxy=use_proxy,
                 )
             ]
 
     @staticmethod
-    async def _get_google_models(api_key: str) -> List[str]:
+    async def _get_google_models(api_key: str, use_proxy: bool | None = None) -> List[str]:
         """获取Google模型列表（使用 google-genai SDK v1）"""
         try:
             from google import genai
             from google.genai.types import HttpOptions
 
-            http_options = None
-            if settings.PROXY_HOST:
-                proxy_key = _get_httpx_proxy_key()
-                proxy_args = {proxy_key: settings.PROXY_HOST}
-                http_options = HttpOptions(
-                    client_args=proxy_args,
-                    async_client_args=proxy_args,
-                )
+            llm_proxy = _resolve_llm_proxy(use_proxy)
+            google_client_args = _build_google_client_args(llm_proxy)
+            http_options = HttpOptions(
+                client_args=google_client_args,
+                async_client_args=google_client_args,
+            )
 
             client = genai.Client(api_key=api_key, http_options=http_options)
             models = await client.aio.models.list()
@@ -939,7 +1322,11 @@ class LLMHelper:
 
     @staticmethod
     async def _get_openai_compatible_models(
-            provider: str, api_key: str, base_url: str = None
+            provider: str,
+            api_key: str,
+            base_url: str = None,
+            user_agent: str | None = None,
+            use_proxy: bool | None = None,
     ) -> List[str]:
         """获取OpenAI兼容模型列表"""
         try:
@@ -948,7 +1335,19 @@ class LLMHelper:
             if provider == "deepseek":
                 base_url = base_url or "https://api.deepseek.com"
 
-            client = AsyncOpenAI(api_key=api_key, base_url=base_url)
+            client = AsyncOpenAI(
+                api_key=api_key,
+                base_url=base_url,
+                default_headers=LLMHelper._build_openai_default_headers(
+                    None,
+                    user_agent=user_agent,
+                ),
+                http_client=_build_httpx_client(
+                    _resolve_llm_proxy(use_proxy),
+                    async_client=True,
+                    timeout=15.0,
+                ),
+            )
             models = await client.models.list()
             await client.close()
             return [model.id for model in models.data]

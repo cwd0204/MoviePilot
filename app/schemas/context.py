@@ -61,6 +61,8 @@ class MetaInfo(BaseModel):
     web_source: Optional[str] = None
     # 应用的识别词信息
     apply_words: Optional[List[str]] = None
+    # 剧集组
+    episode_group: Optional[str] = None
 
 
 class MediaInfo(BaseModel):
@@ -232,10 +234,66 @@ class TorrentInfo(BaseModel):
     labels: Optional[list] = Field(default_factory=list)
     # 种子优先级
     pri_order: Optional[int] = 0
+    # 种子分类 电影/电视剧
+    category: Optional[str] = None
     # 促销
     volume_factor: Optional[str] = None
     # 剩余免费时间
     freedate_diff: Optional[str] = None
+
+
+class SubtitleInfo(BaseModel):
+    """
+    搜索字幕信息
+    """
+    # 站点ID
+    site: Optional[int] = None
+    # 站点名称
+    site_name: Optional[str] = None
+    # 站点Cookie
+    site_cookie: Optional[str] = None
+    # 站点UA
+    site_ua: Optional[str] = None
+    # 站点是否使用代理
+    site_proxy: Optional[bool] = False
+    # 站点优先级
+    site_order: Optional[int] = 0
+    # 字幕标题
+    title: Optional[str] = None
+    # 字幕描述
+    description: Optional[str] = None
+    # 字幕下载链接
+    enclosure: Optional[str] = None
+    # 详情页面
+    page_url: Optional[str] = None
+    # 语言
+    language: Optional[str] = None
+    # 语言图标
+    language_icon: Optional[str] = None
+    # 字幕大小
+    size: Optional[float] = 0.0
+    # 发布时间
+    pubdate: Optional[str] = None
+    # 已过时间
+    date_elapsed: Optional[str] = None
+    # 点击/下载次数
+    grabs: Optional[int] = 0
+    # 上传者
+    uploader: Optional[str] = None
+    # 举报页面
+    report_url: Optional[str] = None
+    # 种子ID
+    torrent_id: Optional[str] = None
+    # 字幕ID
+    subtitle_id: Optional[str] = None
+    # 下载文件名
+    file_name: Optional[str] = None
+    # 识别元数据
+    meta_info: Optional[MetaInfo] = None
+    # SxxExx
+    season_episode: Optional[str] = None
+    # 集列表
+    episode_list: Optional[List[int]] = Field(default_factory=list)
 
 
 class Context(BaseModel):
@@ -256,6 +314,8 @@ class Context(BaseModel):
     candidate_recognized: Optional[bool] = False
     # 当前 media_info 是否为目标媒体回填
     media_info_is_target: Optional[bool] = False
+    # 下载层确认候选资源覆盖完整目标范围，供订阅事实写入判断整包资源
+    confirmed_full_coverage: Optional[bool] = False
 
 
 class MediaSeason(BaseModel):

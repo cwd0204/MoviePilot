@@ -1,59 +1,14 @@
 import asyncio
-import importlib.util
-import sys
 import unittest
 from pathlib import Path
-from types import ModuleType, SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
-
-def _stub_module(name: str, **attrs):
-    module = sys.modules.get(name)
-    if module is None:
-        module = ModuleType(name)
-        sys.modules[name] = module
-    for key, value in attrs.items():
-        setattr(module, key, value)
-    return module
-
-
-class _DummyLogger:
-    def __getattr__(self, _name):
-        return lambda *args, **kwargs: None
-
-
-class _DummySystemConfigOper:
-    def get(self, _key):
-        return {}
-
-    async def async_set(self, _key, _value):
-        return None
-
-
-for _module_name in ("aiofiles", "jwt"):
-    _stub_module(_module_name)
-
-_stub_module(
-    "app.core.config",
-    settings=SimpleNamespace(
-        TEMP_PATH="/tmp",
-        PROXY_HOST=None,
-        LLM_MAX_CONTEXT_TOKENS=64,
-    ),
+from app.agent.llm import provider as provider_module
+from app.agent.llm.provider import (
+    LLMProviderError,
+    LLMProviderManager,
+    PendingAuthSession,
 )
-_stub_module("app.db.systemconfig_oper", SystemConfigOper=_DummySystemConfigOper)
-_stub_module("app.log", logger=_DummyLogger())
-_stub_module("app.schemas.types", SystemConfigKey=SimpleNamespace(AIAgentConfig="agent"))
-
-provider_path = Path(__file__).resolve().parents[1] / "app" / "agent" / "llm" / "provider.py"
-spec = importlib.util.spec_from_file_location("test_llm_provider_module", provider_path)
-provider_module = importlib.util.module_from_spec(spec)
-assert spec and spec.loader
-sys.modules[spec.name] = provider_module
-spec.loader.exec_module(provider_module)
-
-LLMProviderError = provider_module.LLMProviderError
-LLMProviderManager = provider_module.LLMProviderManager
 
 
 class LlmProviderRegistryTest(unittest.TestCase):
@@ -169,11 +124,15 @@ class LlmProviderRegistryTest(unittest.TestCase):
         with patch.object(
             manager,
             "get_models_dev_data",
-            AsyncMock(side_effect=lambda force_refresh=False: manager.__dict__.update({"_models_dev_data": payload}) or payload),
+            AsyncMock(
+                side_effect=lambda force_refresh=False, use_proxy=None: manager.__dict__.update(
+                    {"_models_dev_data": payload}
+                ) or payload
+            ),
         ) as fetch_mock:
             providers = asyncio.run(manager.list_providers_async())
 
-        fetch_mock.assert_awaited_once_with(force_refresh=False)
+        fetch_mock.assert_awaited_once_with(force_refresh=False, use_proxy=None)
         self.assertIn("frogbot", {item["id"] for item in providers})
 
     def test_list_models_uses_dynamic_provider_after_refresh(self):
@@ -194,7 +153,7 @@ class LlmProviderRegistryTest(unittest.TestCase):
             }
         }
 
-        async def _load_models_dev(force_refresh: bool = False):
+        async def _load_models_dev(force_refresh: bool = False, use_proxy=None):
             manager._models_dev_data = payload
             return payload
 
@@ -341,6 +300,127 @@ class LlmProviderRegistryTest(unittest.TestCase):
         models = asyncio.run(manager.list_models(provider_id="kuaishou-wanqing"))
 
         self.assertEqual(models, [])
+
+    def test_builtin_provider_includes_china_operator_token_services(self):
+        """三大运营商 Token 服务应作为内置 OpenAI-compatible provider 暴露。"""
+        manager = LLMProviderManager()
+
+        unicom = manager.get_provider("china-unicom")
+        mobile = manager.get_provider("china-mobile")
+        telecom = manager.get_provider("china-telecom")
+
+        self.assertEqual(unicom.name, "中国联通")
+        self.assertEqual(unicom.default_base_url, "https://aigw-gzgy2.cucloud.cn:8443/v1")
+        self.assertEqual(
+            tuple((preset.id, preset.value, preset.runtime) for preset in unicom.base_url_presets),
+            (
+                (
+                    "china-unicom-coding-openai",
+                    "https://aigw-gzgy2.cucloud.cn:8443/v1",
+                    None,
+                ),
+                (
+                    "china-unicom-coding-anthropic",
+                    "https://aigw-gzgy2.cucloud.cn:8443",
+                    "anthropic_compatible",
+                ),
+            ),
+        )
+        self.assertTrue(unicom.base_url_editable)
+        self.assertFalse(unicom.supports_model_refresh)
+        self.assertEqual(unicom.model_list_strategy, "manual")
+
+        self.assertEqual(mobile.name, "中国移动")
+        self.assertEqual(mobile.default_base_url, "https://ecloud.10086.cn/api")
+        self.assertEqual(
+            tuple((preset.id, preset.value) for preset in mobile.base_url_presets),
+            (
+                ("china-mobile-moma", "https://ecloud.10086.cn/api"),
+                (
+                    "china-mobile-coding",
+                    "https://zhenze-huhehaote.cmecloud.cn/api/coding/v1",
+                ),
+            ),
+        )
+        self.assertTrue(mobile.base_url_editable)
+        self.assertFalse(mobile.supports_model_refresh)
+        self.assertEqual(mobile.model_list_strategy, "manual")
+
+        self.assertEqual(telecom.name, "中国电信")
+        self.assertEqual(telecom.default_base_url, "https://wishub-x6.ctyun.cn/v1")
+        self.assertEqual(telecom.api_key_label, "App Key")
+        self.assertEqual(
+            tuple(
+                (preset.id, preset.value, preset.runtime, preset.model_list_strategy)
+                for preset in telecom.base_url_presets
+            ),
+            (
+                (
+                    "china-telecom-token-service",
+                    "https://wishub-x6.ctyun.cn/v1",
+                    None,
+                    None,
+                ),
+                (
+                    "china-telecom-coding-openai",
+                    "https://wishub-x6.ctyun.cn/coding/v1",
+                    None,
+                    "manual",
+                ),
+                (
+                    "china-telecom-coding-anthropic",
+                    "https://wishub-x6.ctyun.cn/coding/v1",
+                    "anthropic_compatible",
+                    "manual",
+                ),
+            ),
+        )
+        self.assertTrue(telecom.base_url_editable)
+
+    def test_china_operator_manual_model_presets_return_empty_model_list(self):
+        """未提供稳定全局模型目录的运营商套餐应回退为手动填写模型。"""
+        manager = LLMProviderManager()
+
+        unicom_models = asyncio.run(manager.list_models(provider_id="china-unicom"))
+        mobile_models = asyncio.run(manager.list_models(provider_id="china-mobile"))
+        telecom_coding_models = asyncio.run(
+            manager.list_models(
+                provider_id="china-telecom",
+                base_url_preset_id="china-telecom-coding-openai",
+            )
+        )
+
+        self.assertEqual(unicom_models, [])
+        self.assertEqual(mobile_models, [])
+        self.assertEqual(telecom_coding_models, [])
+
+    def test_china_operator_anthropic_presets_resolve_runtime(self):
+        """运营商提供 Anthropic 协议地址时应切换到 anthropic_compatible runtime。"""
+        manager = LLMProviderManager()
+
+        unicom_runtime = asyncio.run(
+            manager.resolve_runtime(
+                provider_id="china-unicom",
+                model=None,
+                api_key="sk-test",
+                base_url="https://aigw-gzgy2.cucloud.cn:8443",
+                base_url_preset_id="china-unicom-coding-anthropic",
+            )
+        )
+        telecom_runtime = asyncio.run(
+            manager.resolve_runtime(
+                provider_id="china-telecom",
+                model=None,
+                api_key="cp-test",
+                base_url="https://wishub-x6.ctyun.cn/coding/v1",
+                base_url_preset_id="china-telecom-coding-anthropic",
+            )
+        )
+
+        self.assertEqual(unicom_runtime["runtime"], "anthropic_compatible")
+        self.assertEqual(unicom_runtime["base_url"], "https://aigw-gzgy2.cucloud.cn:8443")
+        self.assertEqual(telecom_runtime["runtime"], "anthropic_compatible")
+        self.assertEqual(telecom_runtime["base_url"], "https://wishub-x6.ctyun.cn/coding")
 
     def test_builtin_minimax_provider_merges_general_and_coding_presets(self):
         manager = LLMProviderManager()
@@ -491,6 +571,20 @@ class LlmProviderRegistryTest(unittest.TestCase):
 
         self.assertEqual(models, [])
 
+    def test_expired_auth_session_cleanup_removes_state_index(self):
+        """过期授权会话应同时移除 session 与 OAuth state 索引。"""
+        manager = LLMProviderManager()
+        manager._pending_sessions["session-old"] = PendingAuthSession(
+            session_id="session-old",
+            provider_id="chatgpt",
+            method_id="browser_oauth",
+            flow_type="oauth",
+            expires_at=100,
+        )
+        manager._oauth_state_index["state-old"] = "session-old"
 
-if __name__ == "__main__":
-    unittest.main()
+        with manager._lock:
+            manager._cleanup_auth_sessions_locked(now=101)
+
+        self.assertNotIn("session-old", manager._pending_sessions)
+        self.assertNotIn("state-old", manager._oauth_state_index)

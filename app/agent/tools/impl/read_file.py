@@ -7,6 +7,7 @@ from anyio import Path as AsyncPath
 from pydantic import BaseModel, Field
 
 from app.agent.tools.base import MoviePilotTool
+from app.agent.tools.tags import ToolTag
 from app.log import logger
 
 # 最大读取大小 50KB
@@ -14,7 +15,7 @@ MAX_READ_SIZE = 50 * 1024
 
 
 class ReadFileInput(BaseModel):
-    """Input parameters for read file tool"""
+    """文件读取工具的输入参数模型。"""
     file_path: str = Field(..., description="The absolute path of the file to read")
     start_line: Optional[int] = Field(None, description="The starting line number (1-based, inclusive). If not provided, reading starts from the beginning of the file.")
     end_line: Optional[int] = Field(None, description="The ending line number (1-based, inclusive). If not provided, reading goes until the end of the file.")
@@ -22,6 +23,10 @@ class ReadFileInput(BaseModel):
 
 class ReadFileTool(MoviePilotTool):
     name: str = "read_file"
+    tags: list[str] = [
+        ToolTag.Read,
+        ToolTag.File,
+    ]
     description: str = "Read the content of a text file. Supports reading by line range. Each read is limited to 50KB; content exceeding this limit will be truncated."
     args_schema: Type[BaseModel] = ReadFileInput
 
@@ -36,15 +41,21 @@ class ReadFileTool(MoviePilotTool):
         logger.info(f"执行工具: {self.name}, 参数: file_path={file_path}, start_line={start_line}, end_line={end_line}")
 
         try:
-            path = AsyncPath(file_path)
+            resolved_path, access_error = await self._check_local_file_access(
+                file_path, operation="读取"
+            )
+            if access_error:
+                return access_error
+
+            path = AsyncPath(resolved_path)
 
             if not await path.exists():
-                return f"错误：文件 {file_path} 不存在"
+                return f"错误：文件 {resolved_path} 不存在"
 
             if not await path.is_file():
-                return f"错误：{file_path} 不是一个文件"
+                return f"错误：{resolved_path} 不是一个文件"
 
-            content = await path.read_text(encoding="utf-8")
+            content = await path.read_text(encoding="utf-8", errors="replace")
             truncated = False
 
             if start_line is not None or end_line is not None:
@@ -64,7 +75,7 @@ class ReadFileTool(MoviePilotTool):
             # 检查大小限制
             content_bytes = content.encode("utf-8")
             if len(content_bytes) > MAX_READ_SIZE:
-                content = content_bytes[:MAX_READ_SIZE].decode("utf-8", errors="ignore")
+                content = content_bytes[:MAX_READ_SIZE].decode("utf-8", errors="replace")
                 truncated = True
 
             if truncated:

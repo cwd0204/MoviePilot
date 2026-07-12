@@ -11,9 +11,23 @@ from app.core.metainfo import MetaInfo
 from app.log import logger
 from app.modules import _ModuleBase, _DownloaderBase
 from app.modules.transmission.transmission import Transmission
-from app.schemas import TransferTorrent, DownloadingTorrent
-from app.schemas.types import TorrentStatus, ModuleType, DownloaderType
+from app.schemas import DownloaderTorrent
+from app.schemas.types import (
+    DownloadTaskState,
+    DownloaderType,
+    ModuleType,
+    TorrentQueryStatus,
+    TorrentStatus,
+)
 from app.utils.string import StringUtils
+
+_TRANSMISSION_DOWNLOADING_STATES = {
+    "download_pending",
+    "downloading",
+}
+_TRANSMISSION_PAUSED_STATES = {
+    "stopped",
+}
 
 
 class TransmissionModule(_ModuleBase, _DownloaderBase[Transmission]):
@@ -225,13 +239,15 @@ class TransmissionModule(_ModuleBase, _DownloaderBase[Transmission]):
 
     def list_torrents(self, status: TorrentStatus = None,
                       hashs: Union[list, str] = None,
-                      downloader: Optional[str] = None
-                      ) -> Optional[List[Union[TransferTorrent, DownloadingTorrent]]]:
+                      downloader: Optional[str] = None,
+                      include_all_tags: bool = False,
+                      ) -> Optional[List[DownloaderTorrent]]:
         """
         获取下载器种子列表
         :param status:  种子状态
         :param hashs:  种子Hash
         :param downloader:  下载器
+        :param include_all_tags:  是否包含未打内置标签的下载任务
         :return: 下载器中符合状态的种子列表
         """
         # 获取下载器
@@ -243,81 +259,197 @@ class TransmissionModule(_ModuleBase, _DownloaderBase[Transmission]):
         else:
             servers: Dict[str, Transmission] = self.get_instances()
         ret_torrents = []
+        query_status = self.__normalize_query_status(status)
+        query_tags = None if include_all_tags else settings.TORRENT_TAG
+
+        def __get_torrent_attr(torrent_data, *attr_names):
+            """
+            兼容 transmission-rpc 新旧字段名。
+            """
+            for attr_name in attr_names:
+                try:
+                    return getattr(torrent_data, attr_name)
+                except (AttributeError, KeyError, TypeError, ValueError):
+                    continue
+            return None
+
+        def __get_torrent_progress(torrent_data) -> float:
+            """
+            获取任务进度。
+            """
+            return __get_torrent_attr(torrent_data, "progress", "percent_done") or 0
+
+        def __get_torrent_size(torrent_data) -> int:
+            """
+            获取任务大小。
+            """
+            return __get_torrent_attr(torrent_data, "total_size", "totalSize") or 0
+
+        def __get_torrent_labels(torrent_data) -> str:
+            """
+            获取任务标签。
+            """
+            return ",".join(getattr(torrent_data, "labels", None) or [])
+
+        def __get_torrent_path(torrent_data) -> Path:
+            """
+            获取任务内容路径。
+            """
+            return Path(torrent_data.download_dir) / torrent_data.name
+
+        def __build_torrent(downloader_name: str, torrent_data) -> DownloaderTorrent:
+            """
+            构造统一下载器任务对象。
+            """
+            meta = MetaInfo(torrent_data.name)
+            dlspeed = __get_torrent_attr(
+                torrent_data, "rate_download", "rateDownload"
+            ) or 0
+            upspeed = __get_torrent_attr(
+                torrent_data, "rate_upload", "rateUpload"
+            ) or 0
+            left_until_done = __get_torrent_attr(
+                torrent_data, "left_until_done", "leftUntilDone"
+            ) or 0
+            torrent_path = __get_torrent_path(torrent_data)
+            ratio_limit = __get_torrent_attr(torrent_data, "seed_ratio_limit", "seedRatioLimit")
+            seeding_time_limit = __get_torrent_attr(torrent_data, "seed_idle_limit", "seedIdleLimit")
+            return DownloaderTorrent(
+                downloader=downloader_name,
+                hash=torrent_data.hashString,
+                title=torrent_data.name,
+                name=meta.name,
+                year=meta.year,
+                season_episode=meta.season_episode,
+                path=Path(self.normalize_return_path(torrent_path, downloader_name)),
+                save_path=self.normalize_return_path(
+                    Path(torrent_data.download_dir), downloader_name
+                ) if getattr(torrent_data, "download_dir", None) else None,
+                content_path=self.normalize_return_path(torrent_path, downloader_name),
+                progress=__get_torrent_progress(torrent_data),
+                size=__get_torrent_size(torrent_data),
+                state=self.__normalize_torrent_state(torrent_data.status),
+                dlspeed=StringUtils.str_filesize(dlspeed),
+                upspeed=StringUtils.str_filesize(upspeed),
+                tags=__get_torrent_labels(torrent_data),
+                download_limit=__get_torrent_attr(torrent_data, "download_limit", "downloadLimit"),
+                upload_limit=__get_torrent_attr(torrent_data, "upload_limit", "uploadLimit"),
+                ratio_limit=ratio_limit,
+                seeding_time_limit=seeding_time_limit,
+                left_time=StringUtils.str_secends(
+                    left_until_done / dlspeed
+                ) if dlspeed > 0 else ''
+            )
+
         if hashs:
             # 按Hash获取
             for name, server in servers.items():
-                torrents, _ = server.get_torrents(ids=hashs, tags=settings.TORRENT_TAG) or []
+                torrents, _ = server.get_torrents(ids=hashs, tags=query_tags) or []
                 try:
-                    for torrent in torrents:
-                        ret_torrents.append(TransferTorrent(
-                            downloader=name,
-                            title=torrent.name,
-                            path=Path(torrent.download_dir) / torrent.name,
-                            hash=torrent.hashString,
-                            size=torrent.total_size,
-                            tags=",".join(torrent.labels or []),
-                            progress=torrent.progress
-                        ))
+                    for torrent_info in torrents:
+                        ret_torrents.append(__build_torrent(name, torrent_info))
                 finally:
                     torrents.clear()
                     del torrents
-        elif status == TorrentStatus.TRANSFER:
+        elif query_status == TorrentQueryStatus.TRANSFER:
             # 获取已完成且未整理的
             for name, server in servers.items():
-                torrents = server.get_completed_torrents(tags=settings.TORRENT_TAG) or []
+                torrents = server.get_completed_torrents(tags=query_tags) or []
                 try:
-                    for torrent in torrents:
+                    for torrent_info in torrents:
                         # 含"已整理"tag的不处理
-                        if "已整理" in torrent.labels or []:
+                        if "已整理" in torrent_info.labels or []:
                             continue
                         # 下载路径
-                        path = torrent.download_dir
+                        path = torrent_info.download_dir
                         # 无法获取下载路径的不处理
                         if not path:
-                            logger.debug(f"未获取到 {torrent.name} 下载保存路径")
+                            logger.debug(f"未获取到 {torrent_info.name} 下载保存路径")
                             continue
-                        ret_torrents.append(TransferTorrent(
-                            downloader=name,
-                            title=torrent.name,
-                            path=Path(torrent.download_dir) / torrent.name,
-                            hash=torrent.hashString,
-                            tags=",".join(torrent.labels or []),
-                            progress=torrent.progress,
-                            state="paused" if torrent.status == "stopped" else "downloading",
-                        ))
+                        ret_torrents.append(__build_torrent(name, torrent_info))
                 finally:
                     torrents.clear()
                     del torrents
-        elif status == TorrentStatus.DOWNLOADING:
+        elif query_status == TorrentQueryStatus.DOWNLOADING:
             # 获取正在下载的任务
             for name, server in servers.items():
-                torrents = server.get_downloading_torrents(tags=settings.TORRENT_TAG) or []
+                torrents = server.get_downloading_torrents(tags=query_tags) or []
                 try:
-                    for torrent in torrents:
-                        meta = MetaInfo(torrent.name)
-                        dlspeed = torrent.rate_download if hasattr(torrent, "rate_download") else torrent.rateDownload
-                        upspeed = torrent.rate_upload if hasattr(torrent, "rate_upload") else torrent.rateUpload
-                        ret_torrents.append(DownloadingTorrent(
-                            downloader=name,
-                            hash=torrent.hashString,
-                            title=torrent.name,
-                            name=meta.name,
-                            year=meta.year,
-                            season_episode=meta.season_episode,
-                            progress=torrent.progress,
-                            size=torrent.total_size,
-                            state="paused" if torrent.status == "stopped" else "downloading",
-                            dlspeed=StringUtils.str_filesize(dlspeed),
-                            upspeed=StringUtils.str_filesize(upspeed),
-                            tags=",".join(torrent.labels or []),
-                            left_time=StringUtils.str_secends(torrent.left_until_done / dlspeed) if dlspeed > 0 else ''
-                        ))
+                    for torrent_info in torrents:
+                        ret_torrents.append(__build_torrent(name, torrent_info))
+                finally:
+                    torrents.clear()
+                    del torrents
+        elif query_status in (
+                TorrentQueryStatus.ALL,
+                TorrentQueryStatus.COMPLETED,
+                TorrentQueryStatus.PAUSED,
+        ):
+            # 获取完整任务列表，由 MoviePilot 统一归一实际下载器状态。
+            for name, server in servers.items():
+                torrents, _ = server.get_torrents(tags=query_tags) or []
+                try:
+                    for torrent_info in torrents:
+                        torrent_state = self.__normalize_torrent_state(torrent_info.status)
+                        if (
+                                query_status != TorrentQueryStatus.ALL
+                                and torrent_state != query_status.value
+                        ):
+                            continue
+                        ret_torrents.append(__build_torrent(name, torrent_info))
                 finally:
                     torrents.clear()
                     del torrents
         else:
             return None
         return ret_torrents  # noqa
+
+    @staticmethod
+    def __normalize_query_status(
+            status: Optional[Union[TorrentStatus, TorrentQueryStatus, str]]
+    ) -> TorrentQueryStatus:
+        """
+        归一任务查询状态。
+        """
+        status_value = getattr(status, "value", status)
+        status_text = str(status_value or "").strip().lower()
+        if not status_text or status_text in {"all", "全部"}:
+            return TorrentQueryStatus.ALL
+        if status_text in {
+            TorrentStatus.TRANSFER.value,
+            TorrentQueryStatus.TRANSFER.value,
+            "transfer",
+        }:
+            return TorrentQueryStatus.TRANSFER
+        if status_text in {
+            TorrentStatus.DOWNLOADING.value,
+            TorrentQueryStatus.DOWNLOADING.value,
+            "downloading",
+        }:
+            return TorrentQueryStatus.DOWNLOADING
+        if status_text in {
+            TorrentQueryStatus.COMPLETED.value,
+            "complete",
+            "seeding",
+            "完成",
+            "已完成",
+        }:
+            return TorrentQueryStatus.COMPLETED
+        if status_text in {TorrentQueryStatus.PAUSED.value, "pause", "暂停", "已暂停"}:
+            return TorrentQueryStatus.PAUSED
+        return TorrentQueryStatus.ALL
+
+    @staticmethod
+    def __normalize_torrent_state(status: Optional[str]) -> str:
+        """
+        归一 Transmission 原始任务状态。
+        """
+        status_text = str(status or "").strip().lower()
+        if status_text in _TRANSMISSION_PAUSED_STATES:
+            return DownloadTaskState.PAUSED.value
+        if status_text in _TRANSMISSION_DOWNLOADING_STATES:
+            return DownloadTaskState.DOWNLOADING.value
+        return DownloadTaskState.COMPLETED.value
 
     def transfer_completed(self, hashs: str, downloader: Optional[str] = None) -> None:
         """
@@ -370,6 +502,85 @@ class TransmissionModule(_ModuleBase, _DownloaderBase[Transmission]):
         # 获取原标签，TR默认会覆盖，需追加
         org_tags = server.get_torrent_tags(ids=hashs)
         return server.set_torrent_tag(ids=hashs, tags=tags, org_tags=org_tags)
+
+    def update_torrent(
+            self,
+            hash_string: str,
+            downloader: Optional[str] = None,
+            download_limit: Optional[float] = None,
+            upload_limit: Optional[float] = None,
+            tracker_list: Optional[list] = None,
+            save_path: Optional[str] = None,
+            category: Optional[str] = None,
+            ratio_limit: Optional[float] = None,
+            seeding_time_limit: Optional[int] = None,
+    ) -> Optional[Dict[str, bool]]:
+        """
+        修改下载任务属性。
+        :param hash_string: 种子Hash
+        :param downloader: 下载器
+        :param download_limit: 下载限速，单位 KB/s
+        :param upload_limit: 上传限速，单位 KB/s
+        :param tracker_list: Tracker URL列表
+        :param save_path: 保存目录
+        :param category: 分类，Transmission 不支持
+        :param ratio_limit: 分享率限制
+        :param seeding_time_limit: 做种时间限制，单位分钟
+        :return: 各项修改结果
+        """
+        server: Transmission = self.get_instance(downloader)
+        if not server:
+            return None
+        results = {}
+        if any(
+                value is not None
+                for value in (download_limit, upload_limit, ratio_limit, seeding_time_limit)
+        ):
+            change_result = server.change_torrent(
+                hash_string=hash_string,
+                download_limit=download_limit,
+                upload_limit=upload_limit,
+                ratio_limit=ratio_limit,
+                seeding_time_limit=seeding_time_limit,
+            )
+            results["limits"] = change_result
+        if save_path is not None:
+            results["save_path"] = server.set_torrent_location(
+                hash_string=hash_string,
+                location=self.normalize_path(Path(save_path), downloader),
+            )
+        if tracker_list is not None:
+            results["trackers"] = server.update_tracker(
+                hash_string=hash_string, tracker_list=tracker_list
+            )
+        if category is not None:
+            results["category"] = False
+        return results
+
+    def get_torrent_trackers(
+            self,
+            hash_string: str,
+            downloader: Optional[str] = None,
+    ) -> Optional[Dict[str, List[str]]]:
+        """
+        查询下载任务Tracker列表。
+        :param hash_string: 种子Hash
+        :param downloader: 下载器
+        :return: 下载器名称到Tracker列表的映射
+        """
+        if downloader:
+            server: Transmission = self.get_instance(downloader)
+            if not server:
+                return None
+            servers = {downloader: server}
+        else:
+            servers: Dict[str, Transmission] = self.get_instances()
+        ret_trackers = {}
+        for name, server in servers.items():
+            trackers = server.get_trackers(hash_string)
+            if trackers is not None:
+                ret_trackers[name] = trackers
+        return ret_trackers
 
     def start_torrents(self, hashs: Union[list, str],
                        downloader: Optional[str] = None) -> Optional[bool]:

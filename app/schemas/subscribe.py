@@ -1,6 +1,41 @@
 from typing import Optional, List, Dict, Any
 
-from pydantic import BaseModel, Field, ConfigDict
+from pydantic import BaseModel, Field, ConfigDict, model_validator
+
+from app.schemas.types import MediaType
+
+
+def compute_subscribe_completed_episode(subscribe: Any) -> Optional[int]:
+    """
+    计算订阅"已完成"集数派生值，仅用于响应填充，不入库。
+
+    普通电视剧按 ``total_episode - lack_episode`` 计算；洗版电视剧按订阅目标范围内
+    priority==100 的分集数量，加上起始集前的逻辑完成集数计算。
+    """
+    total_episode = getattr(subscribe, "total_episode", None) or 0
+    if getattr(subscribe, "type", None) != MediaType.TV.value or not total_episode:
+        return None
+
+    start_episode = getattr(subscribe, "start_episode", None) or 1
+    if not getattr(subscribe, "best_version", None):
+        lack = getattr(subscribe, "lack_episode", None) or 0
+        return max(total_episode - lack, 0)
+
+    episode_priority = getattr(subscribe, "episode_priority", None) or {}
+    if not episode_priority and getattr(subscribe, "current_priority", None) is not None:
+        # 兼容只有整体优先级的洗版快照，响应派生值需与链路侧按集口径保持一致。
+        episode_priority = {
+            str(episode): int(getattr(subscribe, "current_priority"))
+            for episode in range(start_episode, total_episode + 1)
+        }
+    priority_completed = sum(
+        1
+        for ep_key, priority in episode_priority.items()
+        if str(ep_key).isdigit()
+        and start_episode <= int(ep_key) <= total_episode
+        and priority == 100
+    )
+    return min(max(start_episode - 1, 0), total_episode) + priority_completed
 
 
 class Subscribe(BaseModel):
@@ -45,6 +80,8 @@ class Subscribe(BaseModel):
     start_episode: Optional[int] = 0
     # 缺失集数
     lack_episode: Optional[int] = 0
+    # 已完成集数
+    completed_episode: Optional[int] = None
     # 附加信息
     note: Optional[Any] = None
     # 状态：N-新建， R-订阅中
@@ -58,9 +95,9 @@ class Subscribe(BaseModel):
     # 下载器
     downloader: Optional[str] = None
     # 是否洗版
-    best_version: Optional[int] = 0
+    best_version: Optional[int] = None
     # 是否只洗全集整包
-    best_version_full: Optional[int] = 0
+    best_version_full: Optional[int] = None
     # 当前优先级
     current_priority: Optional[int] = None
     # 洗版时已下载剧集的优先级状态
@@ -81,6 +118,18 @@ class Subscribe(BaseModel):
     episode_group: Optional[str] = None
 
     model_config = ConfigDict(from_attributes=True)
+
+    @model_validator(mode="after")
+    def _fill_completed_episode(self) -> "Subscribe":
+        """
+        填充 ``completed_episode`` 派生字段。电视剧订阅按 best_version 分支计算，
+        电影或缺少 total_episode 时保持 None。
+        """
+        if self.completed_episode is not None:
+            # 调用方显式提供过的值不覆盖
+            return self
+        self.completed_episode = compute_subscribe_completed_episode(self)
+        return self
 
 
 class SubscribeShare(BaseModel):

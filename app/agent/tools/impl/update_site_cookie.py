@@ -5,6 +5,7 @@ from typing import Optional, Type
 from pydantic import BaseModel, Field
 
 from app.agent.tools.base import MoviePilotTool
+from app.agent.tools.tags import ToolTag
 from app.chain.site import SiteChain
 from app.db.site_oper import SiteOper
 from app.log import logger
@@ -13,10 +14,6 @@ from app.log import logger
 class UpdateSiteCookieInput(BaseModel):
     """更新站点Cookie和UA工具的输入参数模型"""
 
-    explanation: str = Field(
-        ...,
-        description="Clear explanation of why this tool is being used in the current context",
-    )
     site_identifier: int = Field(
         ...,
         description="Site ID to update Cookie and User-Agent for (can be obtained from query_sites tool)",
@@ -31,6 +28,11 @@ class UpdateSiteCookieInput(BaseModel):
 
 class UpdateSiteCookieTool(MoviePilotTool):
     name: str = "update_site_cookie"
+    tags: list[str] = [
+        ToolTag.Write,
+        ToolTag.Site,
+        ToolTag.Admin,
+    ]
     description: str = "Update site Cookie and User-Agent by logging in with username and password. This tool can automatically obtain and update the site's authentication credentials. Supports two-step verification for sites that require it. Accepts site ID only."
     args_schema: Type[BaseModel] = UpdateSiteCookieInput
     require_admin: bool = True

@@ -1,13 +1,22 @@
+import copy
 import json
+from typing import Any, Dict, List, Optional, Tuple, Union
 from urllib.parse import quote, unquote
-from typing import Optional, Union, List, Tuple, Any
 
 from app.core.context import MediaInfo, Context
+from app.core.event import eventmanager
 from app.log import logger
 from app.modules import _ModuleBase, _MessageBase
-from app.schemas import MessageChannel, CommingMessage, Notification, MessageResponse
-from app.schemas.types import ModuleType
+from app.schemas import (
+    CommandRegisterEventData,
+    CommingMessage,
+    MessageChannel,
+    MessageResponse,
+    Notification,
+)
+from app.schemas.types import ChainEventType, ModuleType
 from app.utils.http import RequestUtils
+from app.utils.structures import DictUtils
 
 try:
     from app.modules.discord.discord import Discord
@@ -102,6 +111,52 @@ class DiscordModule(_ModuleBase, _MessageBase[Discord]):
     def init_setting(self) -> Tuple[str, Union[str, bool]]:
         pass
 
+    @staticmethod
+    def _get_admins(config: Optional[dict]) -> List[str]:
+        """
+        解析 Discord 管理员配置，兼容逗号分隔和首尾空白。
+        """
+        return [
+            admin.strip()
+            for admin in str((config or {}).get("DISCORD_ADMINS") or "").split(",")
+            if admin.strip()
+        ]
+
+    @classmethod
+    def _should_reject_admin_command(
+            cls,
+            config: Optional[dict],
+            *user_ids: Optional[Union[str, int]],
+    ) -> bool:
+        """
+        判断 Discord 命令或命令型按钮回调是否应因非管理员身份被拒绝。
+        """
+        admins = cls._get_admins(config)
+        if not admins:
+            return False
+        candidates = [
+            str(user_id).strip()
+            for user_id in user_ids
+            if user_id is not None and str(user_id).strip()
+        ]
+        return not any(candidate in admins for candidate in candidates)
+
+    @staticmethod
+    def _send_admin_denied(
+            client: Optional[Discord],
+            userid: Optional[Union[str, int]],
+            chat_id: Optional[Union[str, int]] = None,
+    ) -> None:
+        """
+        向 Discord 非管理员用户发送命令拒绝提示。
+        """
+        if client and userid:
+            client.send_msg(
+                title="只有管理员才有权限执行此命令",
+                userid=str(userid),
+                original_chat_id=str(chat_id) if chat_id else None,
+            )
+
     def message_parser(
         self, source: str, body: Any, form: Any, args: Any
     ) -> Optional[CommingMessage]:
@@ -119,6 +174,7 @@ class DiscordModule(_ModuleBase, _MessageBase[Discord]):
         client_config = self.get_config(source)
         if not client_config:
             return None
+        client: Discord = self.get_instance(client_config.name)
         try:
             msg_json: dict = json.loads(body)
         except Exception as e:
@@ -137,6 +193,11 @@ class DiscordModule(_ModuleBase, _MessageBase[Discord]):
             message_id = msg_json.get("message_id")
             chat_id = msg_json.get("chat_id")
             if callback_data and userid:
+                if str(callback_data).strip().startswith("/") and self._should_reject_admin_command(
+                        client_config.config, userid, username
+                ):
+                    self._send_admin_denied(client, userid, chat_id)
+                    return None
                 logger.info(
                     f"收到来自 {client_config.name} 的 Discord 按钮回调："
                     f"userid={userid}, username={username}, callback_data={callback_data}"
@@ -161,6 +222,11 @@ class DiscordModule(_ModuleBase, _MessageBase[Discord]):
             audio_refs = self._extract_audio_refs(msg_json)
             files = self._extract_files(msg_json)
             if (text or images or audio_refs or files) and userid:
+                if text and text.startswith("/") and self._should_reject_admin_command(
+                        client_config.config, userid, username
+                ):
+                    self._send_admin_denied(client, userid, chat_id)
+                    return None
                 logger.info(
                     f"收到来自 {client_config.name} 的 Discord 消息："
                     f"userid={userid}, username={username}, text={text}, "
@@ -472,6 +538,54 @@ class DiscordModule(_ModuleBase, _MessageBase[Discord]):
                 elif result:
                     return True
         return False
+
+    def register_commands(self, commands: Dict[str, dict]) -> None:
+        """
+        注册命令，实现这个函数接收系统可用的命令菜单。
+
+        :param commands: 命令字典
+        """
+        for client_config in self.get_configs().values():
+            client = self.get_instance(client_config.name)
+            if not client:
+                continue
+
+            scoped_commands = copy.deepcopy(commands)
+            event = eventmanager.send_event(
+                ChainEventType.CommandRegister,
+                CommandRegisterEventData(
+                    commands=scoped_commands,
+                    origin="Discord",
+                    service=client_config.name,
+                ),
+            )
+
+            if event and event.event_data:
+                event_data: CommandRegisterEventData = event.event_data
+                if event_data.cancel:
+                    client.delete_commands()
+                    logger.debug(
+                        f"Command registration for {client_config.name} canceled by event: {event_data.source}"
+                    )
+                    continue
+                scoped_commands = event_data.commands or {}
+                if not scoped_commands:
+                    logger.debug("Filtered commands are empty, skipping registration.")
+                    client.delete_commands()
+
+            filtered_scoped_commands = DictUtils.filter_keys_to_subset(
+                scoped_commands,
+                commands,
+            )
+            if not filtered_scoped_commands:
+                logger.debug("Filtered commands are empty, skipping registration.")
+                client.delete_commands()
+                continue
+            if filtered_scoped_commands != commands:
+                logger.debug(
+                    f"Command set has changed, Updating new commands: {filtered_scoped_commands}"
+                )
+            client.register_commands(filtered_scoped_commands)
 
     def mark_message_processing_started(
         self,

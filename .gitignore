@@ -6,6 +6,7 @@
 build/
 cython_cache/
 dist/
+rust/**/target/
 nginx/
 test.py
 safety_report.txt
@@ -15,21 +16,28 @@ app/helper/*.pyd
 app/helper/*.bin
 app/plugins/**
 !app/plugins/__init__.py
-config/cookies/**
+config/cookies/
 config/app.env
 config/user.db*
 config/sites/**
 config/agent/
 config/logs/
+config/plugins/
 config/temp/
 config/cache/
+config/.cache/
 .runtime/
 public/
 .moviepilot.env
 *.pyc
 *.log
+.coverage
+coverage.xml
+coverage.json
+htmlcov/
 .vscode
 venv
+moviepilot-site-capture-*.zip
 
 # Pylint
 pylint-report.json
@@ -39,3 +47,6 @@ pylint-report.json
 .claude/
 !.claude/*.json
 .claude/settings.local.json
+
+# Superpowers 设计/计划文档（本地协作产物，不纳入仓库）
+docs/superpowers/

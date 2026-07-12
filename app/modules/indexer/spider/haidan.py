@@ -49,6 +49,13 @@ class HaiDanSpider:
         "7": 1
     }
 
+    @classmethod
+    def get_search_page_size(cls, keyword: str = None) -> None:
+        """
+        海胆搜索入口当前没有接入页码参数，不参与自动翻页。
+        """
+        return None
+
     def __init__(self, indexer: dict):
         self.systemconfig = SystemConfigOper()
         if indexer:
@@ -90,10 +97,11 @@ class HaiDanSpider:
         else:
             search_area = '0'
 
+        # urllib.urlencode 会把 None 编码成字面量 "None"，空关键词浏览时必须显式传空字符串。
         return __dict_to_query({
             "isapi": "1",
             "search_area": search_area,  # 0-标题 1-简介（较慢）3-发种用户名 4-IMDb
-            "search": keyword,
+            "search": keyword or "",
             "search_mode": "0",  # 0-与 1-或 2-精准
             "cat": categories
         })

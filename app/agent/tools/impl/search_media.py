@@ -6,6 +6,7 @@ from typing import Optional, Type
 from pydantic import BaseModel, Field
 
 from app.agent.tools.base import MoviePilotTool
+from app.agent.tools.tags import ToolTag
 from app.chain.media import MediaChain
 from app.log import logger
 from app.schemas.types import MediaType, media_type_to_agent
@@ -13,7 +14,6 @@ from app.schemas.types import MediaType, media_type_to_agent
 
 class SearchMediaInput(BaseModel):
     """搜索媒体工具的输入参数模型"""
-    explanation: str = Field(..., description="Clear explanation of why this tool is being used in the current context")
     title: str = Field(..., description="The title of the media to search for (e.g., 'The Matrix', 'Breaking Bad')")
     year: Optional[str] = Field(None, description="Release year of the media (optional, helps narrow down results)")
     media_type: Optional[str] = Field(None,
@@ -24,6 +24,10 @@ class SearchMediaInput(BaseModel):
 
 class SearchMediaTool(MoviePilotTool):
     name: str = "search_media"
+    tags: list[str] = [
+        ToolTag.Read,
+        ToolTag.Media,
+    ]
     description: str = "Search TMDB database for media resources (movies, TV shows, anime, etc.) by title, year, type, and other criteria. Returns detailed media information from TMDB. Use 'recognize_media' to extract info from torrent titles/file paths, or 'scrape_metadata' to generate metadata files."
     args_schema: Type[BaseModel] = SearchMediaInput
 

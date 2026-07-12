@@ -6,6 +6,7 @@ from typing import Optional, Type
 from pydantic import BaseModel, Field
 
 from app.agent.tools.base import MoviePilotTool
+from app.agent.tools.tags import ToolTag
 from app.agent.tools.impl._plugin_tool_utils import (
     get_plugin_snapshot,
     reload_plugin_runtime,
@@ -16,10 +17,6 @@ from app.log import logger
 class ReloadPluginInput(BaseModel):
     """重载插件工具的输入参数模型"""
 
-    explanation: str = Field(
-        ...,
-        description="Clear explanation of why this tool is being used in the current context",
-    )
     plugin_id: str = Field(
         ...,
         description="The plugin ID to reload so the latest saved config takes effect.",
@@ -28,6 +25,11 @@ class ReloadPluginInput(BaseModel):
 
 class ReloadPluginTool(MoviePilotTool):
     name: str = "reload_plugin"
+    tags: list[str] = [
+        ToolTag.Write,
+        ToolTag.Plugin,
+        ToolTag.Admin,
+    ]
     description: str = (
         "Reload an installed plugin so its latest saved configuration takes effect. "
         "This also refreshes the plugin's registered commands, scheduled services, and API routes."

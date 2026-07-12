@@ -8,6 +8,7 @@ from typing import Optional, Type, Any
 from pydantic import BaseModel, Field
 
 from app.agent.tools.base import MoviePilotTool
+from app.agent.tools.tags import ToolTag
 from app.chain.mediaserver import MediaServerChain
 from app.helper.mediaserver import MediaServerHelper
 from app.log import logger
@@ -76,7 +77,6 @@ def _build_tv_server_result(existing_seasons: OrderedDict, total_seasons: Ordere
 
 class QueryLibraryExistsInput(BaseModel):
     """查询媒体库工具的输入参数模型"""
-    explanation: str = Field(..., description="Clear explanation of why this tool is being used in the current context")
     tmdb_id: Optional[int] = Field(None, description="TMDB ID (can be obtained from search_media tool). Either tmdb_id or douban_id must be provided.")
     douban_id: Optional[str] = Field(None, description="Douban ID (can be obtained from search_media tool). Either tmdb_id or douban_id must be provided.")
     media_type: Optional[str] = Field(None, description="Allowed values: movie, tv")
@@ -84,6 +84,11 @@ class QueryLibraryExistsInput(BaseModel):
 
 class QueryLibraryExistsTool(MoviePilotTool):
     name: str = "query_library_exists"
+    tags: list[str] = [
+        ToolTag.Read,
+        ToolTag.Library,
+        ToolTag.Media,
+    ]
     description: str = "Check whether media already exists in Plex, Emby, or Jellyfin by media ID. Results are grouped by media server; TV results include existing episodes, total episodes, and missing episodes/seasons. Requires tmdb_id or douban_id from search_media."
     args_schema: Type[BaseModel] = QueryLibraryExistsInput
 

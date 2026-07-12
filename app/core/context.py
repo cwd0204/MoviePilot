@@ -1,7 +1,7 @@
 import re
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import List, Dict, Any, Tuple, Optional
+from typing import List, Dict, Any, Tuple, Optional, Set
 
 from app.core.config import settings
 from app.core.meta import MetaBase
@@ -12,6 +12,10 @@ from app.utils.string import StringUtils
 
 @dataclass
 class TorrentInfo:
+    """
+    种子搜索结果信息。
+    """
+
     # 站点ID
     site: int = None
     # 站点名称
@@ -147,6 +151,93 @@ class TorrentInfo:
         dicts = vars(self).copy()
         dicts["volume_factor"] = self.volume_factor
         dicts["freedate_diff"] = self.freedate_diff
+        return dicts
+
+
+@dataclass
+class SubtitleInfo:
+    """
+    字幕搜索结果信息。
+    """
+
+    # 站点ID
+    site: int = None
+    # 站点名称
+    site_name: str = None
+    # 站点Cookie
+    site_cookie: str = None
+    # 站点UA
+    site_ua: str = None
+    # 站点是否使用代理
+    site_proxy: bool = False
+    # 站点优先级
+    site_order: int = 0
+    # 字幕标题
+    title: str = None
+    # 字幕描述
+    description: str = None
+    # 字幕下载链接
+    enclosure: str = None
+    # 详情页面
+    page_url: str = None
+    # 语言
+    language: str = None
+    # 语言图标
+    language_icon: str = None
+    # 字幕大小
+    size: float = 0.0
+    # 发布时间
+    pubdate: str = None
+    # 已过时间
+    date_elapsed: str = None
+    # 点击/下载次数
+    grabs: int = 0
+    # 上传者
+    uploader: str = None
+    # 举报页面
+    report_url: str = None
+    # 种子ID
+    torrent_id: str = None
+    # 字幕ID
+    subtitle_id: str = None
+    # 下载文件名
+    file_name: str = None
+
+    def __build_meta_info(self) -> Optional[dict]:
+        """
+        从字幕标题、文件名和描述中识别可展示的季集信息。
+        """
+        for title in (self.title, self.file_name, self.description):
+            if not title:
+                continue
+            try:
+                meta_dict = MetaInfo(title=title, subtitle=self.description).to_dict()
+            except Exception:
+                continue
+            if meta_dict.get("season_episode") or meta_dict.get("episode_list"):
+                return meta_dict
+        return None
+
+    def __setattr__(self, name: str, value: Any):
+        self.__dict__[name] = value
+
+    def from_dict(self, data: dict):
+        """
+        从字典中初始化。
+        """
+        for key, value in data.items():
+            setattr(self, key, value)
+
+    def to_dict(self):
+        """
+        返回字典。
+        """
+        dicts = vars(self).copy()
+        meta_info = self.__build_meta_info()
+        if meta_info:
+            dicts["meta_info"] = meta_info
+            dicts["season_episode"] = meta_info.get("season_episode")
+            dicts["episode_list"] = meta_info.get("episode_list")
         return dicts
 
 
@@ -685,7 +776,10 @@ class MediaInfo:
             if infobox:
                 akas = [item.get("value") for item in infobox if item.get("key") == "别名"]
                 if akas:
-                    self.names = [aka.get("v") for aka in akas[0]]
+                    if isinstance(akas[0], list):
+                        self.names = [aka.get("v") if isinstance(aka, dict) else aka for aka in akas[0]]
+                    elif isinstance(akas[0], str):
+                        self.names = [akas[0]]
 
         # 剧集
         if self.type == MediaType.TV and not self.seasons:
@@ -827,6 +921,10 @@ class Context:
     candidate_recognized: bool = False
     # 当前 media_info 是否为目标媒体回填，而不是候选自身识别结果。
     media_info_is_target: bool = False
+    # 调用方对本候选允许下载的剧集集合，None 表示不限制，空集合表示拒绝交付任何集。
+    allowed_episodes: Optional[Set[int]] = None
+    # 下载层确认候选资源覆盖完整目标范围，供订阅事实写入判断整包资源。
+    confirmed_full_coverage: bool = False
 
     def to_dict(self):
         """
@@ -841,4 +939,7 @@ class Context:
             "match_source": self.match_source,
             "candidate_recognized": self.candidate_recognized,
             "media_info_is_target": self.media_info_is_target,
+            # 保留 None / 空集 / 非空集 三态语义，避免下游误把"显式拒绝"当成"不限制"。
+            "allowed_episodes": sorted(self.allowed_episodes) if self.allowed_episodes is not None else None,
+            "confirmed_full_coverage": self.confirmed_full_coverage,
         }

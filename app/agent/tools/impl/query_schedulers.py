@@ -6,16 +6,18 @@ from typing import Optional, Type
 from pydantic import BaseModel, Field
 
 from app.agent.tools.base import MoviePilotTool
+from app.agent.tools.tags import ToolTag
 from app.log import logger
 
 
 class QuerySchedulersInput(BaseModel):
     """查询定时服务工具的输入参数模型"""
-    explanation: str = Field(..., description="Clear explanation of why this tool is being used in the current context")
-
-
 class QuerySchedulersTool(MoviePilotTool):
     name: str = "query_schedulers"
+    tags: list[str] = [
+        ToolTag.Read,
+        ToolTag.Scheduler,
+    ]
     description: str = "Query scheduled tasks and list all available scheduler jobs. Shows job status, next run time, and provider information."
     args_schema: Type[BaseModel] = QuerySchedulersInput
 

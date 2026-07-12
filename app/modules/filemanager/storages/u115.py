@@ -26,6 +26,20 @@ from app.utils.limit import QpsRateLimiter, RateStats
 lock = Lock()
 
 
+MIN_U115_UPLOAD_PART_SIZE = 1 * 1024 * 1024
+U115_UPLOAD_PART_COUNT_TARGET = 96
+U115_UPLOAD_PART_SIZE_STEPS = (
+    10 * 1024 * 1024,
+    16 * 1024 * 1024,
+    32 * 1024 * 1024,
+    64 * 1024 * 1024,
+    128 * 1024 * 1024,
+    256 * 1024 * 1024,
+    512 * 1024 * 1024,
+    1024 * 1024 * 1024,
+)
+
+
 class NoCheckInException(Exception):
     pass
 
@@ -410,6 +424,24 @@ class U115Pan(StorageBase, metaclass=WeakSingleton):
                     sha1.update(chunk)
         return sha1.finalize().hex()
 
+    @staticmethod
+    def __get_upload_part_size(file_size: int) -> int:
+        """
+        根据文件大小获取 115 OSS 上传分片大小。
+        """
+        if file_size <= 0:
+            return U115_UPLOAD_PART_SIZE_STEPS[0]
+
+        target_part_size = max(
+            MIN_U115_UPLOAD_PART_SIZE,
+            (file_size + U115_UPLOAD_PART_COUNT_TARGET - 1)
+            // U115_UPLOAD_PART_COUNT_TARGET,
+        )
+        for part_size in U115_UPLOAD_PART_SIZE_STEPS:
+            if target_part_size <= part_size:
+                return part_size
+        return U115_UPLOAD_PART_SIZE_STEPS[-1]
+
     def init_storage(self):
         pass
 
@@ -524,6 +556,9 @@ class U115Pan(StorageBase, metaclass=WeakSingleton):
         """
 
         def encode_callback(cb: str) -> str:
+            """
+            编码 115 OSS 回调参数。
+            """
             return oss2.utils.b64encode_as_string(cb)
 
         target_name = new_name or local_path.name
@@ -631,7 +666,10 @@ class U115Pan(StorageBase, metaclass=WeakSingleton):
                         else None,
                         modify_time=info_resp["utime"],
                     )
-            return self.get_item(target_path)
+            uploaded_item = self.get_item(target_path)
+            return uploaded_item or self.__build_uploaded_fileitem(
+                target_path, local_path, file_size
+            )
 
         # Step 4: 获取上传凭证
         token_resp = self._request_api("GET", "/open/upload/get_token", "data")
@@ -669,8 +707,9 @@ class U115Pan(StorageBase, metaclass=WeakSingleton):
             security_token=SecurityToken,
         )
         bucket = oss2.Bucket(auth, endpoint, bucket_name)  # noqa
-        # determine_part_size方法用于确定分片大小，设置分片大小为 10M
-        part_size = determine_part_size(file_size, preferred_size=10 * 1024 * 1024)
+        part_size = determine_part_size(
+            file_size, preferred_size=self.__get_upload_part_size(file_size)
+        )
 
         # 初始化进度条
         logger.info(
@@ -723,14 +762,19 @@ class U115Pan(StorageBase, metaclass=WeakSingleton):
             result = bucket.complete_multipart_upload(
                 object_name, upload_id, parts, headers=headers
             )
-            if result.status == 200:
-                logger.debug(
-                    f"【115】上传 Step 6 回调结果：{result.resp.response.json()}"
-                )
-                logger.info(f"【115】{target_name} 上传成功")
-            else:
+            if result.status != 200:
                 logger.warn(f"【115】{target_name} 上传失败，错误码: {result.status}")
                 return None
+            try:
+                callback_result = result.resp.response.json()
+            except Exception as e:
+                logger.error(f"【115】{target_name} 上传完成回调解析失败: {str(e)}")
+                return None
+            logger.debug(f"【115】上传 Step 6 回调结果：{callback_result}")
+            if not callback_result or not callback_result.get("state"):
+                logger.warn(f"【115】{target_name} 上传完成回调失败: {callback_result}")
+                return None
+            logger.info(f"【115】{target_name} 上传成功")
         except oss2.exceptions.OssError as e:
             if e.code == "FileAlreadyExists":
                 logger.warn(f"【115】{target_name} 已存在")
@@ -740,7 +784,30 @@ class U115Pan(StorageBase, metaclass=WeakSingleton):
                 )
                 return None
         # 返回结果
-        return self.get_item(target_path)
+        uploaded_item = self.get_item(target_path)
+        if uploaded_item:
+            return uploaded_item
+        logger.warn(
+            f"【115】{target_name} 上传已完成但元数据暂不可见，使用目标路径构造整理结果"
+        )
+        return self.__build_uploaded_fileitem(target_path, local_path, file_size)
+
+    def __build_uploaded_fileitem(
+        self, target_path: Path, local_path: Path, file_size: int
+    ) -> schemas.FileItem:
+        """
+        构造已上传文件项，用于兼容 115 上传成功后目录索引延迟刷新。
+        """
+        return schemas.FileItem(
+            storage=self.schema.value,
+            path=target_path.as_posix(),
+            type="file",
+            name=target_path.name,
+            basename=target_path.stem,
+            extension=target_path.suffix[1:] or None,
+            size=file_size,
+            modify_time=local_path.stat().st_mtime if local_path.exists() else None,
+        )
 
     def download(self, fileitem: schemas.FileItem, path: Path = None) -> Optional[Path]:
         """
@@ -763,7 +830,9 @@ class U115Pan(StorageBase, metaclass=WeakSingleton):
             logger.error(f"【115】下载链接为空: {fileitem.name}")
             return None
 
-        local_path = (path or settings.TEMP_PATH) / fileitem.name
+        local_path = self._build_download_path(fileitem, path or settings.TEMP_PATH)
+        if not local_path:
+            return None
 
         # 获取文件大小
         file_size = detail.size

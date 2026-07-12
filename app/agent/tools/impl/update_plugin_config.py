@@ -6,6 +6,7 @@ from typing import Any, Dict, List, Optional, Type
 from pydantic import BaseModel, Field
 
 from app.agent.tools.base import MoviePilotTool
+from app.agent.tools.tags import ToolTag
 from app.agent.tools.impl._plugin_tool_utils import get_plugin_snapshot
 from app.core.plugin import PluginManager
 from app.log import logger
@@ -14,10 +15,6 @@ from app.log import logger
 class UpdatePluginConfigInput(BaseModel):
     """修改插件配置工具的输入参数模型"""
 
-    explanation: str = Field(
-        ...,
-        description="Clear explanation of why this tool is being used in the current context",
-    )
     plugin_id: str = Field(
         ...,
         description="The plugin ID to update. Use query_plugin_config first to inspect the current config.",
@@ -44,6 +41,11 @@ class UpdatePluginConfigInput(BaseModel):
 
 class UpdatePluginConfigTool(MoviePilotTool):
     name: str = "update_plugin_config"
+    tags: list[str] = [
+        ToolTag.Write,
+        ToolTag.Plugin,
+        ToolTag.Admin,
+    ]
     description: str = (
         "Update the saved configuration of an installed plugin. "
         "By default this performs a partial merge update and does NOT reload the plugin automatically. "

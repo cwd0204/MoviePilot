@@ -1,6 +1,6 @@
-from typing import Optional
+from typing import List, Optional
 
-from sqlalchemy import Column, Integer, String, JSON, Index, select
+from sqlalchemy import Column, Integer, String, JSON, Index, and_, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import Session
 
@@ -39,16 +39,83 @@ class Message(Base):
         Index('ix_message_reg_time_id', 'reg_time', 'id'),
     )
 
+    @db_update
+    def create_and_to_dict(self, db: Session) -> dict:
+        """
+        创建消息记录并返回写入后的字段字典。
+        """
+        db.add(self)
+        db.flush()
+        return self.to_dict()
+
     @classmethod
     @db_query
-    def list_by_page(cls, db: Session, page: Optional[int] = 1, count: Optional[int] = 30):
-        return db.query(cls).order_by(cls.reg_time.desc()).offset((page - 1) * count).limit(count).all()
+    def list_by_page(cls, db: Session, page: Optional[int] = 1, count: Optional[int] = 30) -> List["Message"]:
+        """
+        分页获取消息记录。
+        """
+        return (
+            db.query(cls)
+            .order_by(cls.reg_time.desc(), cls.id.desc())
+            .offset((page - 1) * count)
+            .limit(count)
+            .all()
+        )
 
     @classmethod
     @async_db_query
-    async def async_list_by_page(cls, db: AsyncSession, page: Optional[int] = 1, count: Optional[int] = 30):
+    async def async_list_by_page(
+            cls, db: AsyncSession, page: Optional[int] = 1, count: Optional[int] = 30
+    ) -> List["Message"]:
+        """
+        异步分页获取消息记录。
+        """
         result = await db.execute(
-            select(cls).order_by(cls.reg_time.desc()).offset((page - 1) * count).limit(count)
+            select(cls)
+            .order_by(cls.reg_time.desc(), cls.id.desc())
+            .offset((page - 1) * count)
+            .limit(count)
+        )
+        return result.scalars().all()
+
+    @classmethod
+    @async_db_query
+    async def async_list_sent_by_page(
+            cls,
+            db: AsyncSession,
+            page: Optional[int] = 1,
+            count: Optional[int] = 30,
+            all_clear_before: Optional[str] = None,
+            system_clear_before: Optional[str] = None,
+            media_clear_before: Optional[str] = None,
+    ) -> List["Message"]:
+        """
+        分页获取系统发送的通知消息。
+        """
+        statement = select(cls).where(cls.action == 1)
+        if all_clear_before:
+            statement = statement.where(cls.reg_time > all_clear_before)
+        if system_clear_before:
+            statement = statement.where(
+                or_(
+                    and_(cls.image.isnot(None), cls.image != ""),
+                    cls.reg_time > system_clear_before,
+                )
+            )
+        if media_clear_before:
+            statement = statement.where(
+                or_(
+                    cls.image.is_(None),
+                    cls.image == "",
+                    cls.reg_time > media_clear_before,
+                )
+            )
+
+        result = await db.execute(
+            statement
+            .order_by(cls.reg_time.desc(), cls.id.desc())
+            .offset((page - 1) * count)
+            .limit(count)
         )
         return result.scalars().all()
 

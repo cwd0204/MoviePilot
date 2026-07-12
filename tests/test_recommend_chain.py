@@ -1,0 +1,95 @@
+import asyncio
+from typing import Generator
+from unittest.mock import AsyncMock, patch
+
+import pytest
+
+from app.chain.recommend import RecommendChain
+from app.core.cache import TTLCache
+
+
+SYNC_EMPTY_CACHE_CASES = [
+    ("tmdb_movies", "app.chain.recommend.TmdbChain", "tmdb_discover"),
+    ("tmdb_tvs", "app.chain.recommend.TmdbChain", "tmdb_discover"),
+    ("tmdb_trending", "app.chain.recommend.TmdbChain", "tmdb_trending"),
+    ("bangumi_calendar", "app.chain.recommend.BangumiChain", "calendar"),
+    ("douban_movie_showing", "app.chain.recommend.DoubanChain", "movie_showing"),
+    ("douban_movies", "app.chain.recommend.DoubanChain", "douban_discover"),
+    ("douban_tvs", "app.chain.recommend.DoubanChain", "douban_discover"),
+    ("douban_movie_top250", "app.chain.recommend.DoubanChain", "movie_top250"),
+    ("douban_tv_weekly_chinese", "app.chain.recommend.DoubanChain", "tv_weekly_chinese"),
+    ("douban_tv_weekly_global", "app.chain.recommend.DoubanChain", "tv_weekly_global"),
+    ("douban_tv_animation", "app.chain.recommend.DoubanChain", "tv_animation"),
+    ("douban_movie_hot", "app.chain.recommend.DoubanChain", "movie_hot"),
+    ("douban_tv_hot", "app.chain.recommend.DoubanChain", "tv_hot"),
+]
+
+ASYNC_EMPTY_CACHE_CASES = [
+    ("async_tmdb_movies", "app.chain.recommend.TmdbChain"),
+    ("async_tmdb_tvs", "app.chain.recommend.TmdbChain"),
+    ("async_tmdb_trending", "app.chain.recommend.TmdbChain"),
+    ("async_bangumi_calendar", "app.chain.recommend.BangumiChain"),
+    ("async_douban_movie_showing", "app.chain.recommend.DoubanChain"),
+    ("async_douban_movies", "app.chain.recommend.DoubanChain"),
+    ("async_douban_tvs", "app.chain.recommend.DoubanChain"),
+    ("async_douban_movie_top250", "app.chain.recommend.DoubanChain"),
+    ("async_douban_tv_weekly_chinese", "app.chain.recommend.DoubanChain"),
+    ("async_douban_tv_weekly_global", "app.chain.recommend.DoubanChain"),
+    ("async_douban_tv_animation", "app.chain.recommend.DoubanChain"),
+    ("async_douban_movie_hot", "app.chain.recommend.DoubanChain"),
+    ("async_douban_tv_hot", "app.chain.recommend.DoubanChain"),
+]
+
+
+def clear_recommend_cache() -> None:
+    """清理推荐缓存，避免缓存装饰器状态影响用例。"""
+    TTLCache(region=RecommendChain.recommend_cache_region).clear()
+
+
+@pytest.fixture(autouse=True)
+def isolated_recommend_cache() -> Generator[None, None, None]:
+    """每个用例前后都清空推荐缓存。"""
+    clear_recommend_cache()
+    yield
+    clear_recommend_cache()
+
+
+@pytest.mark.parametrize(
+    ("method_name", "chain_target", "backend_method"),
+    SYNC_EMPTY_CACHE_CASES,
+)
+def test_sync_recommend_methods_do_not_cache_empty_result(
+    method_name: str,
+    chain_target: str,
+    backend_method: str,
+) -> None:
+    """同步推荐来源返回空列表时不应缓存。"""
+    chain = RecommendChain()
+    recommend_method = getattr(chain, method_name)
+
+    with patch(chain_target) as backend_chain:
+        backend_call = getattr(backend_chain.return_value, backend_method)
+        backend_call.side_effect = [[], []]
+
+        assert recommend_method(page=1) == []
+        assert recommend_method(page=1) == []
+
+    assert backend_call.call_count == 2
+
+
+@pytest.mark.parametrize(("method_name", "chain_target"), ASYNC_EMPTY_CACHE_CASES)
+def test_async_recommend_methods_do_not_cache_empty_result(
+    method_name: str,
+    chain_target: str,
+) -> None:
+    """异步推荐来源返回空列表时不应缓存。"""
+    chain = RecommendChain()
+    recommend_method = getattr(chain, method_name)
+
+    with patch(chain_target) as backend_chain:
+        backend_chain.return_value.async_run_module = AsyncMock(side_effect=[[], []])
+
+        assert asyncio.run(recommend_method(page=1)) == []
+        assert asyncio.run(recommend_method(page=1)) == []
+
+    assert backend_chain.return_value.async_run_module.call_count == 2

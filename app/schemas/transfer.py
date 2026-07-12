@@ -10,24 +10,9 @@ from app.schemas.system import TransferDirectoryConf
 from app.schemas.tmdb import TmdbEpisode
 
 
-class TransferTorrent(BaseModel):
+class DownloaderTorrent(BaseModel):
     """
-    待转移任务信息
-    """
-    downloader: Optional[str] = None
-    title: Optional[str] = None
-    path: Optional[Path] = None
-    hash: Optional[str] = None
-    tags: Optional[str] = None
-    size: Optional[int] = 0
-    userid: Optional[str] = None
-    progress: Optional[float] = 0.0
-    state: Optional[str] = None
-
-
-class DownloadingTorrent(BaseModel):
-    """
-    下载中任务信息
+    下载器任务信息
     """
     downloader: Optional[str] = None
     hash: Optional[str] = None
@@ -35,16 +20,37 @@ class DownloadingTorrent(BaseModel):
     name: Optional[str] = None
     year: Optional[str] = None
     season_episode: Optional[str] = None
+    path: Optional[Path] = None
     size: Optional[float] = 0.0
     progress: Optional[float] = 0.0
     state: Optional[str] = 'downloading'
     upspeed: Optional[str] = None
     dlspeed: Optional[str] = None
     tags: Optional[str] = None
+    save_path: Optional[str] = None
+    content_path: Optional[str] = None
+    category: Optional[str] = None
+    download_limit: Optional[float] = None
+    upload_limit: Optional[float] = None
+    ratio_limit: Optional[float] = None
+    seeding_time_limit: Optional[int] = None
+    trackers: Optional[List[str]] = Field(default_factory=list)
     media: Optional[dict] = Field(default_factory=dict)
     userid: Optional[str] = None
     username: Optional[str] = None
     left_time: Optional[str] = None
+
+
+class TransferTorrent(DownloaderTorrent):
+    """
+    待转移任务信息
+    """
+
+
+class DownloadingTorrent(DownloaderTorrent):
+    """
+    下载中任务信息
+    """
 
 
 class TransferTask(BaseModel):
@@ -166,11 +172,34 @@ class EpisodeFormat(BaseModel):
     offset: Optional[str] = None
 
 
+class EpisodeFormatRule(BaseModel):
+    """
+    集数定位规则
+    """
+    name: str
+    enabled: bool = True
+    order: int = 0
+    pattern: str
+    min_file_size_mb: int = 0
+
+
+class EpisodeFormatRecommendItem(BaseModel):
+    """
+    集数定位推荐请求
+    """
+    fileitem: Optional[FileItem] = None
+    fileitems: Optional[List[FileItem]] = None
+
+
 class ManualTransferItem(BaseModel):
     # 文件项
     fileitem: FileItem = None
+    # 文件项列表（前端多选时传入）
+    fileitems: Optional[List[FileItem]] = None
     # 日志ID
     logid: Optional[int] = None
+    # 日志ID列表（前端多选历史记录时传入）
+    logids: Optional[List[int]] = None
     # 目标存储
     target_storage: Optional[str] = None
     # 目标路径
@@ -196,7 +225,7 @@ class ManualTransferItem(BaseModel):
     # 最小文件大小
     min_filesize: Optional[int] = 0
     # 刮削
-    scrape: bool = False
+    scrape: Optional[bool] = False
     # 媒体库类型子目录
     library_type_folder: Optional[bool] = None
     # 媒体库类别子目录
@@ -207,3 +236,22 @@ class ManualTransferItem(BaseModel):
     episode_group: Optional[str] = None
     # 仅预览，不执行整理
     preview: Optional[bool] = False
+
+
+class ManualTransferTargetPath(BaseModel):
+    """
+    手动整理目的路径匹配结果
+    """
+
+    # 目标存储
+    target_storage: Optional[str] = None
+    # 目标路径
+    target_path: Optional[str] = None
+    # 整理方式
+    transfer_type: Optional[str] = None
+    # 刮削
+    scrape: Optional[bool] = False
+    # 媒体库类型子目录
+    library_type_folder: Optional[bool] = False
+    # 媒体库类别子目录
+    library_category_folder: Optional[bool] = False

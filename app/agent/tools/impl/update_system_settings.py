@@ -7,10 +7,14 @@ from typing import Any, Literal, Optional, Type, Union
 from pydantic import BaseModel, Field
 
 from app.agent.tools.base import MoviePilotTool
+from app.agent.tools.tags import ToolTag
 from app.agent.tools.impl._system_setting_utils import (
     SettingSpec,
     get_default_list_match_field,
+    is_secret_setting_key,
+    redact_secret_value,
     resolve_setting_spec,
+    should_redact_setting,
 )
 from app.core.config import settings
 from app.core.event import eventmanager
@@ -25,10 +29,6 @@ SettingValue = Optional[Union[list, dict, bool, int, float, str]]
 class UpdateSystemSettingsInput(BaseModel):
     """更新系统设置工具的输入参数模型。"""
 
-    explanation: str = Field(
-        ...,
-        description="Clear explanation of why this tool is being used in the current context",
-    )
     setting_key: str = Field(
         ...,
         description=(
@@ -75,6 +75,12 @@ class UpdateSystemSettingsInput(BaseModel):
 
 class UpdateSystemSettingsTool(MoviePilotTool):
     name: str = "update_system_settings"
+    tags: list[str] = [
+        ToolTag.Write,
+        ToolTag.System,
+        ToolTag.Settings,
+        ToolTag.Admin,
+    ]
     description: str = (
         "Update system settings across both the basic Settings module and all SystemConfig-backed categories. "
         "Supports full replacement, shallow dict merge, and generic list item upsert/remove so the agent can manage downloaders, media servers, notification channels, storages, directories, search-site ranges, subscribe-site ranges, site auth params, AI agent config, and other system settings through one tool."
@@ -97,12 +103,14 @@ class UpdateSystemSettingsTool(MoviePilotTool):
 
     @staticmethod
     def _load_setting_value(spec: SettingSpec):
+        """读取指定设置项的当前值。"""
         if spec.source == "settings":
             return getattr(settings, spec.key)
-        return SystemConfigOper().get(spec.key)
+        return SystemConfigOper().get(spec.systemconfig_key)
 
     @staticmethod
     def _normalize_systemconfig_value(value: Any):
+        """规范化写入 SystemConfig 的空列表值。"""
         if isinstance(value, list):
             filtered = [item for item in value if item is not None]
             return filtered or None
@@ -216,10 +224,7 @@ class UpdateSystemSettingsTool(MoviePilotTool):
         **kwargs,
     ) -> str:
         logger.info(
-            "执行工具: %s, setting_key=%s, operation=%s",
-            self.name,
-            setting_key,
-            operation,
+            f"执行工具: {self.name}, setting_key={setting_key}, operation={operation}"
         )
 
         try:
@@ -261,7 +266,10 @@ class UpdateSystemSettingsTool(MoviePilotTool):
             else:
                 normalized_value = self._normalize_systemconfig_value(next_value)
                 event_value = normalized_value
-                success = await SystemConfigOper().async_set(spec.key, normalized_value)
+                success = await SystemConfigOper().async_set(
+                    spec.systemconfig_key,
+                    normalized_value,
+                )
                 changed = success is True
 
             if changed:
@@ -275,6 +283,26 @@ class UpdateSystemSettingsTool(MoviePilotTool):
                 )
 
             saved_value = self._load_setting_value(spec)
+            redact_values = (
+                should_redact_setting(spec, saved_value)
+                or should_redact_setting(spec, current_value)
+            )
+            response_previous_value = (
+                redact_secret_value(
+                    current_value,
+                    redact_scalar=is_secret_setting_key(spec.key),
+                )
+                if redact_values
+                else current_value
+            )
+            response_saved_value = (
+                redact_secret_value(
+                    saved_value,
+                    redact_scalar=is_secret_setting_key(spec.key),
+                )
+                if redact_values
+                else saved_value
+            )
             if not changed and not message:
                 message = "配置值未发生变化"
 
@@ -290,8 +318,9 @@ class UpdateSystemSettingsTool(MoviePilotTool):
                         "group": spec.group,
                         "label": spec.label,
                     },
-                    "previous_value": current_value,
-                    "saved_value": saved_value,
+                    "values_redacted": redact_values,
+                    "previous_value": response_previous_value,
+                    "saved_value": response_saved_value,
                 },
                 ensure_ascii=False,
                 indent=2,

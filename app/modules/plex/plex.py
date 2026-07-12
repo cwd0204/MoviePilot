@@ -152,6 +152,7 @@ class Plex:
                     name=library.title,
                     path=library.locations,
                     type=library_type,
+                    item_count=self.get_items_count(library.key),
                     image_list=image_list,
                     link=f"{self._playhost or self._host}web/index.html#!/media/{self._plex.machineIdentifier}"
                          f"/com.plexapp.plugins.library?source={library.key}&X-Plex-Token={self._token}",
@@ -574,6 +575,22 @@ class Plex:
             path=path,
             user_state=user_state,
         )
+
+    def get_items_count(self, parent: Union[str, int]) -> Optional[int]:
+        """
+        获取指定媒体库可同步的媒体条目总数
+
+        :param parent: 媒体库ID
+        :return: 媒体条目总数，查询失败时返回None
+        """
+        if not parent or not self._plex:
+            return None
+        try:
+            section = self._plex.library.sectionByID(int(parent))
+            return int(section.totalSize) if section else None
+        except Exception as err:
+            logger.error(f"查询媒体库 {parent} 的媒体总数出错：{str(err)}")
+            return None
 
     def get_items(self, parent: Union[str, int], start_index: Optional[int] = 0, limit: Optional[int] = -1) \
             -> Generator[MediaServerItem | None, Any, None]:

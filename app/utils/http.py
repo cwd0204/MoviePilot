@@ -70,6 +70,8 @@ _DEFAULT_MAX_KEEPALIVE_CONNECTIONS = 20
 _DEFAULT_MAX_CONNECTIONS = 40
 # 默认的 keep-alive 连接过期时间（秒）
 _DEFAULT_KEEPALIVE_EXPIRY = 30
+# 同步 requests.Session 复用连接时，遇到对端或代理关闭 keep-alive 后允许重试的方法
+_REQUESTS_RETRY_IDEMPOTENT_METHODS = ("GET", "HEAD", "OPTIONS")
 # 持有 LRU 淘汰后正在异步关闭的 transport task，避免 fire-and-forget 被 GC 警告
 _pending_eviction_tasks: set[asyncio.Task] = set()
 
@@ -90,6 +92,9 @@ def _get_shared_async_transport(
     会话级状态由调用方在外层 AsyncClient(transport=...) 实例化时单独配置，
     每次调用用完即销毁，因此天然无 jar 累积串扰。
     """
+    # 规范化代理：拒绝空字符串等非法值，防止 httpx 抛出 Unknown scheme for proxy URL
+    if proxy is not None and (not proxy or not proxy.strip()):
+        proxy = None
     try:
         loop = asyncio.get_running_loop()
     except RuntimeError:
@@ -344,14 +349,47 @@ class RequestUtils:
         kwargs.setdefault("timeout", self._timeout)
         kwargs.setdefault("verify", False)
         kwargs.setdefault("stream", False)
+        method_upper = method.upper()
         try:
             return req_method(method, url, **kwargs)
+        except (
+            requests.exceptions.ConnectionError,
+            requests.exceptions.ChunkedEncodingError,
+            requests.exceptions.ReadTimeout,
+        ) as e:
+            if (
+                self._session is not None
+                and method_upper in _REQUESTS_RETRY_IDEMPOTENT_METHODS
+            ):
+                logger.debug(f"keep-alive 连接已失效，同步幂等请求重试一次: {e!r}")
+                try:
+                    self._session.close()
+                    return req_method(method, url, **kwargs)
+                except requests.exceptions.RequestException as retry_error:
+                    error_msg = (
+                        str(retry_error)
+                        if str(retry_error)
+                        else f"未知网络错误 (URL: {url}, Method: {method_upper})"
+                    )
+                    logger.debug(f"重试后同步请求仍失败: {error_msg}")
+                    if raise_exception:
+                        raise
+                    return None
+            error_msg = (
+                str(e)
+                if str(e)
+                else f"未知网络错误 (URL: {url}, Method: {method_upper})"
+            )
+            logger.debug(f"同步请求失败(不重试): {error_msg}")
+            if raise_exception:
+                raise
+            return None
         except requests.exceptions.RequestException as e:
             # 获取更详细的错误信息
             error_msg = (
                 str(e)
                 if str(e)
-                else f"未知网络错误 (URL: {url}, Method: {method.upper()})"
+                else f"未知网络错误 (URL: {url}, Method: {method_upper})"
             )
             logger.debug(f"请求失败: {error_msg}")
             if raise_exception:
@@ -732,6 +770,112 @@ class RequestUtils:
             return fallback_encoding or "utf-8"
 
     @staticmethod
+    def detect_xml_declared_encoding(raw_data: bytes) -> Optional[str]:
+        """
+        从 XML 声明中读取字符集，适用于 RSS/Atom 等 XML 响应的 bytes 级解码。
+        """
+        if not raw_data:
+            return None
+        xml_head = raw_data[:512].decode("ascii", errors="ignore")
+        match = re.search(
+            r"^\s*(?:\ufeff)?<\?xml[^>]*encoding\s*=\s*[\"']([^\"']+)[\"']",
+            xml_head,
+            re.IGNORECASE,
+        )
+        return match.group(1).strip() if match else None
+
+    @staticmethod
+    def is_low_confidence_http_encoding(encoding: Optional[str]) -> bool:
+        """
+        判断 HTTP 客户端默认编码是否低可信，避免 latin1 类默认值吞掉 UTF-8 内容。
+        """
+        if not encoding:
+            return False
+        normalized = encoding.strip().lower().replace("_", "-")
+        return normalized in {"iso-8859-1", "latin-1", "latin1"}
+
+    @staticmethod
+    def get_decoded_xml_content(
+        response: Response,
+        performance_mode: bool = False,
+        confidence_threshold: float = 0.8,
+    ) -> str:
+        """
+        获取 XML 响应的解码文本内容，优先尊重 XML 声明并避免低可信 HTTP 默认编码。
+
+        :param response: HTTP 响应对象
+        :param performance_mode: 是否优先使用轻量规则，默认为 False (兼容模式)
+        :param confidence_threshold: chardet 检测置信度阈值，默认为 0.8
+        :return: 解码后的 XML 文本
+        """
+        if not response:
+            return ""
+        raw_data = getattr(response, "content", None)
+        if not raw_data:
+            return getattr(response, "text", "") or ""
+
+        def _try_decode(encodings):
+            seen_encodings = set()
+            for encoding in encodings:
+                if not encoding:
+                    continue
+                normalized = str(encoding).strip()
+                if not normalized or normalized.lower() in seen_encodings:
+                    continue
+                seen_encodings.add(normalized.lower())
+                try:
+                    return raw_data.decode(normalized)
+                except (LookupError, UnicodeDecodeError):
+                    continue
+            return None
+
+        xml_encoding = RequestUtils.detect_xml_declared_encoding(raw_data)
+        if xml_encoding:
+            decoded = _try_decode([xml_encoding])
+            if decoded is not None:
+                return decoded
+
+        response_encoding = getattr(response, "encoding", None)
+        trusted_response_encoding = (
+            response_encoding
+            if not RequestUtils.is_low_confidence_http_encoding(response_encoding)
+            else None
+        )
+        apparent_encoding = getattr(response, "apparent_encoding", None)
+        trusted_apparent_encoding = (
+            apparent_encoding
+            if not RequestUtils.is_low_confidence_http_encoding(apparent_encoding)
+            else None
+        )
+
+        fallback_encoding = None
+        try:
+            if performance_mode:
+                decoded = _try_decode(["utf-8", trusted_response_encoding, trusted_apparent_encoding])
+                if decoded is not None:
+                    return decoded
+
+            detection = chardet.detect(raw_data)
+            if detection.get("confidence", 0) > confidence_threshold:
+                decoded = _try_decode([detection.get("encoding")])
+                if decoded is not None:
+                    return decoded
+            fallback_encoding = detection.get("encoding")
+
+            if not performance_mode:
+                decoded = _try_decode(["utf-8", trusted_response_encoding, trusted_apparent_encoding])
+                if decoded is not None:
+                    return decoded
+
+            decoded = _try_decode([fallback_encoding, "utf-8", apparent_encoding, response_encoding])
+            if decoded is not None:
+                return decoded
+        except Exception as e:
+            logger.debug(f"Error when getting decoded XML content: {str(e)}")
+
+        return raw_data.decode("utf-8", errors="replace")
+
+    @staticmethod
     def get_decoded_html_content(
         response: Response,
         performance_mode: bool = False,
@@ -864,12 +1008,17 @@ class AsyncRequestUtils:
 
         # 如果已经是字符串格式，直接返回
         if isinstance(proxies, str):
-            return proxies
+            return proxies.strip() or None
 
         # 如果是字典格式，提取http或https代理
         if isinstance(proxies, dict):
             # 优先使用https代理，如果没有则使用http代理
-            proxy_url = proxies.get("https") or proxies.get("http")
+            # 先各自 strip，避免空白字符串阻断裂合取或回退到 http 代理
+            https_proxy = proxies.get("https")
+            http_proxy = proxies.get("http")
+            https_proxy = https_proxy.strip() if isinstance(https_proxy, str) else None
+            http_proxy = http_proxy.strip() if isinstance(http_proxy, str) else None
+            proxy_url = https_proxy or http_proxy
             if proxy_url:
                 return proxy_url
 

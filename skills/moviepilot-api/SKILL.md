@@ -1,7 +1,14 @@
 ---
 name: moviepilot-api
-version: 1
-description: Use this skill when you need to call MoviePilot REST API endpoints directly. Covers all 237 API endpoints across 27 categories including media search, downloads, subscriptions, library management, site management, system administration, plugins, workflows, and more. Use this skill whenever the user asks to interact with MoviePilot via its HTTP API, or when the moviepilot-cli skill cannot cover a specific operation.
+version: 2
+description: >-
+  Use this skill when you need to call MoviePilot REST API endpoints directly
+  with the bundled Python client. Covers MoviePilot HTTP endpoints across media
+  search, downloads, subscriptions, library management, site management, system
+  administration, plugins, workflows, and more. Prefer `moviepilot-cli` for
+  normal local MCP tool workflows; use this skill when the user explicitly asks
+  for HTTP API access, when an endpoint is not exposed as an MCP tool, or when
+  running in an environment where direct REST calls are the appropriate bridge.
 ---
 
 # MoviePilot REST API
@@ -10,15 +17,38 @@ description: Use this skill when you need to call MoviePilot REST API endpoints 
 
 Use `scripts/mp-api.py` to call any MoviePilot REST API endpoint directly.
 
+## Scope And Boundaries
+
+This skill is the REST API bridge. It is implemented as a Python script and is
+useful when the agent needs endpoint-level coverage beyond the local
+`moviepilot tool` MCP CLI.
+
+Choose other skills first when they match more precisely:
+
+| Request | Preferred skill |
+|---|---|
+| Normal local MoviePilot product operation exposed as an MCP tool | `moviepilot-cli` |
+| Direct SQL query or database update | `database-operation` |
+| Restart, version check, or upgrade | `moviepilot-update` |
+| Slash commands or plugin/system command dispatch | `command-dispatch` |
+| Browser-only state, site login pages, screenshots, cookies | `browser-use` |
+
+Do not use this skill just because MoviePilot is mentioned. Use it when the
+task specifically needs a REST endpoint, token-query endpoint, or API behavior
+that the CLI/MCP tools do not expose.
+
 ## Setup
 
-Configure the backend host and API key (persisted to `~/.config/moviepilot_api/config`):
+When the script runs inside the MoviePilot project, it imports `app.core.config.settings` and reads `settings.HOST`, `settings.PORT`, and `settings.API_TOKEN` directly. Do not ask the user for `API_TOKEN`, and do not copy API keys into the prompt.
 
-```
-python scripts/mp-api.py configure --host http://localhost:3000 --apikey <API_TOKEN>
-```
+Configuration priority:
 
-The API key is the `API_TOKEN` value from MoviePilot settings.
+1. CLI flags: `--host`, `--apikey`
+2. Environment variables: `MP_HOST`, `MP_API_KEY`
+3. Local MoviePilot settings
+4. Legacy config file: `~/.config/moviepilot_api/config`
+
+Use `configure` only as a legacy fallback outside the MoviePilot project, and avoid it in normal agent workflows because it persists a long-lived API key to disk.
 
 ## How to Call APIs
 
@@ -30,9 +60,10 @@ python scripts/mp-api.py <METHOD> <PATH> [key=value ...] [--json '<body>']
 
 ### Authentication
 
-- By default, the key is sent via the `X-API-KEY` header.
+- By default, the script auto-loads the local key and sends it via the `X-API-KEY` header.
 - For endpoints suffixed with `2` (e.g. `/api/v1/dashboard/statistic2`), use `--token-param` to send the key as `?token=`.
 - Both methods validate against the same `API_TOKEN` value.
+- Never print, summarize, or ask the user to paste the API key unless the script is being used outside the local project and no safer configuration source is available.
 
 ### Examples
 
@@ -107,22 +138,30 @@ All endpoints are under the base URL `{MP_HOST}`. Path parameters are shown as `
 | GET | `/api/v1/bangumi/person/{person_id}` | Person detail |
 | GET | `/api/v1/bangumi/person/credits/{person_id}` | Person filmography. Params: `page`, `count` |
 
-### Search / Torrents (4 endpoints)
+### Search / Torrents / Subtitles (11 endpoints)
 
 | Method | Path | Description |
 |--------|------|-------------|
 | GET | `/api/v1/search/media/{mediaid}` | Search torrents by media ID (format: `tmdb:123` / `douban:123` / `bangumi:123`). Params: `mtype`, `area`, `title`, `year`, `season`, `sites` |
+| GET | `/api/v1/search/media/{mediaid}/stream` | Stream torrent search by media ID with SSE. Params: `mtype`, `area`, `title`, `year`, `season`, `sites` |
 | GET | `/api/v1/search/title` | Fuzzy search torrents by keyword. Params: `keyword`, `page`, `sites` |
+| GET | `/api/v1/search/title/stream` | Stream fuzzy torrent search with SSE. Params: `keyword`, `page`, `sites` |
+| GET | `/api/v1/search/subtitle/title` | Fuzzy search site subtitles by keyword. Params: `keyword`, `page`, `sites` |
+| GET | `/api/v1/search/subtitle/title/stream` | Stream fuzzy site subtitle search with SSE. Params: `keyword`, `page`, `sites` |
+| GET | `/api/v1/search/subtitle/media/{mediaid}` | Exact subtitle search by media ID (format: `tmdb:123` / `douban:123` / `bangumi:123`). Params: `mtype`, `title`, `year`, `season`, `episode`, `sites` |
+| GET | `/api/v1/search/subtitle/media/{mediaid}/stream` | Stream exact subtitle search by media ID with SSE. Params: `mtype`, `title`, `year`, `season`, `episode`, `sites` |
 | GET | `/api/v1/search/last` | Get latest search results |
+| GET | `/api/v1/search/last/context` | Get latest search results with replayable params. `params.result_type` is `torrent` or `subtitle` |
 | POST | `/api/v1/search/recommend` | AI recommended resources. Body: `filtered_indices`, `check_only`, `force` |
 
-### Download (7 endpoints)
+### Download (8 endpoints)
 
 | Method | Path | Description |
 |--------|------|-------------|
 | GET | `/api/v1/download/` | List active downloads. Params: `name` (downloader name) |
 | POST | `/api/v1/download/` | Add download (with media info). Body: JSON |
 | POST | `/api/v1/download/add` | Add download (without media info). Body: JSON with `torrent_url` |
+| POST | `/api/v1/download/subtitle` | Download subtitle file to the recognized media download directory. Body: `subtitle_in`, optional `tmdbid`, `doubanid`, `save_path` |
 | GET | `/api/v1/download/start/{hashString}` | Resume download task |
 | GET | `/api/v1/download/stop/{hashString}` | Pause download task |
 | GET | `/api/v1/download/clients` | List available download clients |
@@ -161,7 +200,7 @@ All endpoints are under the base URL `{MP_HOST}`. Path parameters are shown as `
 | GET | `/api/v1/subscribe/shares` | List shared subscriptions. Params: `name`, `page`, `count`, `genre_id`, `min_rating`, `max_rating`, `sort_type` |
 | GET | `/api/v1/subscribe/share/statistics` | Share statistics |
 
-### Site (24 endpoints)
+### Site (25 endpoints)
 
 | Method | Path | Description |
 |--------|------|-------------|
@@ -174,7 +213,8 @@ All endpoints are under the base URL `{MP_HOST}`. Path parameters are shown as `
 | GET | `/api/v1/site/cookiecloud` | Sync CookieCloud |
 | GET | `/api/v1/site/reset` | Reset sites |
 | POST | `/api/v1/site/priorities` | Batch update site priorities. Body: array |
-| GET | `/api/v1/site/cookie/{site_id}` | Update site cookie & UA. Params: `username`, `password`, `code` |
+| POST | `/api/v1/site/cookie/{site_id}` | Update site cookie & UA. Body: `SiteCookieUpdate` JSON |
+| GET | `/api/v1/site/cookie/{site_id}` | Legacy update site cookie & UA. Params: `username`, `password`, `code` |
 | POST | `/api/v1/site/userdata/{site_id}` | Refresh site user data |
 | GET | `/api/v1/site/userdata/{site_id}` | Get site user data. Params: `workdate` |
 | GET | `/api/v1/site/userdata/latest` | All sites latest user data |
@@ -231,17 +271,18 @@ All endpoints are under the base URL `{MP_HOST}`. Path parameters are shown as `
 | POST | `/api/v1/storage/save/{name}` | Save storage config. Body: JSON object |
 | GET | `/api/v1/storage/reset/{name}` | Reset storage config |
 
-### Transfer (5 endpoints)
+### Transfer (6 endpoints)
 
 | Method | Path | Description |
 |--------|------|-------------|
 | GET | `/api/v1/transfer/name` | Preview transfer name. Params: `path` (required), `filetype` (required) |
 | GET | `/api/v1/transfer/queue` | Transfer queue |
 | DELETE | `/api/v1/transfer/queue` | Remove from transfer queue. Body: FileItem JSON |
+| POST | `/api/v1/transfer/manual/target-path` | Match manual transfer target path. Body: ManualTransferItem JSON |
 | POST | `/api/v1/transfer/manual` | Manual transfer. Params: `background`. Body: ManualTransferItem JSON |
 | GET | `/api/v1/transfer/now` | Run immediate transfer |
 
-### Dashboard (16 endpoints)
+### Dashboard (19 endpoints)
 
 | Method | Path | Description |
 |--------|------|-------------|
@@ -250,10 +291,13 @@ All endpoints are under the base URL `{MP_HOST}`. Path parameters are shown as `
 | GET | `/api/v1/dashboard/storage` | Local storage space |
 | GET | `/api/v1/dashboard/storage2` | Local storage space (API_TOKEN) |
 | GET | `/api/v1/dashboard/processes` | Process info |
+| GET | `/api/v1/dashboard/system` | Host name, operating system, MoviePilot runtime, and backend version |
 | GET | `/api/v1/dashboard/downloader` | Downloader info. Params: `name` |
 | GET | `/api/v1/dashboard/downloader2` | Downloader info (API_TOKEN) |
 | GET | `/api/v1/dashboard/schedule` | Scheduled services |
 | GET | `/api/v1/dashboard/schedule2` | Scheduled services (API_TOKEN) |
+| GET | `/api/v1/dashboard/schedule/{job_id}/progress` | Scheduled service real-time progress |
+| GET | `/api/v1/dashboard/schedule2/{job_id}/progress` | Scheduled service real-time progress (API_TOKEN) |
 | GET | `/api/v1/dashboard/transfer` | Transfer statistics. Params: `days` |
 | GET | `/api/v1/dashboard/cpu` | CPU usage |
 | GET | `/api/v1/dashboard/cpu2` | CPU usage (API_TOKEN) |
@@ -310,14 +354,17 @@ All endpoints are under the base URL `{MP_HOST}`. Path parameters are shown as `
 | POST | `/api/v1/workflow/fork` | Fork shared workflow. Body: WorkflowShare JSON |
 | GET | `/api/v1/workflow/shares` | List shared workflows. Params: `name`, `page`, `count` |
 
-### System (21 endpoints)
+### System (24 endpoints)
 
 | Method | Path | Description |
 |--------|------|-------------|
-| GET | `/api/v1/system/env` | Get system configuration |
+| GET | `/api/v1/system/env` | Get system configuration, including runtime versions and Rust acceleration availability/enabled status |
 | POST | `/api/v1/system/env` | Update system configuration. Body: JSON object |
+| GET | `/api/v1/system/ping` | Check service availability for authenticated users |
+| GET | `/api/v1/system/setting/public/{key}` | Get allowlisted non-sensitive system setting for authenticated users |
 | GET | `/api/v1/system/setting/{key}` | Get system setting |
 | POST | `/api/v1/system/setting/{key}` | Update system setting |
+| POST | `/api/v1/system/setting/PLUGIN_MARKET/sync-wiki` | Sync plugin market repository URLs from the MoviePilot Wiki and merge with local `PLUGIN_MARKET` |
 | GET | `/api/v1/system/global` | Non-sensitive settings. Params: `token` (required) |
 | GET | `/api/v1/system/global/user` | User-related settings |
 | GET | `/api/v1/system/restart` | Restart system |
@@ -376,7 +423,7 @@ All endpoints are under the base URL `{MP_HOST}`. Path parameters are shown as `
 | POST | `/api/v1/torrent/cache/refresh` | Refresh torrent cache |
 | POST | `/api/v1/torrent/cache/reidentify/{domain}/{torrent_hash}` | Re-identify torrent. Params: `tmdbid`, `doubanid` |
 
-### Message (6 endpoints)
+### Message (8 endpoints)
 
 | Method | Path | Description |
 |--------|------|-------------|
@@ -384,6 +431,8 @@ All endpoints are under the base URL `{MP_HOST}`. Path parameters are shown as `
 | GET | `/api/v1/message/` | Callback verification. Params: `token`, `echostr`, `msg_signature`, `timestamp`, `nonce`, `source` |
 | POST | `/api/v1/message/web` | Send web message. Params: `text` (required) |
 | GET | `/api/v1/message/web` | Get web messages. Params: `page`, `count` |
+| GET | `/api/v1/message/notification` | Get notification history. Params: `page`, `count`; server filters cleared history |
+| DELETE | `/api/v1/message/notification` | Mark notification history as cleared. Params: `scope` (`all`, `system`, `media`) |
 | POST | `/api/v1/message/webpush/subscribe` | WebPush subscribe. Body: Subscription JSON |
 | POST | `/api/v1/message/webpush/send` | Send WebPush notification. Body: SubscriptionMessage JSON |
 
@@ -420,6 +469,14 @@ All endpoints are under the base URL `{MP_HOST}`. Path parameters are shown as `
 | POST | `/api/v1/mcp/tools/call` | Call a tool. Body: `{"tool_name":"...","arguments":{...}}` |
 | GET | `/api/v1/mcp/tools/{tool_name}` | Get tool definition |
 | GET | `/api/v1/mcp/tools/{tool_name}/schema` | Get tool input schema |
+
+### Agent MCP Client (3 endpoints)
+
+| Method | Path | Description |
+|--------|------|-------------|
+| GET | `/api/v1/message/agent/mcp/servers` | List external MCP servers configured for the built-in Agent. Superuser login required |
+| POST | `/api/v1/message/agent/mcp/servers` | Save external MCP servers for the built-in Agent. Body: `{"servers":[...]}` |
+| POST | `/api/v1/message/agent/mcp/servers/test` | Test one external MCP server and return discovered tools. Body: `{"server":{...}}` |
 
 ### Webhook (2 endpoints)
 
@@ -484,6 +541,19 @@ python scripts/mp-api.py GET /api/v1/search/last
 python scripts/mp-api.py POST /api/v1/download/add --json '{"torrent_url":"<url_from_search>"}'
 ```
 
+### Search and download subtitles
+
+```bash
+# 1. Search site subtitles by keyword
+python scripts/mp-api.py GET /api/v1/search/subtitle/title keyword="Inception" sites="1,2"
+
+# 2. Restore the last subtitle search with replayable params
+python scripts/mp-api.py GET /api/v1/search/last/context
+
+# 3. Download a subtitle result to the recognized media directory
+python scripts/mp-api.py POST /api/v1/download/subtitle --json '{"subtitle_in":{"title":"Inception.2010.1080p.chs","enclosure":"https://example.com/downloadsubs.php?torrentid=1&subid=2","site_name":"Example"},"tmdbid":27205}'
+```
+
 ### Add a subscription
 
 ```bash
@@ -538,9 +608,9 @@ python scripts/mp-api.py GET /api/v1/site/cookiecloud
 
 | Scenario | Action |
 |----------|--------|
-| HTTP 401 | API key is invalid or missing. Re-run `configure` with correct `--apikey`. |
+| HTTP 401 | API key is invalid or missing. Verify local settings with `moviepilot doctor`; only use `--apikey` as an external fallback. |
 | HTTP 403 | Insufficient permissions. The API key grants superuser access; check if the endpoint requires special auth. |
 | HTTP 404 | Endpoint or resource not found. Verify the path and path parameters. |
 | HTTP 422 | Validation error. Check required parameters and JSON body format. |
 | Connection error | Verify `--host` URL is reachable. Check if MoviePilot is running. |
-| Missing config | Run `python scripts/mp-api.py configure --host <HOST> --apikey <KEY>` first. |
+| Missing config | Run inside the MoviePilot project, or set `MP_HOST` and `MP_API_KEY` in the process environment. |

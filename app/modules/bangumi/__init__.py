@@ -12,19 +12,31 @@ from app.utils.http import RequestUtils
 
 
 class BangumiModule(_ModuleBase):
+    """
+    Bangumi媒体信息匹配
+    """
+    CONFIG_WATCH = {"PROXY_HOST"}
+
     bangumiapi: BangumiApi = None
 
     def init_module(self) -> None:
+        """
+        初始化Bangumi客户端
+        """
         self.bangumiapi = BangumiApi()
 
-    def stop(self):
-        self.bangumiapi.close()
+    def stop(self) -> None:
+        """
+        关闭Bangumi客户端
+        """
+        if self.bangumiapi:
+            self.bangumiapi.close()
 
     def test(self) -> Tuple[bool, str]:
         """
         测试模块连接性
         """
-        ret = RequestUtils().get_res("https://api.bgm.tv/")
+        ret = RequestUtils(proxies=settings.PROXY).get_res("https://api.bgm.tv/")
         if ret and ret.status_code == 200:
             return True, ""
         elif ret:
@@ -36,6 +48,9 @@ class BangumiModule(_ModuleBase):
 
     @staticmethod
     def get_name() -> str:
+        """
+        获取模块名称
+        """
         return "Bangumi"
 
     @staticmethod
@@ -226,14 +241,7 @@ class BangumiModule(_ModuleBase):
         """
         personinfo = self.bangumiapi.person_detail(person_id)
         if personinfo:
-            return schemas.MediaPerson(source='bangumi', **{
-                "id": personinfo.get("id"),
-                "name": personinfo.get("name"),
-                "images": personinfo.get("images"),
-                "biography": personinfo.get("summary"),
-                "birthday": personinfo.get("birth_day"),
-                "gender": personinfo.get("gender")
-            })
+            return self._build_person_detail(personinfo)
         return None
 
     async def async_bangumi_person_detail(self, person_id: int) -> Optional[schemas.MediaPerson]:
@@ -243,15 +251,35 @@ class BangumiModule(_ModuleBase):
         """
         personinfo = await self.bangumiapi.async_person_detail(person_id)
         if personinfo:
-            return schemas.MediaPerson(source='bangumi', **{
-                "id": personinfo.get("id"),
-                "name": personinfo.get("name"),
-                "images": personinfo.get("images"),
-                "biography": personinfo.get("summary"),
-                "birthday": personinfo.get("birth_day"),
-                "gender": personinfo.get("gender")
-            })
+            return self._build_person_detail(personinfo)
         return None
+
+    @classmethod
+    def _build_person_detail(cls, personinfo: dict) -> schemas.MediaPerson:
+        """
+        构造Bangumi人物详情信息。
+        :param personinfo: Bangumi人物详情接口返回数据
+        :return: 媒体人物信息
+        """
+        return schemas.MediaPerson(source='bangumi', **{
+            "id": personinfo.get("id"),
+            "name": personinfo.get("name"),
+            "images": personinfo.get("images"),
+            "biography": personinfo.get("summary"),
+            "birthday": cls._normalize_optional_string(personinfo.get("birth_day")),
+            "gender": personinfo.get("gender")
+        })
+
+    @staticmethod
+    def _normalize_optional_string(value: object) -> Optional[str]:
+        """
+        规范化Bangumi接口中可能返回非字符串的可选文本字段。
+        :param value: 原始字段值
+        :return: 字符串字段值或None
+        """
+        if value is None:
+            return None
+        return str(value)
 
     def bangumi_person_credits(self, person_id: int) -> List[MediaInfo]:
         """

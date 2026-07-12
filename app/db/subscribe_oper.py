@@ -6,6 +6,19 @@ from app.db import DbOper
 from app.db.models.subscribe import Subscribe
 from app.db.models.subscribehistory import SubscribeHistory
 
+INTEGER_FLAG_FIELDS = ("best_version", "best_version_full", "search_imdbid", "manual_total_episode")
+
+
+def _normalize_integer_flags(payload: dict, fields: Tuple[str, ...] = INTEGER_FLAG_FIELDS) -> dict:
+    """
+    将历史兼容的布尔开关转换为整型值，避免 PostgreSQL 严格类型检查失败。
+    """
+    normalized_payload = dict(payload)
+    for field in fields:
+        if isinstance(normalized_payload.get(field), bool):
+            normalized_payload[field] = int(normalized_payload[field])
+    return normalized_payload
+
 
 class SubscribeOper(DbOper):
     """
@@ -16,10 +29,19 @@ class SubscribeOper(DbOper):
         """
         新增订阅
         """
-        subscribe = Subscribe.exists(self._db,
-                                     tmdbid=mediainfo.tmdb_id,
-                                     doubanid=mediainfo.douban_id,
-                                     season=kwargs.get('season'))
+        owner_scope = bool(kwargs.pop("owner_scope", False))
+        username = kwargs.get("username") if owner_scope else None
+        if username:
+            subscribe = Subscribe.exists_by_username(self._db,
+                                                     username=username,
+                                                     tmdbid=mediainfo.tmdb_id,
+                                                     doubanid=mediainfo.douban_id,
+                                                     season=kwargs.get('season'))
+        else:
+            subscribe = Subscribe.exists(self._db,
+                                         tmdbid=mediainfo.tmdb_id,
+                                         doubanid=mediainfo.douban_id,
+                                         season=kwargs.get('season'))
         kwargs.update({
             "name": mediainfo.title,
             "year": mediainfo.year,
@@ -37,14 +59,22 @@ class SubscribeOper(DbOper):
             "search_imdbid": 1 if kwargs.get('search_imdbid') else 0,
             "date": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
         })
+        kwargs = _normalize_integer_flags(kwargs)
         if not subscribe:
             subscribe = Subscribe(**kwargs)
             subscribe.create(self._db)
             # 查询订阅
-            subscribe = Subscribe.exists(self._db,
-                                         tmdbid=mediainfo.tmdb_id,
-                                         doubanid=mediainfo.douban_id,
-                                         season=kwargs.get('season'))
+            if username:
+                subscribe = Subscribe.exists_by_username(self._db,
+                                                         username=username,
+                                                         tmdbid=mediainfo.tmdb_id,
+                                                         doubanid=mediainfo.douban_id,
+                                                         season=kwargs.get('season'))
+            else:
+                subscribe = Subscribe.exists(self._db,
+                                             tmdbid=mediainfo.tmdb_id,
+                                             doubanid=mediainfo.douban_id,
+                                             season=kwargs.get('season'))
             return subscribe.id, "新增订阅成功"
         else:
             return subscribe.id, "订阅已存在"
@@ -53,10 +83,19 @@ class SubscribeOper(DbOper):
         """
         异步新增订阅
         """
-        subscribe = await Subscribe.async_exists(self._db,
-                                                 tmdbid=mediainfo.tmdb_id,
-                                                 doubanid=mediainfo.douban_id,
-                                                 season=kwargs.get('season'))
+        owner_scope = bool(kwargs.pop("owner_scope", False))
+        username = kwargs.get("username") if owner_scope else None
+        if username:
+            subscribe = await Subscribe.async_exists_by_username(self._db,
+                                                                 username=username,
+                                                                 tmdbid=mediainfo.tmdb_id,
+                                                                 doubanid=mediainfo.douban_id,
+                                                                 season=kwargs.get('season'))
+        else:
+            subscribe = await Subscribe.async_exists(self._db,
+                                                     tmdbid=mediainfo.tmdb_id,
+                                                     doubanid=mediainfo.douban_id,
+                                                     season=kwargs.get('season'))
         kwargs.update({
             "name": mediainfo.title,
             "year": mediainfo.year,
@@ -74,14 +113,22 @@ class SubscribeOper(DbOper):
             "search_imdbid": 1 if kwargs.get('search_imdbid') else 0,
             "date": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
         })
+        kwargs = _normalize_integer_flags(kwargs)
         if not subscribe:
             subscribe = Subscribe(**kwargs)
             await subscribe.async_create(self._db)
             # 查询订阅
-            subscribe = await Subscribe.async_exists(self._db,
-                                                     tmdbid=mediainfo.tmdb_id,
-                                                     doubanid=mediainfo.douban_id,
-                                                     season=kwargs.get('season'))
+            if username:
+                subscribe = await Subscribe.async_exists_by_username(self._db,
+                                                                     username=username,
+                                                                     tmdbid=mediainfo.tmdb_id,
+                                                                     doubanid=mediainfo.douban_id,
+                                                                     season=kwargs.get('season'))
+            else:
+                subscribe = await Subscribe.async_exists(self._db,
+                                                         tmdbid=mediainfo.tmdb_id,
+                                                         doubanid=mediainfo.douban_id,
+                                                         season=kwargs.get('season'))
             return subscribe.id, "新增订阅成功"
         else:
             return subscribe.id, "订阅已存在"
@@ -154,12 +201,29 @@ class SubscribeOper(DbOper):
         """
         await Subscribe.async_delete(self._db, rid=sid)
 
+    async def async_update(self, sid: int, payload: dict) -> Subscribe:
+        """
+        异步更新订阅。
+        """
+        subscribe = await self.async_get(sid)
+        if subscribe:
+            payload = _normalize_integer_flags(payload)
+            await subscribe.async_update(self._db, payload)
+        return subscribe
+
+    async def async_update_filter_groups(self, sid: int, filter_groups: list) -> Subscribe:
+        """
+        异步更新订阅使用的过滤规则组。
+        """
+        return await self.async_update(sid, {"filter_groups": filter_groups})
+
     def update(self, sid: int, payload: dict) -> Subscribe:
         """
         更新订阅
         """
         subscribe = self.get(sid)
         if subscribe:
+            payload = _normalize_integer_flags(payload)
             subscribe.update(self._db, payload)
         return subscribe
 
@@ -188,6 +252,7 @@ class SubscribeOper(DbOper):
         """
         # 去除kwargs中 SubscribeHistory 没有的字段
         kwargs = {k: v for k, v in kwargs.items() if hasattr(SubscribeHistory, k)}
+        kwargs = _normalize_integer_flags(kwargs)
         # 更新完成订阅时间
         kwargs.update({"date": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())})
         # 去掉主键

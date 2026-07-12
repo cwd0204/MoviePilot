@@ -3,12 +3,12 @@ import traceback
 from typing import List, Tuple, Union, Optional
 from urllib.parse import urljoin
 
-import chardet
 from lxml import etree
 
 from app.core.config import settings
 from app.helper.browser import PlaywrightHelper
 from app.log import logger
+from app.utils import rust_accel
 from app.utils.http import RequestUtils
 from app.utils.string import StringUtils
 
@@ -227,6 +227,22 @@ class RssHelper:
         },
     }
 
+    def __parse_with_rust(self, ret_xml: Optional[str]) -> Optional[list]:
+        """
+        调用 Rust RSS 解析器，并统一处理基础 XML 校验和最大条目限制。
+        """
+        if not ret_xml or not ret_xml.strip():
+            return None
+        ret_xml_stripped = ret_xml.strip()
+        if not ret_xml_stripped.startswith('<'):
+            return None
+        rust_items = rust_accel.parse_rss_items(ret_xml, self.MAX_RSS_ITEMS + 1)
+        if rust_items is None:
+            return None
+        if len(rust_items) > self.MAX_RSS_ITEMS:
+            logger.warning(f"RSS条目过多: 超过{self.MAX_RSS_ITEMS}，仅处理前{self.MAX_RSS_ITEMS}个")
+        return rust_items[:self.MAX_RSS_ITEMS]
+
     def parse(self, url, proxy: bool = False,
               timeout: Optional[int] = 15, headers: dict = None, ua: str = None) -> Union[List[dict], None, bool]:
         """
@@ -269,21 +285,14 @@ class RssHelper:
                     return False
 
                 if raw_data:
-                    try:
-                        result = chardet.detect(raw_data)
-                        encoding = result['encoding']
-                        # 解码为字符串
-                        ret_xml = raw_data.decode(encoding)
-                    except Exception as e:
-                        logger.debug(f"chardet解码失败：{str(e)}")
-                        # 探测utf-8解码
-                        match = re.search(r'encoding\s*=\s*["\']([^"\']+)["\']', ret.text)
-                        if match:
-                            encoding = match.group(1)
-                            if encoding:
-                                ret_xml = raw_data.decode(encoding)
-                        else:
-                            ret.encoding = ret.apparent_encoding
+                    ret_xml = RequestUtils.get_decoded_xml_content(
+                        ret,
+                        performance_mode=settings.ENCODING_DETECTION_PERFORMANCE_MODE,
+                        confidence_threshold=settings.ENCODING_DETECTION_MIN_CONFIDENCE
+                    )
+                    rust_items = self.__parse_with_rust(ret_xml)
+                    if rust_items is not None:
+                        return rust_items
                 if not ret_xml:
                     ret_xml = ret.text
 
@@ -297,6 +306,10 @@ class RssHelper:
                 if not ret_xml_stripped.startswith('<'):
                     logger.error("RSS内容不是有效的XML格式")
                     return False
+
+                rust_items = self.__parse_with_rust(ret_xml)
+                if rust_items is not None:
+                    return rust_items
 
                 # 使用lxml.etree解析XML
                 parser = None

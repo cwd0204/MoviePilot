@@ -6,7 +6,8 @@ from typing import Optional, Type
 from pydantic import BaseModel, Field
 
 from app.agent.tools.base import MoviePilotTool
-from app.helper.subscribe import SubscribeHelper
+from app.agent.tools.tags import ToolTag
+from app.helper.server import MoviePilotServerHelper
 from app.log import logger
 
 MAX_PAGE_SIZE = 50
@@ -14,7 +15,6 @@ MAX_PAGE_SIZE = 50
 
 class QuerySubscribeSharesInput(BaseModel):
     """查询订阅分享工具的输入参数模型"""
-    explanation: str = Field(..., description="Clear explanation of why this tool is being used in the current context")
     name: Optional[str] = Field(None, description="Filter shares by media name (partial match, optional)")
     page: Optional[int] = Field(1, description="Page number for pagination (default: 1)")
     count: Optional[int] = Field(30, description="Number of items per page (default: 30, max: 50)")
@@ -26,6 +26,10 @@ class QuerySubscribeSharesInput(BaseModel):
 
 class QuerySubscribeSharesTool(MoviePilotTool):
     name: str = "query_subscribe_shares"
+    tags: list[str] = [
+        ToolTag.Read,
+        ToolTag.Subscription,
+    ]
     description: str = "Query shared subscriptions from other users. Shows popular subscriptions shared by the community with filtering and pagination support."
     args_schema: Type[BaseModel] = QuerySubscribeSharesInput
 
@@ -68,8 +72,7 @@ class QuerySubscribeSharesTool(MoviePilotTool):
             # 订阅分享是外部列表型结果，限制单页大小能降低工具上下文占用。
             count = min(count, MAX_PAGE_SIZE)
 
-            subscribe_helper = SubscribeHelper()
-            shares = await subscribe_helper.async_get_shares(
+            shares = await MoviePilotServerHelper.async_get_subscribe_shares(
                 name=name,
                 page=page,
                 count=count,

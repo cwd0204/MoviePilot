@@ -7,6 +7,7 @@ from typing import List, Optional, Type
 from pydantic import BaseModel, Field
 
 from app.agent.tools.base import MoviePilotTool
+from app.agent.tools.tags import ToolTag
 from app.chain.search import SearchChain
 from app.log import logger
 from ._torrent_search_utils import (
@@ -20,10 +21,6 @@ from ._torrent_search_utils import (
 class GetSearchResultsInput(BaseModel):
     """获取搜索结果工具的输入参数模型"""
 
-    explanation: str = Field(
-        ...,
-        description="Clear explanation of why this tool is being used in the current context",
-    )
     site: Optional[List[str]] = Field(None, description="Site name filters")
     season: Optional[List[str]] = Field(None, description="Season or episode filters")
     free_state: Optional[List[str]] = Field(None, description="Promotion state filters")
@@ -49,6 +46,10 @@ class GetSearchResultsInput(BaseModel):
 
 class GetSearchResultsTool(MoviePilotTool):
     name: str = "get_search_results"
+    tags: list[str] = [
+        ToolTag.Read,
+        ToolTag.Resource,
+    ]
     description: str = "Get cached torrent search results from search_torrents with optional filters. Supports pagination with up to 50 results per page."
     args_schema: Type[BaseModel] = GetSearchResultsInput
 

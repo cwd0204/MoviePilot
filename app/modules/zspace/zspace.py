@@ -15,6 +15,9 @@ from app.utils.http import RequestUtils
 from app.utils.url import UrlUtils
 
 
+DEFAULT_ITEMS_PAGE_SIZE = 100
+
+
 class ZSpace:
     _host: Optional[str] = None
     _playhost: Optional[str] = None
@@ -245,6 +248,7 @@ class ZSpace:
                     name=library.get("Name"),
                     path=library.get("Path"),
                     type=library_type,
+                    item_count=self.get_items_count(library.get("Id")),
                     image=image,
                     link=f'{self._playhost or self._host}web/index.html'
                          f'#!/videos?serverId={self.serverid}&parentId={library.get("Id")}',
@@ -812,6 +816,32 @@ class ZSpace:
             logger.error(f"连接/Users/{self.user}/Items/{itemid}出错：{e}")
         return None
 
+    def get_items_count(self, parent: Union[str, int]) -> Optional[int]:
+        """
+        获取指定媒体库的媒体条目总数
+
+        极影视当前兼容层会忽略条目类型过滤，因此以递归查询返回的
+        TotalRecordCount 作为同步进度的总数。
+
+        :param parent: 媒体库ID
+        :return: 媒体条目总数，查询失败时返回None
+        """
+        if not parent or not self._host or not self._apikey or not self.user:
+            return None
+        url = f"{self._host}emby/Users/{self.user}/Items"
+        try:
+            res = self.__request_utils().get_res(
+                url,
+                params={"ParentId": parent, "Recursive": "true", "Limit": 0},
+            )
+            if not res or res.status_code != 200:
+                return None
+            total_count = res.json().get("TotalRecordCount")
+            return int(total_count) if total_count is not None else None
+        except Exception as e:
+            logger.error(f"查询媒体库 {parent} 的媒体总数出错：{e}")
+            return None
+
     def get_items(self, parent: Union[str, int], start_index: Optional[int] = 0,
                   limit: Optional[int] = -1) -> Generator[MediaServerItem | None | Any, Any, None]:
         """
@@ -826,30 +856,60 @@ class ZSpace:
         if not parent or not self._host or not self._apikey or not self.user:
             return None
         url = f"{self._host}emby/Users/{self.user}/Items"
-        params = {
-            "ParentId": parent,
-            "Fields": "ProviderIds,OriginalTitle,ProductionYear,Path,UserDataPlayCount,UserDataLastPlayedDate,ParentId"
-        }
-        if limit is not None and limit != -1:
-            params.update({
-                "StartIndex": start_index,
-                "Limit": limit
-            })
-        try:
-            res = self.__request_utils().get_res(url, params=params)
-            if not res or res.status_code != 200:
-                return None
-            items = res.json().get("Items") or []
-            for item in items:
-                if not item:
-                    continue
-                if "Folder" in item.get("Type"):
-                    for sub_item in self.get_items(parent=item.get('Id')) or []:
-                        yield sub_item
-                elif item.get("Type") in ["Movie", "Series"]:
+        fetch_all = limit is None or limit == -1
+        page_size = DEFAULT_ITEMS_PAGE_SIZE if fetch_all else limit
+        current_start_index = max(start_index or 0, 0)
+        while True:
+            params = {
+                "ParentId": parent,
+                "Recursive": "true",
+                "StartIndex": current_start_index,
+                "Limit": page_size,
+                "Fields": "ProviderIds,OriginalTitle,ProductionYear,Path,"
+                          "UserDataPlayCount,UserDataLastPlayedDate,ParentId"
+            }
+            try:
+                res = self.__request_utils().get_res(url, params=params)
+                if not res or res.status_code != 200:
+                    return None
+                result = res.json() or {}
+                items = result.get("Items") or []
+                for item in items:
+                    if not item:
+                        continue
+                    if item.get("Type") == "BoxSet" and item.get("Id"):
+                        for sub_item in self.get_items(parent=item.get("Id")):
+                            if sub_item:
+                                yield sub_item
+                        continue
+                    if item.get("Type") not in ["Movie", "Series"]:
+                        continue
+                    provider_ids = item.get("ProviderIds") or {}
+                    needs_detail = (
+                        not provider_ids.get("Tmdb")
+                        or not item.get("ProductionYear")
+                        or not item.get("Path")
+                    )
+                    if needs_detail and item.get("Id"):
+                        detail_item = self.get_iteminfo(item.get("Id"))
+                        if detail_item:
+                            yield detail_item
+                            continue
                     yield self.__format_item_info(item)
-        except Exception as e:
-            logger.error(f"连接Users/Items出错：{e}")
+            except Exception as e:
+                logger.error(f"连接Users/Items出错：{e}")
+                return None
+
+            if not fetch_all:
+                break
+            current_start_index += len(items)
+            total_count = result.get("TotalRecordCount")
+            if not items or (
+                    total_count is not None and current_start_index >= total_count
+            ) or (
+                    total_count is None and len(items) < page_size
+            ):
+                break
         return None
 
     def get_webhook_message(self, form: Any, args: dict) -> Optional[schemas.WebhookEventInfo]:

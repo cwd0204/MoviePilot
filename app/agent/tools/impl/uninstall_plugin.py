@@ -6,6 +6,7 @@ from typing import Optional, Type
 from pydantic import BaseModel, Field
 
 from app.agent.tools.base import MoviePilotTool
+from app.agent.tools.tags import ToolTag
 from app.agent.tools.impl._plugin_tool_utils import (
     list_installed_plugins,
     summarize_plugin,
@@ -17,10 +18,6 @@ from app.log import logger
 class UninstallPluginInput(BaseModel):
     """卸载插件工具的输入参数模型"""
 
-    explanation: str = Field(
-        ...,
-        description="Clear explanation of why this tool is being used in the current context",
-    )
     plugin_id: str = Field(
         ...,
         description="Exact plugin ID to uninstall. Use query_installed_plugins first to find the correct plugin_id.",
@@ -29,6 +26,11 @@ class UninstallPluginInput(BaseModel):
 
 class UninstallPluginTool(MoviePilotTool):
     name: str = "uninstall_plugin"
+    tags: list[str] = [
+        ToolTag.Write,
+        ToolTag.Plugin,
+        ToolTag.Admin,
+    ]
     description: str = (
         "Uninstall an installed plugin by exact plugin_id. "
         "Use query_installed_plugins first when you need filtering or discovery."

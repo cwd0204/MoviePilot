@@ -53,7 +53,7 @@ def _read_json_file(path: Path) -> Optional[Dict[str, Any]]:
     if not path.exists():
         return None
     try:
-        return json.loads(path.read_text(encoding="utf-8"))
+        return json.loads(path.read_text(encoding="utf-8", errors="replace"))
     except (OSError, json.JSONDecodeError):
         return None
 
@@ -158,7 +158,7 @@ def _http_request(
                 "text": raw,
             }
     except HTTPError as exc:
-        raw = exc.read().decode("utf-8", errors="ignore")
+        raw = exc.read().decode("utf-8", errors="replace")
         try:
             data = json.loads(raw) if raw else None
         except json.JSONDecodeError:
@@ -198,7 +198,7 @@ def _frontend_health(runtime: Optional[Dict[str, Any]] = None, timeout: float = 
     request = Request(url=url, headers={"Accept": "text/plain"}, method="GET")
     try:
         with urlopen(request, timeout=timeout) as response:
-            raw = response.read().decode("utf-8", errors="ignore").strip()
+            raw = response.read().decode("utf-8", errors="replace").strip()
             return response.status == 200, {"version": raw}
     except (HTTPError, URLError):
         return False, None
@@ -223,7 +223,7 @@ def _release_sort_key(tag: str) -> tuple[int, ...]:
 def _github_api_json(url: str, *, repo: str) -> Any:
     headers = {
         "Accept": "application/vnd.github+json",
-        "User-Agent": "MoviePilot-CLI",
+        "User-Agent": settings.USER_AGENT,
     }
     headers.update(settings.REPO_GITHUB_HEADERS(repo))
     opener = build_opener(ProxyHandler(settings.PROXY or {}))
@@ -233,7 +233,7 @@ def _github_api_json(url: str, *, repo: str) -> Any:
         with opener.open(request, timeout=10.0) as response:
             return json.loads(response.read().decode("utf-8"))
     except HTTPError as exc:
-        detail = exc.read().decode("utf-8", errors="ignore")
+        detail = exc.read().decode("utf-8", errors="replace")
         raise RuntimeError(f"访问 GitHub API 失败（HTTP {exc.code}）: {detail or url}") from exc
     except URLError as exc:
         raise RuntimeError(f"访问 GitHub API 失败：{exc.reason}") from exc
@@ -325,11 +325,16 @@ def _best_effort_auto_update() -> None:
     ]
 
     update_env = os.environ.copy()
+    package_cache_root = Path(update_env.get("PACKAGE_CACHE_ROOT", "").strip() or settings.PACKAGE_CACHE_PATH)
+    update_env.setdefault("PACKAGE_CACHE_ROOT", str(package_cache_root))
+    update_env.setdefault("PIP_CACHE_DIR", str(package_cache_root / "pip"))
+    update_env.setdefault("UV_CACHE_DIR", str(package_cache_root / "uv"))
+    if settings.PIP_PROXY:
+        update_env["PIP_PROXY"] = settings.PIP_PROXY
     if settings.PROXY_HOST:
-        update_env.setdefault("http_proxy", settings.PROXY_HOST)
-        update_env.setdefault("https_proxy", settings.PROXY_HOST)
-        update_env.setdefault("HTTP_PROXY", settings.PROXY_HOST)
-        update_env.setdefault("HTTPS_PROXY", settings.PROXY_HOST)
+        update_env["PROXY_HOST"] = settings.PROXY_HOST
+        for key in ("http_proxy", "https_proxy", "HTTP_PROXY", "HTTPS_PROXY"):
+            update_env[key] = settings.PROXY_HOST
     if settings.GITHUB_TOKEN:
         update_env.setdefault("GITHUB_TOKEN", settings.GITHUB_TOKEN)
 
@@ -342,7 +347,7 @@ def _best_effort_auto_update() -> None:
         stderr=subprocess.STDOUT,
         text=True,
         encoding="utf-8",
-        errors="ignore",
+        errors="replace",
         check=False,
     )
     if result.returncode == 0:
@@ -451,7 +456,7 @@ def _annotation_name(annotation: Any) -> str:
 def _tail_lines(path: Path, count: int) -> list[str]:
     if not path.exists():
         raise click.ClickException(f"日志文件不存在：{path}")
-    with path.open("r", encoding="utf-8", errors="ignore") as handle:
+    with path.open("r", encoding="utf-8", errors="replace") as handle:
         return [line.rstrip("\n") for line in deque(handle, maxlen=count)]
 
 
@@ -459,7 +464,7 @@ def _follow_file(path: Path) -> None:
     if not path.exists():
         raise click.ClickException(f"日志文件不存在：{path}")
 
-    with path.open("r", encoding="utf-8", errors="ignore") as handle:
+    with path.open("r", encoding="utf-8", errors="replace") as handle:
         handle.seek(0, os.SEEK_END)
         while True:
             line = handle.readline()
@@ -554,8 +559,6 @@ def _format_tool_detail(tool: Dict[str, Any]) -> None:
     required = set((tool.get("inputSchema") or {}).get("required") or [])
     fields = []
     for name, schema in properties.items():
-        if name == "explanation":
-            continue
         fields.append(
             (
                 f"{name}*" if name in required else name,
@@ -625,23 +628,27 @@ def _spawn_process(
     return subprocess.Popen(command, **kwargs)
 
 
-def _spawn_backend_process() -> subprocess.Popen:
+def _spawn_backend_process(*, safe: bool = False) -> subprocess.Popen:
+    backend_env = {
+        **os.environ,
+        "PYTHONUNBUFFERED": "1",
+        "MOVIEPILOT_DISABLE_CONSOLE_LOG": "1",
+        "MOVIEPILOT_STDIO_LOG_FILE": str(BACKEND_STDIO_LOG_FILE),
+        "MOVIEPILOT_STDIO_LOG_MAX_BYTES": str(
+            max(int(settings.LOG_MAX_FILE_SIZE or 0), 1) * 1024 * 1024
+        ),
+        "MOVIEPILOT_STDIO_LOG_BACKUP_COUNT": str(
+            max(int(settings.LOG_BACKUP_COUNT or 0), 0)
+        ),
+    }
+    if safe:
+        backend_env["MOVIEPILOT_SAFE_MODE"] = "true"
+
     return _spawn_process(
         [sys.executable, "-m", "app.main"],
         cwd=_repo_root(),
         log_file=None,
-        env={
-            **os.environ,
-            "PYTHONUNBUFFERED": "1",
-            "MOVIEPILOT_DISABLE_CONSOLE_LOG": "1",
-            "MOVIEPILOT_STDIO_LOG_FILE": str(BACKEND_STDIO_LOG_FILE),
-            "MOVIEPILOT_STDIO_LOG_MAX_BYTES": str(
-                max(int(settings.LOG_MAX_FILE_SIZE or 0), 1) * 1024 * 1024
-            ),
-            "MOVIEPILOT_STDIO_LOG_BACKUP_COUNT": str(
-                max(int(settings.LOG_BACKUP_COUNT or 0), 0)
-            ),
-        },
+        env=backend_env,
     )
 
 
@@ -719,7 +726,7 @@ def _wait_until_frontend_ready(runtime: Dict[str, Any], timeout: int) -> Dict[st
     raise click.ClickException(f"前端进程已启动，但在 {timeout} 秒内未通过健康检查，请执行 `moviepilot logs --frontend` 查看前端日志")
 
 
-def _start_backend_service(timeout: int) -> Dict[str, Any]:
+def _start_backend_service(timeout: int, safe: bool = False) -> Dict[str, Any]:
     state, runtime, process, health_payload = _managed_backend_status()
     if state in {"running", "starting"} and runtime and process:
         return {"status": state, "runtime": runtime, "process": process, "health": health_payload, "started": False}
@@ -728,7 +735,7 @@ def _start_backend_service(timeout: int) -> Dict[str, Any]:
 
     _ensure_local_api_token()
     _clear_json_file(BACKEND_RUNTIME_FILE)
-    process = _spawn_backend_process()
+    process = _spawn_backend_process(safe=safe)
     ps_process = psutil.Process(process.pid)
     runtime = {
         "pid": process.pid,
@@ -739,6 +746,7 @@ def _start_backend_service(timeout: int) -> Dict[str, Any]:
         "started_at": int(time.time()),
         "python": sys.executable,
         "stdio_log": str(BACKEND_STDIO_LOG_FILE),
+        "safe_mode": safe,
     }
     _write_json_file(BACKEND_RUNTIME_FILE, runtime)
     health_payload = _wait_until_backend_ready(runtime, timeout)
@@ -821,7 +829,7 @@ def _installed_frontend_version() -> Optional[str]:
     if not FRONTEND_VERSION_FILE.exists():
         return None
     try:
-        return FRONTEND_VERSION_FILE.read_text(encoding="utf-8").strip() or None
+        return FRONTEND_VERSION_FILE.read_text(encoding="utf-8", errors="replace").strip() or None
     except OSError:
         return None
 
@@ -833,7 +841,8 @@ def cli() -> None:
 
 @cli.command(context_settings=CONTEXT_SETTINGS)
 @click.option("--timeout", default=60, show_default=True, help="等待后端与前端就绪的秒数")
-def start(timeout: int) -> None:
+@click.option("--safe", is_flag=True, help="安全模式启动，仅保留核心 API，跳过插件和后台任务")
+def start(timeout: int, safe: bool) -> None:
     """后台启动本地 MoviePilot 前后端服务"""
     _ensure_frontend_not_running_alone(timeout=min(timeout, 15))
     backend_state, _, _, _ = _managed_backend_status()
@@ -841,7 +850,7 @@ def start(timeout: int) -> None:
     if backend_state == "stopped" and frontend_state == "stopped":
         _best_effort_auto_update()
 
-    backend_result = _start_backend_service(timeout=timeout)
+    backend_result = _start_backend_service(timeout=timeout, safe=safe)
     backend_runtime = backend_result["runtime"]
     try:
         frontend_result = _start_frontend_service(timeout=timeout, backend_port=int(backend_runtime["port"]))
@@ -864,6 +873,8 @@ def start(timeout: int) -> None:
     click.echo(f"Frontend URL: {_frontend_base_url(frontend_result['runtime'])}")
     click.echo(f"Backend Version: {backend_version}")
     click.echo(f"Frontend Version: {frontend_version}")
+    if safe or backend_runtime.get("safe_mode"):
+        click.echo("Safe Mode: enabled")
 
 
 @cli.command(context_settings=CONTEXT_SETTINGS)
@@ -972,6 +983,23 @@ def logs(lines: int, follow: bool, stdio: bool, frontend_log: bool) -> None:
         _follow_file(log_file)
 
 
+@cli.command(context_settings=CONTEXT_SETTINGS)
+@click.option("--json", "json_output", is_flag=True, help="输出 JSON 报告")
+@click.option("--fix", is_flag=True, help="执行白名单安全修复")
+@click.option("--deep", is_flag=True, help="执行可能较慢的深度检查")
+def doctor(json_output: bool, fix: bool, deep: bool) -> None:
+    """离线诊断本地 MoviePilot 运行环境"""
+    from app.doctor import run_doctor
+    from app.doctor.formatters import format_json_report, format_text_report
+
+    report = run_doctor(fix=fix, deep=deep)
+    if json_output:
+        click.echo(format_json_report(report))
+    else:
+        click.echo(format_text_report(report))
+    raise click.exceptions.Exit(report.exit_code())
+
+
 @cli.group(context_settings=CONTEXT_SETTINGS)
 def config() -> None:
     """查看或修改本地配置"""
@@ -998,7 +1026,8 @@ def config_list(show_secrets: bool) -> None:
 @click.argument("key")
 def config_get(key: str) -> None:
     """读取单个配置项"""
-    if key not in Settings.model_fields and not hasattr(settings, key):
+    setting_fields = Settings.model_fields.keys()
+    if key not in setting_fields and not hasattr(settings, key):
         raise click.ClickException(f"配置项不存在：{key}")
     click.echo(_format_value(getattr(settings, key)))
 
@@ -1102,8 +1131,7 @@ def tool_show(tool_name: str) -> None:
 @click.argument("args", nargs=-1, type=click.UNPROCESSED)
 def tool_run(tool_name: str, args: tuple[str, ...]) -> None:
     """运行指定工具"""
-    arguments = {"explanation": "CLI invocation"}
-    arguments.update(_parse_key_value_pairs(args))
+    arguments = _parse_key_value_pairs(args)
     result = _call_tool(tool_name, arguments, runtime=_backend_runtime())
     if isinstance(result, (dict, list)):
         _print_json(result)
@@ -1121,7 +1149,7 @@ def scheduler_list() -> None:
     """列出调度任务"""
     result = _call_tool(
         "query_schedulers",
-        {"explanation": "List scheduler jobs from local CLI"},
+        {},
         runtime=_backend_runtime(),
     )
     if isinstance(result, list):
@@ -1137,10 +1165,7 @@ def scheduler_run(job_id: str) -> None:
     """立即执行某个调度任务"""
     result = _call_tool(
         "run_scheduler",
-        {
-            "explanation": "Run a scheduler job from local CLI",
-            "job_id": job_id,
-        },
+        {"job_id": job_id},
         runtime=_backend_runtime(),
     )
     if isinstance(result, (dict, list)):

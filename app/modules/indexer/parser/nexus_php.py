@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 import re
 from typing import Optional
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from lxml import etree
 
@@ -10,6 +11,10 @@ from app.utils.string import StringUtils
 
 
 class NexusPhpSiteUserInfo(SiteParserBase):
+    """
+    NexusPHP 站点用户信息解析器。
+    """
+
     schema = SiteSchema.NexusPhp
 
     def _parse_site_page(self, html_text: str):
@@ -93,10 +98,10 @@ class NexusPhpSiteUserInfo(SiteParserBase):
         html_text = self._prepare_html_text(html_text)
         upload_match = re.search(r"[^总]上[传傳]量?[:：_<>/a-zA-Z-=\"'\s#;]+([\d,.\s]+[KMGTPI]*B)", html_text,
                                  re.IGNORECASE)
-        self.upload = StringUtils.num_filesize(upload_match.group(1).strip()) if upload_match else 0
+        self.upload = self.num_filesize(upload_match.group(1).strip()) if upload_match else 0
         download_match = re.search(r"[^总子影力]下[载載]量?[:：_<>/a-zA-Z-=\"'\s#;]+([\d,.\s]+[KMGTPI]*B)", html_text,
                                    re.IGNORECASE)
-        self.download = StringUtils.num_filesize(download_match.group(1).strip()) if download_match else 0
+        self.download = self.num_filesize(download_match.group(1).strip()) if download_match else 0
         ratio_match = re.search(r"分享率[:：_<>/a-zA-Z-=\"'\s#;]+([\d,.\s]+)", html_text)
         # 计算分享率
         calc_ratio = 0.0 if self.download <= 0.0 else round(self.upload / self.download, 3)
@@ -111,7 +116,7 @@ class NexusPhpSiteUserInfo(SiteParserBase):
             has_ucoin, self.bonus = self._parse_ucoin(html)
             if has_ucoin:
                 return
-            tmps = html.xpath('//a[contains(@href,"mybonus")]/text()') if html else None
+            tmps = html.xpath('//a[contains(@href,"mybonus")]/text()') if html is not None else None
             if tmps:
                 bonus_text = str(tmps[0]).strip()
                 bonus_match = re.search(r"([\d,.]+)", bonus_text)
@@ -209,7 +214,7 @@ class NexusPhpSiteUserInfo(SiteParserBase):
                 page_seeding = len(seeding_sizes)
 
                 for i in range(0, len(seeding_sizes)):
-                    size = StringUtils.num_filesize(seeding_sizes[i].xpath("string(.)").strip())
+                    size = self.num_filesize(seeding_sizes[i].xpath("string(.)").strip())
                     seeders = StringUtils.str_int(seeding_seeders[i])
 
                     page_seeding_size += size
@@ -233,13 +238,33 @@ class NexusPhpSiteUserInfo(SiteParserBase):
 
             # fix up page url
             if next_page:
-                if self.userid not in next_page:
-                    next_page = f'{next_page}&userid={self.userid}&type=seeding'
+                next_page = self._fixup_next_page_url(next_page, self.userid)
         finally:
             if html is not None:
                 del html
 
         return next_page
+
+    @staticmethod
+    def _fixup_next_page_url(next_page: str, userid: Optional[str]) -> Optional[str]:
+        """
+        修正做种下一页地址，无法补齐用户 ID 时停止翻页。
+
+        :param next_page: 页面中解析出的下一页地址
+        :param userid: 当前站点用户 ID
+        :return: 修正后的下一页地址，无法构造时返回 None
+        """
+        parsed_url = urlsplit(next_page)
+        query_params = dict(parse_qsl(parsed_url.query, keep_blank_values=True))
+
+        if query_params.get("userid"):
+            return next_page
+        if not userid:
+            return None
+
+        query_params["userid"] = userid
+        query_params.setdefault("type", "seeding")
+        return urlunsplit(parsed_url._replace(query=urlencode(query_params)))
 
     def _parse_user_detail_info(self, html_text: str):
         """
@@ -259,7 +284,8 @@ class NexusPhpSiteUserInfo(SiteParserBase):
             # 加入日期
             join_at_text = html.xpath(
                 '//tr/td[text()="加入日期" or text()="注册日期" or *[text()="加入日期"]]/following-sibling::td[1]//text()'
-                '|//div/b[text()="加入日期"]/../text()')
+                '|//div/b[text()="加入日期"]/../text()'
+                '|//*[@id="outer"]/table/tr/td/div/div[1]/div[2]/div[3]/span[1]/span/@title')
             if join_at_text:
                 self.join_at = StringUtils.unify_datetime_str(join_at_text[0].split(' (')[0].strip())
 
@@ -273,7 +299,7 @@ class NexusPhpSiteUserInfo(SiteParserBase):
             tmp_seeding_size = 0
             tmp_seeding_info = []
             for i in range(0, len(seeding_sizes)):
-                size = StringUtils.num_filesize(seeding_sizes[i].xpath("string(.)").strip())
+                size = self.num_filesize(seeding_sizes[i].xpath("string(.)").strip())
                 seeders = StringUtils.str_int(seeding_seeders[i])
 
                 tmp_seeding_size += size
@@ -292,7 +318,7 @@ class NexusPhpSiteUserInfo(SiteParserBase):
                 seeding_size_match = re.search(r"总做种体积:\s+([\d,.\s]+[KMGTPI]*B)", seeding_sizes[0], re.IGNORECASE)
                 tmp_seeding = StringUtils.str_int(seeding_match.group(1)) if (
                         seeding_match and seeding_match.group(1)) else 0
-                tmp_seeding_size = StringUtils.num_filesize(
+                tmp_seeding_size = self.num_filesize(
                     seeding_size_match.group(1).strip()) if seeding_size_match else 0
             if not self.seeding_size:
                 self.seeding_size = tmp_seeding_size

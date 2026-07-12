@@ -5,18 +5,14 @@ from typing import Optional, Type
 from pydantic import BaseModel, Field
 
 from app.agent.tools.base import MoviePilotTool
-from app.db import AsyncSessionFactory
-from app.db.models.downloadhistory import DownloadHistory
+from app.agent.tools.tags import ToolTag
+from app.db.downloadhistory_oper import DownloadHistoryOper
 from app.log import logger
 
 
 class DeleteDownloadHistoryInput(BaseModel):
     """删除下载历史记录工具的输入参数模型"""
 
-    explanation: str = Field(
-        ...,
-        description="Clear explanation of why this tool is being used in the current context",
-    )
     history_id: int = Field(
         ..., description="The ID of the download history record to delete"
     )
@@ -24,6 +20,11 @@ class DeleteDownloadHistoryInput(BaseModel):
 
 class DeleteDownloadHistoryTool(MoviePilotTool):
     name: str = "delete_download_history"
+    tags: list[str] = [
+        ToolTag.Write,
+        ToolTag.Download,
+        ToolTag.Admin,
+    ]
     description: str = "Delete a download history record by ID. This only removes the record from the database, does not delete any actual files."
     args_schema: Type[BaseModel] = DeleteDownloadHistoryInput
     require_admin: bool = True
@@ -36,9 +37,8 @@ class DeleteDownloadHistoryTool(MoviePilotTool):
         logger.info(f"执行工具: {self.name}, 参数: history_id={history_id}")
 
         try:
-            async with AsyncSessionFactory() as db:
-                await DownloadHistory.async_delete(db, history_id)
-                return f"下载历史记录 ID: {history_id} 已成功删除"
+            await DownloadHistoryOper().async_delete_history(history_id)
+            return f"下载历史记录 ID: {history_id} 已成功删除"
         except Exception as e:
             logger.error(f"删除下载历史记录失败: {e}", exc_info=True)
             return f"删除下载历史记录时发生错误: {str(e)}"

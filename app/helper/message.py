@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+import asyncio
 import json
 import queue
 import re
@@ -28,11 +29,16 @@ from app.utils.string import StringUtils
 
 class TemplateContextBuilder:
     """
-    模板上下文构建器
-    """
+    模板上下文构建器。
 
-    def __init__(self):
-        self._context = {}
+    无状态实现：所有 ``_add_*`` 方法均为静态方法，接受并就地修改调用方提供的
+    ``context`` 字典。``build`` 每次调用都基于一份新的本地字典装填后返回，
+    实例自身不持有任何中间状态——可以被多线程共享调用而不会产生互相串味的
+    ``rename_dict``，配合 ``settings.TRANSFER_THREADS > 1`` 的并发整理场景安全。
+
+    保留为类（而非自由函数）是为了向后兼容现有调用方式
+    （``TemplateHelper().builder.build(...)``）。
+    """
 
     def build(
             self,
@@ -46,55 +52,64 @@ class TemplateContextBuilder:
             **kwargs
     ) -> Dict[str, Any]:
         """
-        :param meta: 媒体信息
-        :param mediainfo: 媒体信息
+        构建一次性渲染上下文字典。
+
+        每次调用都新建本地 ``context`` 字典，依次填充各业务来源后返回过滤掉
+        None 值的副本，调用之间互不影响。
+
+        :param meta: 媒体元数据
+        :param mediainfo: 识别的媒体信息
         :param torrentinfo: 种子信息
-        :param transferinfo: 传输信息
+        :param transferinfo: 整理结果信息
         :param file_extension: 文件扩展名
-        :param episodes_info: 剧集信息
-        :param include_raw_objects: 是否包含原始对象
+        :param episodes_info: 当前季的全部集信息
+        :param include_raw_objects: 是否在 dict 里附带原始对象引用（``__meta__`` 等）
         :return: 渲染上下文字典
         """
-        self._context.clear()
-        self._add_episode_details(meta, episodes_info)
-        self._add_media_info(mediainfo)
-        self._add_transfer_info(transferinfo)
-        self._add_torrent_info(torrentinfo)
-        self._add_file_info(file_extension)
+        context: Dict[str, Any] = {}
+        self._add_episode_details(context, meta, episodes_info)
+        self._add_media_info(context, mediainfo)
+        self._add_transfer_info(context, transferinfo)
+        self._add_torrent_info(context, torrentinfo)
+        self._add_file_info(context, file_extension)
         if kwargs:
-            self._context.update(kwargs)
+            context.update(kwargs)
 
         if include_raw_objects:
-            self._add_raw_objects(meta, mediainfo, torrentinfo, transferinfo, episodes_info)
+            self._add_raw_objects(context, meta, mediainfo, torrentinfo, transferinfo, episodes_info)
 
         # 移除空值
-        return {k: v for k, v in self._context.items() if v is not None}
+        return {k: v for k, v in context.items() if v is not None}
 
-    def _add_media_info(self, mediainfo: MediaInfo):
+    @classmethod
+    def _add_media_info(cls, context: Dict[str, Any], mediainfo: Optional[MediaInfo]) -> None:
         """
-        增加媒体信息
+        将 MediaInfo 中的标题、季年份、海报等业务字段就地写入 ``context``。
+
+        会读取 ``context`` 中由 ``_add_episode_details`` 先填好的 ``season`` /
+        ``year`` / ``title_year`` 占位，保证电视剧场景下季/年优先沿用 meta 解析值。
         """
         if not mediainfo:
             return
         season_fmt = f"S{mediainfo.season:02d}" if mediainfo.season is not None else None
         base_info = {
             # 标题
-            "title": self.__convert_invalid_characters(mediainfo.title),
+            "title": cls.__convert_invalid_characters(mediainfo.title),
             # 英文标题
-            "en_title": self.__convert_invalid_characters(mediainfo.en_title),
+            "en_title": cls.__convert_invalid_characters(mediainfo.en_title),
             # 原语种标题
-            "original_title": self.__convert_invalid_characters(mediainfo.original_title),
+            "original_title": cls.__convert_invalid_characters(mediainfo.original_title),
             # 季号
-            "season": self._context.get("season") or mediainfo.season,
+            "season": context.get("season") or mediainfo.season,
             # Sxx
-            "season_fmt": self._context.get("season_fmt") or season_fmt,
+            "season_fmt": context.get("season_fmt") or season_fmt,
             # 年份
-            "year": mediainfo.year or self._context.get("year"),
+            "year": mediainfo.year or context.get("year"),
             # 媒体标题 + 年份
-            "title_year": mediainfo.title_year or self._context.get("title_year"),
+            "title_year": mediainfo.title_year or context.get("title_year"),
         }
 
-        _meta_season = self._context.get("season")
+        _meta_season = context.get("season")
         media_info = {
             # 类型
             "type": mediainfo.type.value,
@@ -121,11 +136,18 @@ class TemplateContextBuilder:
             # 豆瓣ID
             "doubanid": mediainfo.douban_id,
         }
-        self._context.update({**base_info, **media_info})
+        context.update({**base_info, **media_info})
 
-    def _add_episode_details(self, meta: Optional[MetaBase], episodes: Optional[List[TmdbEpisode]]):
+    @classmethod
+    def _add_episode_details(
+            cls,
+            context: Dict[str, Any],
+            meta: Optional[MetaBase],
+            episodes: Optional[List[TmdbEpisode]],
+    ) -> None:
         """
-        添加剧集详细信息
+        将 meta 解析得到的剧集级信息、技术字段写入 ``context``，并尝试匹配
+        TMDB 集详情填入 ``episode_title`` / ``episode_date``。
         """
         if not meta:
             return
@@ -135,7 +157,7 @@ class TemplateContextBuilder:
             for episode in episodes:
                 if episode.episode_number == meta.begin_episode:
                     episode_data.update({
-                        "episode_title": self.__convert_invalid_characters(episode.name),
+                        "episode_title": cls.__convert_invalid_characters(episode.name),
                         "episode_date": episode.air_date if episode.air_date else None
                     })
                     break
@@ -150,7 +172,7 @@ class TemplateContextBuilder:
             # 年份
             "year": meta.year,
             # 名字 + 年份
-            "title_year": self._context.get("title_year") or "%s (%s)" % (
+            "title_year": context.get("title_year") or "%s (%s)" % (
                 meta.name, meta.year) if meta.year else meta.name,
             # 季号
             "season": meta.season_seq,
@@ -158,6 +180,8 @@ class TemplateContextBuilder:
             "season_fmt": meta.season,
             # 集号
             "episode": meta.episode_seqs,
+            # 当前季总集数
+            "total_episodes": len(episodes) if episodes else 0,
             # 季集 SxxExx
             "season_episode": "%s%s" % (meta.season, meta.episode),
             # 段/节
@@ -183,16 +207,23 @@ class TemplateContextBuilder:
             "releaseGroup": meta.resource_team,
             # 视频编码
             "videoCodec": meta.video_encode,
+            # 视频位深
+            "videoBit": meta.video_bit,
             # 音频编码
             "audioCodec": meta.audio_encode,
             # 流媒体平台
             "webSource": meta.web_source,
         }
-        self._context.update({**meta_info, **tech_metadata, **episode_data})
+        context.update({**meta_info, **tech_metadata, **episode_data})
 
-    def _add_torrent_info(self, torrentinfo: Optional[TorrentInfo]):
+    @staticmethod
+    def _add_torrent_info(context: Dict[str, Any], torrentinfo: Optional[TorrentInfo]) -> None:
         """
-        添加种子信息
+        将种子信息写入 ``context``，描述字段会去除 HTML 标签。
+
+        副作用提醒：当 ``torrentinfo.description`` 包含 HTML 时，会就地清洗
+        原对象的 description 字段——保留原始行为，避免破坏现有调用方对清洗后
+        描述的依赖。
         """
         if not torrentinfo:
             return
@@ -231,25 +262,27 @@ class TemplateContextBuilder:
             # 种子大小
             "size": size,
         }
-        self._context.update(torrent_info)
+        context.update(torrent_info)
 
-    def _add_transfer_info(self, transferinfo: Optional[TransferInfo]) -> Optional[Dict]:
+    @staticmethod
+    def _add_transfer_info(context: Dict[str, Any], transferinfo: Optional[TransferInfo]) -> None:
         """
-        添加文件转移上下文
+        将整理结果（类型、文件数、总大小、错误信息）写入 ``context``。
         """
         if not transferinfo:
-            return None
+            return
         ctx = {
             "transfer_type": transferinfo.transfer_type,
             "file_count": transferinfo.file_count,
             "total_size": StringUtils.str_filesize(transferinfo.total_size),
             "err_msg": transferinfo.message,
         }
-        return self._context.update(ctx)
+        context.update(ctx)
 
-    def _add_file_info(self, file_extension: Optional[str]):
+    @staticmethod
+    def _add_file_info(context: Dict[str, Any], file_extension: Optional[str]) -> None:
         """
-        添加文件信息
+        将文件扩展名写入 ``context.fileExt``。
         """
         if not file_extension:
             return
@@ -257,18 +290,21 @@ class TemplateContextBuilder:
             # 文件后缀
             "fileExt": file_extension,
         }
-        self._context.update(file_info)
+        context.update(file_info)
 
+    @staticmethod
     def _add_raw_objects(
-            self,
+            context: Dict[str, Any],
             meta: Optional[MetaBase],
             mediainfo: Optional[MediaInfo],
             torrentinfo: Optional[TorrentInfo],
             transferinfo: Optional[TransferInfo],
             episodes_info: Optional[List[TmdbEpisode]],
-    ):
+    ) -> None:
         """
-        添加原始对象引用
+        以双下划线键名将原始对象引用写入 ``context``。
+
+        约定：消费方仅读不写，避免在事件回调里改这些对象污染下游流程。
         """
         raw_objects = {
             # 文件元数据
@@ -282,7 +318,7 @@ class TemplateContextBuilder:
             # 当前季的全部集信息
             "__episodes_info__": episodes_info,
         }
-        self._context.update(raw_objects)
+        context.update(raw_objects)
 
     @staticmethod
     def __convert_invalid_characters(filename: str):
@@ -667,9 +703,20 @@ class MessageQueueManager(metaclass=SingletonClass):
 
     async def async_send_message(self, *args, **kwargs) -> None:
         """
-        异步发送消息（直接加入队列）
+        异步发送消息：``immediately=True`` 立即发送，否则按调度时段入队。
+
+        历史实现把 ``immediately`` 标志直接 pop 后丢弃，所有异步消息一律
+        进队列；如果调用时落在用户配置的"免打扰时段"之外，消息会一直挂
+        着不发。这里与同步 ``send_message`` 行为对齐：
+        指定 ``immediately=True`` 必须当场发出，与时段无关。
         """
-        kwargs.pop("immediately", False)
+        immediately = kwargs.pop("immediately", False)
+        if immediately or self._is_in_scheduled_time(datetime.now()):
+            # _send 会执行具体渠道回调，可能包含网络 IO；放到 executor
+            # 避免 async 调用方所在事件循环被同步发送阻塞。
+            loop = asyncio.get_running_loop()
+            await loop.run_in_executor(None, lambda: self._send(*args, **kwargs))
+            return
         self.queue.put({
             "args": args,
             "kwargs": kwargs
@@ -719,61 +766,74 @@ class MessageQueueManager(metaclass=SingletonClass):
 
 class MessageHelper(metaclass=Singleton):
     """
-    消息队列管理器，包括系统消息和用户消息
+    消息队列管理器，负责系统和插件实时消息的 SSE 推送
     """
 
     def __init__(self):
         self.sys_queue = queue.Queue()
-        self.user_queue = queue.Queue()
+        self._recent_notification_keys = TTLCache(region="message:notification", maxsize=500, ttl=60)
+
+    @staticmethod
+    def _build_system_notification_key(
+            message: Any, role: str, title: str = None, note: Union[list, dict] = None
+    ) -> str:
+        """
+        构建系统通知短期去重键。
+        """
+        return json.dumps(
+            {
+                "role": role,
+                "title": title or "",
+                "text": str(message),
+                "note": note or {},
+                "time": time.strftime("%Y-%m-%d %H:%M", time.localtime()),
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+
+    def _is_recent_system_notification(
+            self, message: Any, role: str, title: str = None, note: Union[list, dict] = None
+    ) -> bool:
+        """
+        判断系统通知是否在短时间内重复。
+        """
+        key = self._build_system_notification_key(message, role, title=title, note=note)
+        if self._recent_notification_keys.get(key):
+            return True
+        self._recent_notification_keys.set(key, True)
+        return False
 
     def put(self, message: Any, role: str = "plugin", title: str = None, note: Union[list, dict] = None):
         """
         存消息
         :param message: 消息
-        :param role: 消息通道 systm：系统消息，plugin：插件消息，user：用户消息
+        :param role: 消息通道 system：系统消息，plugin：插件消息
         :param title: 标题
         :param note: 附件json
         """
-        if role in ["system", "plugin"]:
-            # 没有标题时获取插件名称
-            if role == "plugin" and not title:
-                title = "插件通知"
-            # 系统通知，默认
-            self.sys_queue.put(json.dumps({
-                "type": role,
-                "title": title,
-                "text": message,
-                "date": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime()),
-                "note": note
-            }))
-        else:
-            if isinstance(message, str):
-                # 非系统的文本通知
-                self.user_queue.put(json.dumps({
-                    "title": title,
-                    "text": message,
-                    "date": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime()),
-                    "note": note
-                }))
-            elif hasattr(message, "to_dict"):
-                # 非系统的复杂结构通知，如媒体信息/种子列表等。
-                content = message.to_dict()
-                content['title'] = title
-                content['date'] = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
-                content['note'] = note
-                self.user_queue.put(json.dumps(content))
+        if role not in ["system", "plugin"]:
+            return
+        # 没有标题时获取插件名称
+        if role == "plugin" and not title:
+            title = "插件通知"
+        if self._is_recent_system_notification(message, role, title=title, note=note):
+            return
+        self.sys_queue.put(json.dumps({
+            "type": role,
+            "title": title,
+            "text": message,
+            "date": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime()),
+            "note": note
+        }))
 
     def get(self, role: str = "system") -> Optional[str]:
         """
         取消息
-        :param role: 消息通道 systm：系统消息，plugin：插件消息，user：用户消息
+        :param role: 兼容旧参数，当前所有 SSE 消息共用一个队列
         """
-        if role == "system":
-            if not self.sys_queue.empty():
-                return self.sys_queue.get(block=False)
-        else:
-            if not self.user_queue.empty():
-                return self.user_queue.get(block=False)
+        if not self.sys_queue.empty():
+            return self.sys_queue.get(block=False)
         return None
 
 

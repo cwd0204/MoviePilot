@@ -34,6 +34,8 @@ class NotExistMediaInfo(BaseModel):
     total_episode: Optional[int] = 0
     # 开始集
     start_episode: Optional[int] = 0
+    # 候选资源须完整覆盖目标范围
+    require_complete_coverage: Optional[bool] = False
 
 
 class RefreshMediaItem(BaseModel):
@@ -60,12 +62,18 @@ class MediaServerLibrary(BaseModel):
     server: Optional[str] = None
     # ID
     id: Optional[Union[str, int]] = None
+    # 媒体服务器项目ID
+    item_id: Optional[Union[str, int]] = None
+    # 媒体服务器ID
+    server_id: Optional[str] = None
     # 名称
     name: Optional[str] = None
     # 路径
     path: Optional[Union[str, list]] = None
     # 类型
     type: Optional[str] = None
+    # 媒体库内媒体数量
+    item_count: Optional[int] = None
     # 封面图
     image: Optional[str] = None
     # 封面图列表
@@ -101,6 +109,8 @@ class MediaServerItem(BaseModel):
     server: Optional[str] = None
     # 媒体库ID
     library: Optional[Union[str, int]] = None
+    # 媒体服务器ID
+    server_id: Optional[str] = None
     # ID
     item_id: Optional[str] = None
     # 类型
@@ -171,6 +181,8 @@ class MediaServerPlayItem(BaseModel):
     媒体服务器可播放项目信息
     """
     id: Optional[Union[str, int]] = None
+    item_id: Optional[Union[str, int]] = None
+    server_id: Optional[str] = None
     title: Optional[str] = None
     subtitle: Optional[str] = None
     type: Optional[str] = None

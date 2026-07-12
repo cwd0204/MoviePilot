@@ -20,6 +20,7 @@ from app.schemas import (
     FileItem,
     TransferInterceptEventData,
     TransferOverwriteCheckEventData,
+    TransferRenameBuildEventData,
     TransferRenameEventData,
 )
 from app.schemas.types import MediaType, ChainEventType
@@ -33,6 +34,49 @@ class TransHandler:
 
     def __init__(self):
         pass
+
+    @staticmethod
+    def __normalize_disc_folder_name(value: Optional[str]) -> Optional[str]:
+        """
+        从 Disc/Disk/DVD/CD 标识中提取盘号并统一为 Disc N。
+        """
+        if not value:
+            return None
+        match = re.search(
+            r"(?:disc|disk|dvd|cd)[\s._-]*0*(\d{1,3})",
+            value,
+            re.IGNORECASE,
+        )
+        if not match:
+            return None
+        return f"Disc {int(match.group(1))}"
+
+    @classmethod
+    def __get_tv_bluray_dir_path(
+            cls,
+            rendered_path: Path,
+            source_item: FileItem,
+            meta: MetaBase,
+    ) -> Path:
+        """
+        电视剧原盘目录没有单集文件名，保留季目录并追加盘片目录。
+        """
+        disc_folder = cls.__normalize_disc_folder_name(getattr(meta, "part", None))
+        if not disc_folder and source_item:
+            source_name = source_item.name or Path(source_item.path).name
+            disc_folder = cls.__normalize_disc_folder_name(source_name)
+            if not disc_folder:
+                match = re.search(
+                    r"(?:^|[^A-Za-z0-9])S\d{1,3}D0*(\d{1,3})(?:[^A-Za-z0-9]|$)",
+                    source_name,
+                    re.IGNORECASE,
+                )
+                if match:
+                    disc_folder = f"Disc {int(match.group(1))}"
+            if not disc_folder:
+                disc_folder = source_name
+
+        return rendered_path.parent / (disc_folder or "Disc")
 
     @staticmethod
     def __update_result(result: TransferInfo, **kwargs):
@@ -156,7 +200,7 @@ class TransHandler:
             if fileitem.type == "dir":
                 # 整理整个目录，一般为蓝光原盘
                 if need_rename:
-                    new_path = self.get_rename_path(
+                    rendered_path = self.get_rename_path(
                         path=target_path,
                         template_string=rename_format,
                         rename_dict=self.get_naming_dict(
@@ -165,9 +209,16 @@ class TransHandler:
                         source_path=fileitem.path,
                         source_item=fileitem,
                     )
-                    new_path = DirectoryHelper.get_media_root_path(
-                        rename_format, rename_path=new_path
-                    )
+                    if mediainfo.type == MediaType.TV:
+                        new_path = self.__get_tv_bluray_dir_path(
+                            rendered_path=rendered_path,
+                            source_item=fileitem,
+                            meta=in_meta,
+                        )
+                    else:
+                        new_path = DirectoryHelper.get_media_root_path(
+                            rename_format, rename_path=rendered_path
+                        )
                     if not new_path:
                         self.__update_result(
                             result=result,
@@ -485,6 +536,7 @@ class TransHandler:
                 # 整理文件
                 new_item, err_msg = self.__transfer_file(
                     fileitem=fileitem,
+                    meta=in_meta,
                     mediainfo=mediainfo,
                     target_storage=target_storage,
                     target_file=new_file,
@@ -495,6 +547,7 @@ class TransHandler:
                     result=result,
                 )
                 if not new_item:
+                    err_msg = err_msg or f"{fileitem.path} 整理后未获取到目标文件信息"
                     logger.error(f"文件 {fileitem.path} 整理失败：{err_msg}")
                     self.__update_result(
                         result=result,
@@ -556,6 +609,34 @@ class TransHandler:
                 extension=_path.suffix.lstrip("."),
                 modify_time=_path.stat().st_mtime,
             )
+
+        def __build_remote_targetitem(_source_item: FileItem, _path: Path) -> FileItem:
+            """
+            根据已确认的目标路径构造网盘文件信息，用于兼容元数据延迟可见的存储。
+            """
+            return FileItem(
+                storage=target_storage,
+                path=_path.as_posix(),
+                name=_path.name,
+                basename=_path.stem,
+                type=_source_item.type or "file",
+                size=_source_item.size,
+                extension=_path.suffix.lstrip("."),
+                modify_time=_source_item.modify_time,
+                thumbnail=_source_item.thumbnail,
+            )
+
+        def __get_remote_targetitem(_source_item: FileItem, _path: Path) -> FileItem:
+            """
+            获取网盘目标文件信息，目标存储索引未刷新时使用目标路径兜底。
+            """
+            target_item = target_oper.get_item(_path)
+            if target_item:
+                return target_item
+            logger.warn(
+                f"目标文件【{target_storage}】{_path} 元数据暂不可见，使用目标路径构造整理结果"
+            )
+            return __build_remote_targetitem(_source_item, _path)
 
         if (
             fileitem.storage != target_storage
@@ -658,12 +739,18 @@ class TransHandler:
                 # 复制文件到新目录
                 target_fileitem = target_oper.get_folder(target_file.parent)
                 if target_fileitem:
-                    if source_oper.copy(
-                        fileitem, Path(target_fileitem.path), target_file.name
+                    copy_item = getattr(source_oper, "copy_item", None)
+                    if callable(copy_item):
+                        new_item = copy_item(
+                            fileitem, Path(target_fileitem.path), target_file.name
+                        )
+                        if new_item:
+                            return new_item, ""
+                    elif source_oper.copy(
+                            fileitem, Path(target_fileitem.path), target_file.name
                     ):
-                        return target_oper.get_item(target_file), ""
-                    else:
-                        return None, f"【{target_storage}】{fileitem.path} 复制文件失败"
+                        return __get_remote_targetitem(fileitem, target_file), ""
+                    return None, f"【{target_storage}】{fileitem.path} 复制文件失败"
                 else:
                     return (
                         None,
@@ -673,12 +760,18 @@ class TransHandler:
                 # 移动文件到新目录
                 target_fileitem = target_oper.get_folder(target_file.parent)
                 if target_fileitem:
-                    if source_oper.move(
-                        fileitem, Path(target_fileitem.path), target_file.name
+                    move_item = getattr(source_oper, "move_item", None)
+                    if callable(move_item):
+                        new_item = move_item(
+                            fileitem, Path(target_fileitem.path), target_file.name
+                        )
+                        if new_item:
+                            return new_item, ""
+                    elif source_oper.move(
+                            fileitem, Path(target_fileitem.path), target_file.name
                     ):
-                        return target_oper.get_item(target_file), ""
-                    else:
-                        return None, f"【{target_storage}】{fileitem.path} 移动文件失败"
+                        return __get_remote_targetitem(fileitem, target_file), ""
+                    return None, f"【{target_storage}】{fileitem.path} 移动文件失败"
                 else:
                     return (
                         None,
@@ -686,7 +779,7 @@ class TransHandler:
                     )
             elif transfer_type == "link":
                 if source_oper.link(fileitem, target_file):
-                    return target_oper.get_item(target_file), ""
+                    return __get_remote_targetitem(fileitem, target_file), ""
                 else:
                     return None, f"【{target_storage}】{fileitem.path} 创建硬链接失败"
             else:
@@ -870,6 +963,7 @@ class TransHandler:
     def __transfer_file(
         self,
         fileitem: FileItem,
+        meta: Optional[MetaBase],
         mediainfo: MediaInfo,
         source_oper: StorageBase,
         target_oper: StorageBase,
@@ -882,6 +976,7 @@ class TransHandler:
         """
         整理一个文件，同时处理其他相关文件
         :param fileitem: 原文件
+        :param meta: 元数据
         :param mediainfo: 媒体信息
         :param source_oper: 源存储操作对象
         :param target_oper: 目标存储操作对象
@@ -898,6 +993,7 @@ class TransHandler:
         )
         event_data = TransferInterceptEventData(
             fileitem=fileitem,
+            meta=meta,
             mediainfo=mediainfo,
             target_storage=target_storage,
             target_path=target_file,
@@ -1045,6 +1141,7 @@ class TransHandler:
         meta = MetaInfoPath(path)
         season = meta.season
         episode = meta.episode
+        part = meta.part
         logger.warn(f"正在删除目标目录中其它版本的文件：{path.parent}")
         # 获取父目录
         parent_item = storage_oper.get_item(path.parent)
@@ -1071,6 +1168,9 @@ class TransHandler:
             # 相同季集的文件才删除
             if filemeta.season != season or filemeta.episode != episode:
                 continue
+            # 相同 Part 的文件才删除，避免误删多 Part 文件 (issue #5862)
+            if part and filemeta.part and filemeta.part != part:
+                continue
             logger.info(f"正在删除文件：{media_file.name}")
             storage_oper.delete(media_file)
         return True
@@ -1092,6 +1192,19 @@ class TransHandler:
         :param source_item: 源文件信息，即待整理的文件信息
         :return: 生成的完整路径
         """
+        # 渲染前先发事件，让插件有机会往 rename_dict 写字段
+        build_event_data = TransferRenameBuildEventData(
+            template_string=template_string,
+            rename_dict=rename_dict,
+            source_path=source_path,
+            source_item=source_item,
+        )
+        build_event = eventmanager.send_event(
+            ChainEventType.TransferRenameBuild, build_event_data
+        )
+        if build_event and build_event.event_data:
+            rename_dict = build_event.event_data.rename_dict
+
         # 创建jinja2模板对象
         template = Template(template_string)
         # 渲染生成的字符串

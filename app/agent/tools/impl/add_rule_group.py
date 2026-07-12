@@ -6,6 +6,7 @@ from typing import Optional, Type
 from pydantic import BaseModel, Field
 
 from app.agent.tools.base import MoviePilotTool
+from app.agent.tools.tags import ToolTag
 from app.agent.tools.impl._filter_rule_utils import (
     build_custom_rule_map,
     collect_rule_group_usages,
@@ -23,10 +24,6 @@ from app.schemas.types import SystemConfigKey
 class AddRuleGroupInput(BaseModel):
     """新增过滤规则组工具的输入参数模型"""
 
-    explanation: str = Field(
-        ...,
-        description="Clear explanation of why this tool is being used in the current context",
-    )
     name: str = Field(..., description="New rule group name.")
     rule_string: str = Field(
         ...,
@@ -48,6 +45,11 @@ class AddRuleGroupInput(BaseModel):
 
 class AddRuleGroupTool(MoviePilotTool):
     name: str = "add_rule_group"
+    tags: list[str] = [
+        ToolTag.Write,
+        ToolTag.FilterRule,
+        ToolTag.Admin,
+    ]
     description: str = (
         "Add a new filter rule group to UserFilterRuleGroups. "
         "Rule groups are matched level by level from left to right and can be linked to search/subscription flows. "

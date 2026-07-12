@@ -21,6 +21,10 @@ from app.utils.structures import DictUtils
 
 
 class TelegramModule(_ModuleBase, _MessageBase[Telegram]):
+    """
+    Telegram 通知模块，负责模块生命周期、消息解析和通知发送。
+    """
+
     def init_module(self) -> None:
         """
         初始化模块
@@ -32,6 +36,9 @@ class TelegramModule(_ModuleBase, _MessageBase[Telegram]):
 
     @staticmethod
     def get_name() -> str:
+        """
+        获取模块名称
+        """
         return "Telegram"
 
     @staticmethod
@@ -75,7 +82,40 @@ class TelegramModule(_ModuleBase, _MessageBase[Telegram]):
         return True, ""
 
     def init_setting(self) -> Tuple[str, Union[str, bool]]:
+        """
+        获取模块初始化配置项。
+        """
         pass
+
+    @staticmethod
+    def _get_admins(config: Optional[dict]) -> List[str]:
+        """
+        解析 Telegram 管理员配置，兼容逗号分隔和首尾空白。
+        """
+        return [
+            admin.strip()
+            for admin in str((config or {}).get("TELEGRAM_ADMINS") or "").split(",")
+            if admin.strip()
+        ]
+
+    @classmethod
+    def _should_reject_admin_command(
+            cls,
+            config: Optional[dict],
+            *user_ids: Optional[Union[str, int]],
+    ) -> bool:
+        """
+        判断 Telegram 命令或命令型按钮回调是否应因非管理员身份被拒绝。
+        """
+        admins = cls._get_admins(config)
+        if not admins:
+            return False
+        candidates = [
+            str(user_id).strip()
+            for user_id in user_ids
+            if user_id is not None and str(user_id).strip()
+        ]
+        return not any(candidate in admins for candidate in candidates)
 
     def message_parser(
         self, source: str, body: Any, form: Any, args: Any
@@ -149,16 +189,15 @@ class TelegramModule(_ModuleBase, _MessageBase[Telegram]):
         if message:
             # 处理按钮回调
             if "callback_query" in message:
-                return self._handle_callback_query(message, client_config)
+                return self._handle_callback_query(message, client_config, client)
 
             # 处理普通消息
             return self._handle_text_message(message, client_config, client)
 
         return None
 
-    @staticmethod
     def _handle_callback_query(
-        message: dict, client_config: NotificationConf
+        self, message: dict, client_config: NotificationConf, client: Telegram
     ) -> Optional[CommingMessage]:
         """
         处理按钮回调查询
@@ -170,6 +209,17 @@ class TelegramModule(_ModuleBase, _MessageBase[Telegram]):
         user_name = user_info.get("username")
 
         if callback_data and user_id:
+            if str(callback_data).strip().startswith("/") and self._should_reject_admin_command(
+                    client_config.config, user_id, user_name
+            ):
+                if client:
+                    client.answer_callback_query(
+                        callback_query_id=callback_query.get("id"),
+                        text="只有管理员才有权限执行此命令",
+                        show_alert=True,
+                    )
+                return None
+
             logger.info(
                 f"收到来自 {client_config.name} 的Telegram按钮回调："
                 f"userid={user_id}, username={user_name}, callback_data={callback_data}"
@@ -202,9 +252,11 @@ class TelegramModule(_ModuleBase, _MessageBase[Telegram]):
         处理普通文本消息
         """
         text = msg.get("text") or msg.get("caption")
+        message_id = msg.get("message_id")
         user_id = msg.get("from", {}).get("id")
         user_name = msg.get("from", {}).get("username")
         chat_id = msg.get("chat", {}).get("id")
+        reply_to_message_id = (msg.get("reply_to_message") or {}).get("message_id")
 
         # 将 text_link 实体中的 URL 嵌入到文本中
         if text:
@@ -237,16 +289,10 @@ class TelegramModule(_ModuleBase, _MessageBase[Telegram]):
                 else None
             )
 
-            admin_users = client_config.config.get("TELEGRAM_ADMINS")
             user_list = client_config.config.get("TELEGRAM_USERS")
-            config_chat_id = client_config.config.get("TELEGRAM_CHAT_ID")
 
             if cleaned_text and cleaned_text.startswith("/"):
-                if (
-                    admin_users
-                    and str(user_id) not in admin_users.split(",")
-                    and str(user_id) != config_chat_id
-                ):
+                if self._should_reject_admin_command(client_config.config, user_id, user_name):
                     client.send_msg(
                         title="只有管理员才有权限执行此命令", userid=user_id
                     )
@@ -265,7 +311,9 @@ class TelegramModule(_ModuleBase, _MessageBase[Telegram]):
                 userid=user_id,
                 username=user_name,
                 text=cleaned_text,
+                message_id=message_id,
                 chat_id=str(chat_id) if chat_id else None,
+                reply_to_message_id=reply_to_message_id,
                 images=images if images else None,
                 audio_refs=audio_refs if audio_refs else None,
                 files=files if files else None,
@@ -459,6 +507,7 @@ class TelegramModule(_ModuleBase, _MessageBase[Telegram]):
                         text=message.text,
                         userid=userid,
                         original_chat_id=message.original_chat_id,
+                        parse_mode=message.parse_mode,
                     )
                 elif message.voice_path:
                     client.send_voice(
@@ -466,8 +515,15 @@ class TelegramModule(_ModuleBase, _MessageBase[Telegram]):
                         userid=userid,
                         caption=message.voice_caption,
                         original_chat_id=message.original_chat_id,
+                        parse_mode=message.parse_mode,
                     )
                 else:
+                    # Telegram 的 reply_markup 不能同时承载 InlineKeyboard 和 ForceReply。
+                    # 普通通知只清空可编辑消息 ID，仍保留原会话作为新消息目标。
+                    has_interaction_context = bool(message.buttons or message.force_reply)
+                    original_message_id = (
+                        message.original_message_id if has_interaction_context else None
+                    )
                     client.send_msg(
                         title=message.title,
                         text=message.text,
@@ -475,9 +531,11 @@ class TelegramModule(_ModuleBase, _MessageBase[Telegram]):
                         userid=userid,
                         link=message.link,
                         buttons=message.buttons,
-                        original_message_id=message.original_message_id,
+                        force_reply=message.force_reply,
+                        original_message_id=original_message_id,
                         original_chat_id=message.original_chat_id,
                         disable_web_page_preview=message.disable_web_page_preview,
+                        parse_mode=message.parse_mode,
                     )
 
     def post_medias_message(
@@ -502,6 +560,7 @@ class TelegramModule(_ModuleBase, _MessageBase[Telegram]):
                     buttons=message.buttons,
                     original_message_id=message.original_message_id,
                     original_chat_id=message.original_chat_id,
+                    parse_mode=message.parse_mode,
                 )
 
     def post_torrents_message(
@@ -526,6 +585,7 @@ class TelegramModule(_ModuleBase, _MessageBase[Telegram]):
                     buttons=message.buttons,
                     original_message_id=message.original_message_id,
                     original_chat_id=message.original_chat_id,
+                    parse_mode=message.parse_mode,
                 )
 
     def delete_message(
@@ -566,6 +626,7 @@ class TelegramModule(_ModuleBase, _MessageBase[Telegram]):
         title: Optional[str] = None,
         buttons: Optional[List[List[dict]]] = None,
         metadata: Optional[dict] = None,
+        parse_mode: Optional[str] = None,
     ) -> Optional[bool]:
         """
         编辑消息
@@ -576,6 +637,8 @@ class TelegramModule(_ModuleBase, _MessageBase[Telegram]):
         :param text: 新的消息内容
         :param title: 消息标题
         :param buttons: 新的按钮列表
+        :param metadata: 其他元信息
+        :param parse_mode: Telegram 消息格式类型，默认 MarkdownV2，可传 HTML
         :return: 编辑是否成功
         """
         if channel != self._channel:
@@ -591,6 +654,7 @@ class TelegramModule(_ModuleBase, _MessageBase[Telegram]):
                     text=text,
                     title=title,
                     buttons=buttons,
+                    parse_mode=parse_mode,
                 )
                 if result:
                     return True
@@ -607,11 +671,18 @@ class TelegramModule(_ModuleBase, _MessageBase[Telegram]):
     ) -> Optional[dict]:
         """
         标记 Telegram 消息正在处理。
-        入站侧已经启动 typing 任务，这里只返回可用于统一收口的上下文。
+        Telegram typing 需要周期性续发，因此在模块接口中启动保活任务。
         """
         if channel != self._channel:
             return None
-        if not text:
+        client_config = self.get_config(source)
+        if not client_config:
+            return None
+        client: Telegram = self.get_instance(client_config.name)
+        if not client:
+            return None
+        started = client.start_typing(chat_id=chat_id, userid=userid)
+        if not started:
             return None
         return {
             "channel": channel.value,
@@ -671,15 +742,24 @@ class TelegramModule(_ModuleBase, _MessageBase[Telegram]):
                         userid=userid,
                         caption=message.voice_caption,
                         original_chat_id=message.original_chat_id,
+                        parse_mode=message.parse_mode,
                     )
                 else:
+                    # direct message 只禁用编辑旧消息；仅 ForceReply 使用 original_chat_id
+                    # 发回原会话，并保留 original_message_id 让 client reply_to 原消息。
+                    original_chat_id = message.original_chat_id if message.force_reply else None
+                    original_message_id = message.original_message_id if message.force_reply else None
                     result = client.send_msg(
                         title=message.title,
                         text=message.text,
                         image=message.image,
                         userid=userid,
                         link=message.link,
+                        force_reply=message.force_reply,
+                        original_message_id=original_message_id,
+                        original_chat_id=original_chat_id,
                         disable_web_page_preview=message.disable_web_page_preview,
+                        parse_mode=message.parse_mode,
                     )
                 if result and result.get("success"):
                     return MessageResponse(

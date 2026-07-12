@@ -4,8 +4,11 @@ import os
 import platform
 import re
 import shutil
+import socket
 import subprocess
 import sys
+import time
+import urllib.parse
 import uuid
 from pathlib import Path
 from typing import List, Optional, Tuple, Union
@@ -13,12 +16,15 @@ from typing import List, Optional, Tuple, Union
 import psutil
 
 from app import schemas
+from version import APP_VERSION
 
 
 class SystemUtils:
     """
     系统工具类，提供系统相关的操作和信息获取方法。
     """
+
+    _URL_WITH_USERINFO_PATTERN = re.compile(r"([A-Za-z][A-Za-z0-9+.-]*://[^\s]+)")
 
     @staticmethod
     def execute(cmd: str) -> str:
@@ -33,24 +39,87 @@ class SystemUtils:
             return ""
 
     @staticmethod
-    def execute_with_subprocess(pip_command: list) -> Tuple[bool, str]:
+    def redact_url_userinfo(value: str) -> str:
+        """
+        脱敏 URL 中的 userinfo，避免命令输出泄露镜像源或代理凭据。
+        """
+        def replace(match: re.Match[str]) -> str:
+            candidate = match.group(1)
+            trailing = ""
+            while candidate and candidate[-1] in ".,;:)":
+                trailing = candidate[-1] + trailing
+                candidate = candidate[:-1]
+            parsed = urllib.parse.urlsplit(candidate)
+            if not parsed.username and not parsed.password:
+                return match.group(1)
+            host = parsed.netloc.rsplit("@", 1)[-1]
+            redacted = urllib.parse.urlunsplit((
+                parsed.scheme,
+                host,
+                parsed.path,
+                parsed.query,
+                parsed.fragment,
+            ))
+            return f"{redacted}{trailing}"
+
+        return SystemUtils._URL_WITH_USERINFO_PATTERN.sub(replace, value or "")
+
+    @staticmethod
+    def redact_command_url_userinfo(command: list[str]) -> List[str]:
+        """
+        脱敏命令参数中的 URL userinfo，供错误信息展示。
+        """
+        return [SystemUtils.redact_url_userinfo(str(item)) for item in command]
+
+    @staticmethod
+    def execute_with_subprocess(
+            pip_command: list,
+            env: Optional[dict[str, str]] = None,
+            safe_command: Optional[list[str]] = None,
+    ) -> Tuple[bool, str]:
         """
         执行命令并捕获标准输出和错误输出，记录日志。
 
         :param pip_command: 要执行的命令，以列表形式提供
+        :param env: 传递给子进程的环境变量
+        :param safe_command: 用于错误信息展示的脱敏命令
         :return: (命令是否成功, 输出信息或错误信息)
         """
+        display_command = safe_command or pip_command
         try:
             # 使用 subprocess.run 捕获标准输出和标准错误
-            result = subprocess.run(pip_command, check=True, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            result = subprocess.run(
+                pip_command,
+                check=True,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                env=env,
+            )
             # 合并 stdout 和 stderr
-            output = result.stdout + result.stderr
+            output = SystemUtils.redact_url_userinfo(result.stdout + result.stderr)
             return True, output
         except subprocess.CalledProcessError as e:
-            error_message = f"命令：{' '.join(pip_command)}，执行失败，错误信息：{e.stderr.strip()}"
+            stdout = SystemUtils.redact_url_userinfo((e.stdout or "").strip())
+            stderr = SystemUtils.redact_url_userinfo((e.stderr or "").strip())
+            # 不同命令/兼容层可能把失败原因写入 stdout，失败时需要同时保留两路输出。
+            output_parts = []
+            if stdout:
+                output_parts.append(f"标准输出：{stdout}")
+            if stderr:
+                output_parts.append(f"错误输出：{stderr}")
+            if not output_parts:
+                output_parts.append("无标准输出或错误输出")
+            error_message = (
+                f"命令：{' '.join(SystemUtils.redact_command_url_userinfo(display_command))}，执行失败，"
+                f"返回码：{e.returncode}，{'; '.join(output_parts)}"
+            )
             return False, error_message
         except Exception as e:
-            error_message = f"未知错误，命令：{' '.join(pip_command)}，错误：{str(e)}"
+            error_message = (
+                f"未知错误，命令：{' '.join(SystemUtils.redact_command_url_userinfo(display_command))}，"
+                f"错误：{SystemUtils.redact_url_userinfo(str(e))}"
+            )
             return False, error_message
 
     @staticmethod
@@ -248,6 +317,84 @@ class SystemUtils:
 
         _scan_directory(directory, recursive)
         return files
+
+    @staticmethod
+    def unpack_archive(archive_file: Path, extract_dir: Path, archive_format: Optional[str] = None) -> None:
+        """
+        解压压缩包，并补充标准库未覆盖的 RAR 格式支持。
+
+        :param archive_file: 待解压的压缩包文件
+        :param extract_dir: 解压目标目录
+        :param archive_format: 压缩包格式，未指定时按文件后缀推断
+        """
+        if archive_format == "rar" or (not archive_format and archive_file.suffix.lower() == ".rar"):
+            SystemUtils.__unpack_rar_archive(archive_file, extract_dir)
+            return
+        shutil.unpack_archive(archive_file, extract_dir, format=archive_format)
+
+    @staticmethod
+    def __unpack_rar_archive(archive_file: Path, extract_dir: Path) -> None:
+        """
+        调用系统解压工具处理 RAR 压缩包。
+        """
+        extract_dir.mkdir(parents=True, exist_ok=True)
+        commands = []
+        if shutil.which("unar"):
+            commands.append([
+                "unar",
+                "-quiet",
+                "-force-overwrite",
+                "-output-directory",
+                extract_dir.as_posix(),
+                archive_file.as_posix(),
+            ])
+        if shutil.which("unrar"):
+            commands.append([
+                "unrar",
+                "x",
+                "-o+",
+                "-idq",
+                archive_file.as_posix(),
+                f"{extract_dir.as_posix()}/",
+            ])
+        if shutil.which("7z"):
+            commands.append([
+                "7z",
+                "x",
+                "-y",
+                f"-o{extract_dir.as_posix()}",
+                archive_file.as_posix(),
+            ])
+        if shutil.which("bsdtar"):
+            commands.append([
+                "bsdtar",
+                "-xf",
+                archive_file.as_posix(),
+                "-C",
+                extract_dir.as_posix(),
+            ])
+        if not commands:
+            raise RuntimeError("未找到可用的 RAR 解压工具，请安装 unar、unrar、7z 或 bsdtar")
+
+        errors = []
+        for command in commands:
+            try:
+                result = subprocess.run(
+                    command,
+                    check=False,
+                    text=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    timeout=120,
+                )
+            except Exception as err:
+                errors.append(f"{command[0]}：{str(err)}")
+                continue
+            if result.returncode == 0:
+                return
+            output = (result.stderr or result.stdout or "").strip()
+            errors.append(f"{command[0]}：{output or f'返回码 {result.returncode}'}")
+        raise RuntimeError(f"RAR 压缩包解压失败：{'；'.join(errors)}")
 
     @staticmethod
     def exits_files(directory: Path, extensions: list, min_filesize: int = 0, recursive: bool = True) -> bool:
@@ -474,6 +621,36 @@ class SystemUtils:
         return processes
 
     @staticmethod
+    def dashboard_system_info() -> schemas.DashboardSystemInfo:
+        """
+        获取仪表板展示所需的系统摘要信息。
+
+        运行时间以当前 MoviePilot 进程为基准，避免宿主机或容器长期运行时间
+        掩盖服务最近一次重启。
+        """
+        return schemas.DashboardSystemInfo(
+            hostname=socket.gethostname(),
+            operating_system=SystemUtils._operating_system_name(),
+            runtime=max(0, int(time.time() - psutil.Process().create_time())),
+            version=APP_VERSION,
+        )
+
+    @staticmethod
+    def _operating_system_name() -> str:
+        """返回适合在仪表板展示的操作系统名称。"""
+        if SystemUtils.is_windows():
+            return platform.platform()
+        if SystemUtils.is_macos():
+            version = platform.mac_ver()[0]
+            return f"macOS {version}".strip()
+
+        try:
+            operating_system = platform.freedesktop_os_release()
+            return operating_system.get("PRETTY_NAME") or operating_system.get("NAME") or platform.platform()
+        except OSError:
+            return platform.platform()
+
+    @staticmethod
     def is_bluray_dir(dir_path: Path) -> bool:
         """
         判断是否为蓝光原盘目录
@@ -510,15 +687,27 @@ class SystemUtils:
         return psutil.cpu_percent()
 
     @staticmethod
-    def memory_usage() -> List[int]:
+    def memory_usage() -> schemas.DashboardMemoryInfo:
         """
-        获取当前程序的内存使用量和使用率
+        获取当前 MoviePilot 进程内存与系统缓存、可用和总内存信息。
         """
-        current_process = psutil.Process()
-        process_memory = current_process.memory_info().rss
-        system_memory = psutil.virtual_memory().total
-        process_memory_percent = (process_memory / system_memory) * 100
-        return [process_memory, int(process_memory_percent)]
+        memory = psutil.virtual_memory()
+        total = max(0, int(memory.total))
+        used = max(0, int(psutil.Process().memory_info().rss))
+        cached = max(
+            0,
+            int(getattr(memory, "cached", 0) or 0)
+            + int(getattr(memory, "buffers", 0) or 0),
+        )
+        available = max(0, int(memory.available))
+        usage = used / total * 100 if total else 0.0
+        return schemas.DashboardMemoryInfo(
+            total=total,
+            used=used,
+            cached=cached,
+            available=available,
+            usage=usage,
+        )
 
     @staticmethod
     def network_usage() -> List[int]:

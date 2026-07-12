@@ -13,6 +13,7 @@ from app.helper.cloudflare import under_challenge
 from app.log import logger
 from app.utils.http import RequestUtils
 from app.utils.site import SiteUtils
+from app.utils.string import StringUtils
 
 
 # 站点框架
@@ -153,6 +154,13 @@ class SiteParserBase(metaclass=ABCMeta):
         :return: 站点解析模型
         """
         return self.schema
+
+    @staticmethod
+    def num_filesize(text) -> int:
+        """
+        将站点页面中的文件大小文本转换为字节。
+        """
+        return StringUtils.num_filesize(text)
 
     def parse(self):
         """

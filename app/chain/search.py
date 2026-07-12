@@ -4,7 +4,7 @@ import json
 import random
 import re
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, as_completed, wait
 from datetime import datetime
 from typing import AsyncIterator, Any, Dict, Tuple
 from typing import List, Optional
@@ -14,7 +14,7 @@ from fastapi.concurrency import run_in_threadpool
 from app.chain import ChainBase
 from app.core.config import global_vars, settings
 from app.core.context import Context
-from app.core.context import MediaInfo, TorrentInfo
+from app.core.context import MediaInfo, SubtitleInfo, TorrentInfo
 from app.core.event import eventmanager, Event
 from app.core.metainfo import MetaInfo
 from app.db.systemconfig_oper import SystemConfigOper
@@ -33,6 +33,8 @@ class SearchChain(ChainBase):
     """
 
     __result_temp_file = "__search_result__"
+    __subtitle_result_temp_file = "__subtitle_search_result__"
+    __search_params_temp_file = "__search_params__"
     __ai_indices_cache_file = "__ai_recommend_indices__"
 
     _ai_recommend_running = False
@@ -40,6 +42,52 @@ class SearchChain(ChainBase):
     _current_recommend_request_hash: Optional[str] = None
     _ai_recommend_result: Optional[List[int]] = None
     _ai_recommend_error: Optional[str] = None
+
+    @staticmethod
+    def _get_search_resource_pages() -> int:
+        """
+        获取搜索资源需要抓取的页数。
+
+        settings 可能被环境变量写成字符串，这里统一兜底为 1，避免异常配置导致搜索中断。
+        """
+        pages = settings.SEARCH_RESOURCE_PAGES
+        try:
+            pages = int(pages)
+        except (TypeError, ValueError):
+            return 1
+        return max(pages, 1)
+
+    @classmethod
+    def _build_search_pages(cls, page: Optional[int] = 0) -> List[int]:
+        """
+        根据起始页和配置页数生成需要请求的页码列表。
+        """
+        try:
+            start_page = int(page or 0)
+        except (TypeError, ValueError):
+            start_page = 0
+        start_page = max(start_page, 0)
+        return list(range(start_page, start_page + cls._get_search_resource_pages()))
+
+    def _should_continue_search_pages(self, site: dict, page_results: Optional[List[Any]],
+                                      keyword: Optional[str] = None) -> bool:
+        """
+        判断是否继续抓取下一页；少于站点单页容量时视为当前站点已到末页。
+        """
+        page_size = self.get_search_page_size(site=site, keyword=keyword)
+        return page_size is not None and len(page_results or []) >= page_size
+
+    @staticmethod
+    def _should_continue_subtitle_search_pages(site: dict, page_results: Optional[List[Any]]) -> bool:
+        """
+        判断字幕搜索是否继续抓取下一页。
+        """
+        subtitle_conf = (site or {}).get("subtitles") or {}
+        try:
+            page_size = int(subtitle_conf.get("result_num") or site.get("result_num") or 100)
+        except (TypeError, ValueError):
+            page_size = 100
+        return page_size > 0 and len(page_results or []) >= page_size
 
     @property
     def is_ai_recommend_enabled(self) -> bool:
@@ -120,6 +168,125 @@ class SearchChain(ChainBase):
         state._ai_recommend_result = None
         state._ai_recommend_error = None
         self.remove_cache(self.__ai_indices_cache_file)
+
+    @staticmethod
+    def _build_search_keyword(
+            tmdbid: Optional[int] = None, doubanid: Optional[str] = None
+    ) -> str:
+        """
+        根据媒体ID生成可重放的搜索关键字。
+        """
+        if tmdbid is not None:
+            return f"tmdb:{tmdbid}"
+        if doubanid:
+            return f"douban:{doubanid}"
+        return ""
+
+    @staticmethod
+    def _stringify_sites(sites: Optional[List[int]]) -> str:
+        """
+        将站点ID列表转换为前端可直接复用的查询字符串。
+        """
+        return ",".join(str(site) for site in sites) if sites else ""
+
+    @staticmethod
+    def _normalize_search_params(params: Optional[Dict[str, Any]]) -> Optional[Dict[str, str]]:
+        """
+        规范化上次搜索参数，供前端结果页重新搜索使用。
+        """
+        if not isinstance(params, dict):
+            return None
+
+        normalized = {
+            "keyword": str(params.get("keyword") or ""),
+            "type": str(params.get("type") or ""),
+            "area": str(params.get("area") or ""),
+            "title": str(params.get("title") or ""),
+            "year": str(params.get("year") or ""),
+            "season": str(params.get("season") or ""),
+            "episode": str(params.get("episode") or ""),
+            "sites": str(params.get("sites") or ""),
+            "result_type": str(params.get("result_type") or "torrent"),
+        }
+        return normalized if normalized["keyword"] else None
+
+    def save_last_search_params(
+            self,
+            *,
+            keyword: Optional[str],
+            mtype: Optional[MediaType] = None,
+            area: Optional[str] = "title",
+            title: Optional[str] = None,
+            year: Optional[str] = None,
+            season: Optional[int] = None,
+            episode: Optional[int] = None,
+            sites: Optional[List[int]] = None,
+            result_type: Optional[str] = "torrent",
+    ) -> None:
+        """
+        保存最后一次资源搜索参数。
+        """
+        params = self._normalize_search_params(
+            {
+                "keyword": keyword,
+                "type": mtype.value if isinstance(mtype, MediaType) else mtype,
+                "area": area,
+                "title": title,
+                "year": year,
+                "season": season,
+                "episode": episode,
+                "sites": self._stringify_sites(sites),
+                "result_type": result_type or "torrent",
+            }
+        )
+        if params:
+            self.save_cache(params, self.__search_params_temp_file)
+
+    async def async_save_last_search_params(
+            self,
+            *,
+            keyword: Optional[str],
+            mtype: Optional[MediaType] = None,
+            area: Optional[str] = "title",
+            title: Optional[str] = None,
+            year: Optional[str] = None,
+            season: Optional[int] = None,
+            episode: Optional[int] = None,
+            sites: Optional[List[int]] = None,
+            result_type: Optional[str] = "torrent",
+    ) -> None:
+        """
+        异步保存最后一次资源搜索参数。
+        """
+        params = self._normalize_search_params(
+            {
+                "keyword": keyword,
+                "type": mtype.value if isinstance(mtype, MediaType) else mtype,
+                "area": area,
+                "title": title,
+                "year": year,
+                "season": season,
+                "episode": episode,
+                "sites": self._stringify_sites(sites),
+                "result_type": result_type or "torrent",
+            }
+        )
+        if params:
+            await self.async_save_cache(params, self.__search_params_temp_file)
+
+    def last_search_params(self) -> Optional[Dict[str, str]]:
+        """
+        获取上次搜索使用的参数。
+        """
+        return self._normalize_search_params(self.load_cache(self.__search_params_temp_file))
+
+    async def async_last_search_params(self) -> Optional[Dict[str, str]]:
+        """
+        异步获取上次搜索使用的参数。
+        """
+        return self._normalize_search_params(
+            await self.async_load_cache(self.__search_params_temp_file)
+        )
 
     @staticmethod
     def _normalize_ai_indices(ai_indices: List[Any]) -> List[int]:
@@ -228,7 +395,6 @@ class SearchChain(ChainBase):
             session_prefix="__agent_search_recommend",
             output_callback=on_output,
             reply_mode=ReplyMode.CAPTURE_ONLY,
-            persist_output_message=False,
             allow_message_tools=False,
         )
         return full_output[0].strip()
@@ -337,6 +503,13 @@ class SearchChain(ChainBase):
         """
         if cache_local:
             self.cancel_ai_recommend()
+            self.save_last_search_params(
+                keyword=self._build_search_keyword(tmdbid=tmdbid, doubanid=doubanid),
+                mtype=mtype,
+                area=area,
+                season=season,
+                sites=sites,
+            )
         mediainfo = self.recognize_media(tmdbid=tmdbid, doubanid=doubanid, mtype=mtype)
         if not mediainfo:
             logger.error(f'{tmdbid} 媒体信息识别失败！')
@@ -357,7 +530,7 @@ class SearchChain(ChainBase):
     def search_by_title(self, title: str, page: Optional[int] = 0,
                         sites: List[int] = None, cache_local: Optional[bool] = False) -> List[Context]:
         """
-        根据标题搜索资源，不识别不过滤，直接返回站点内容
+        根据标题搜索资源，不识别媒体信息，按默认搜索过滤规则返回站点内容
         :param title: 标题，为空时返回所有站点首页内容
         :param page: 页码
         :param sites: 站点ID列表
@@ -365,6 +538,11 @@ class SearchChain(ChainBase):
         """
         if cache_local:
             self.cancel_ai_recommend()
+            self.save_last_search_params(
+                keyword=title,
+                area="title",
+                sites=sites,
+            )
         if title:
             logger.info(f'开始搜索资源，关键词：{title} ...')
         else:
@@ -373,6 +551,10 @@ class SearchChain(ChainBase):
         torrents = self.__search_all_sites(keyword=title, sites=sites, page=page) or []
         if not torrents:
             logger.warn(f'{title} 未搜索到资源')
+            return []
+        torrents = self.__filter_title_search_torrents(torrents=torrents)
+        if not torrents:
+            logger.warn(f'{title} 没有符合过滤规则的资源')
             return []
         # 组装上下文
         contexts = [
@@ -399,6 +581,178 @@ class SearchChain(ChainBase):
         """
         return await self.async_load_cache(self.__result_temp_file)
 
+    async def async_last_subtitle_search_results(self) -> Optional[List[SubtitleInfo]]:
+        """
+        异步获取上次字幕搜索结果。
+        """
+        return await self.async_load_cache(self.__subtitle_result_temp_file)
+
+    async def async_search_subtitles_by_title(self, title: str, page: Optional[int] = 0,
+                                              sites: List[int] = None,
+                                              cache_local: Optional[bool] = False) -> List[SubtitleInfo]:
+        """
+        根据标题异步搜索字幕，不识别不过滤，直接返回站点字幕内容。
+        :param title: 标题关键词
+        :param page: 页码
+        :param sites: 站点ID列表
+        :param cache_local: 是否缓存到本地
+        """
+        if cache_local:
+            self.cancel_ai_recommend()
+            await self.async_save_last_search_params(
+                keyword=title,
+                area="title",
+                sites=sites,
+                result_type="subtitle",
+            )
+        logger.info(f'开始搜索字幕，关键词：{title} ...')
+        subtitles = await self.__async_search_subtitles_all_sites(
+            keyword=title, sites=sites, page=page
+        ) or []
+        if not subtitles:
+            logger.warn(f'{title} 未搜索到字幕')
+            return []
+        if cache_local:
+            await self.async_save_cache(subtitles, self.__subtitle_result_temp_file)
+        return subtitles
+
+    async def async_search_subtitles_by_title_stream(self, title: str, page: Optional[int] = 0,
+                                                     sites: List[int] = None,
+                                                     cache_local: Optional[bool] = False) -> AsyncIterator[dict]:
+        """
+        根据标题渐进式搜索字幕，不识别不过滤，按站点完成顺序返回结果。
+        """
+        if cache_local:
+            self.cancel_ai_recommend()
+            await self.async_save_last_search_params(
+                keyword=title,
+                area="title",
+                sites=sites,
+                result_type="subtitle",
+            )
+        logger.info(f'开始渐进式搜索字幕，关键词：{title} ...')
+
+        subtitles: List[SubtitleInfo] = []
+        async for event in self.__async_search_subtitles_all_sites_stream(
+                keyword=title, sites=sites, page=page):
+            result = event.pop("items", []) or []
+            if result:
+                subtitles.extend(result)
+            yield {
+                **event,
+                "type": "append",
+                "items": [subtitle.to_dict() for subtitle in result],
+                "total_items": len(subtitles)
+            }
+
+        if cache_local:
+            await self.async_save_cache(subtitles, self.__subtitle_result_temp_file)
+
+        if not subtitles:
+            logger.warn(f'{title} 未搜索到字幕')
+        yield {
+            "type": "done",
+            "stage": "done",
+            "text": f"搜索完成，共 {len(subtitles)} 个字幕",
+            "items": [subtitle.to_dict() for subtitle in subtitles],
+            "total_items": len(subtitles)
+        }
+
+    async def async_search_subtitles_by_id(self, tmdbid: Optional[int] = None, doubanid: Optional[str] = None,
+                                           mtype: MediaType = None, season: Optional[int] = None,
+                                           episode: Optional[int] = None, sites: List[int] = None,
+                                           cache_local: bool = False) -> List[SubtitleInfo]:
+        """
+        根据TMDBID/豆瓣ID异步精确搜索字幕，不应用过滤规则。
+        :param tmdbid: TMDB ID
+        :param doubanid: 豆瓣 ID
+        :param mtype: 媒体，电影 or 电视剧
+        :param season: 季数
+        :param episode: 集数
+        :param sites: 站点ID列表
+        :param cache_local: 是否缓存到本地
+        """
+        if cache_local:
+            self.cancel_ai_recommend()
+            await self.async_save_last_search_params(
+                keyword=self._build_search_keyword(tmdbid=tmdbid, doubanid=doubanid),
+                mtype=mtype,
+                area="title",
+                season=season,
+                episode=episode,
+                sites=sites,
+                result_type="subtitle",
+            )
+        mediainfo = await self.async_recognize_media(tmdbid=tmdbid, doubanid=doubanid, mtype=mtype)
+        if not mediainfo:
+            logger.error(f'{tmdbid} 媒体信息识别失败！')
+            return []
+        subtitles = await self.__async_search_subtitles_for_media(
+            mediainfo=mediainfo,
+            tmdbid=tmdbid,
+            doubanid=doubanid,
+            season=season,
+            episode=episode,
+            sites=sites,
+        )
+        if cache_local:
+            await self.async_save_cache(subtitles, self.__subtitle_result_temp_file)
+        return subtitles
+
+    async def async_search_subtitles_by_id_stream(
+            self,
+            tmdbid: Optional[int] = None,
+            doubanid: Optional[str] = None,
+            mtype: MediaType = None,
+            season: Optional[int] = None,
+            episode: Optional[int] = None,
+            sites: List[int] = None,
+            cache_local: bool = False,
+    ) -> AsyncIterator[dict]:
+        """
+        根据TMDBID/豆瓣ID渐进式精确搜索字幕，先返回站点候选，再返回标题和剧集匹配后的结果。
+        """
+        if cache_local:
+            self.cancel_ai_recommend()
+            await self.async_save_last_search_params(
+                keyword=self._build_search_keyword(tmdbid=tmdbid, doubanid=doubanid),
+                mtype=mtype,
+                area="title",
+                season=season,
+                episode=episode,
+                sites=sites,
+                result_type="subtitle",
+            )
+        mediainfo = await self.async_recognize_media(tmdbid=tmdbid, doubanid=doubanid, mtype=mtype)
+        if not mediainfo:
+            logger.error(f'{tmdbid} 媒体信息识别失败！')
+            yield {
+                "type": "error",
+                "success": False,
+                "message": "媒体信息识别失败"
+            }
+            return
+
+        subtitles: List[SubtitleInfo] = []
+        async for event in self.__async_search_subtitles_for_media_stream(
+                mediainfo=mediainfo,
+                tmdbid=tmdbid,
+                doubanid=doubanid,
+                season=season,
+                episode=episode,
+                sites=sites):
+            if event.get("type") == "done":
+                subtitles = event.get("subtitles") or []
+                event = {
+                    key: value
+                    for key, value in event.items()
+                    if key != "subtitles"
+                }
+            yield event
+
+        if cache_local:
+            await self.async_save_cache(subtitles, self.__subtitle_result_temp_file)
+
     async def async_search_by_id(self, tmdbid: Optional[int] = None, doubanid: Optional[str] = None,
                                  mtype: MediaType = None, area: Optional[str] = "title", season: Optional[int] = None,
                                  sites: List[int] = None, cache_local: bool = False) -> List[Context]:
@@ -414,6 +768,13 @@ class SearchChain(ChainBase):
         """
         if cache_local:
             self.cancel_ai_recommend()
+            await self.async_save_last_search_params(
+                keyword=self._build_search_keyword(tmdbid=tmdbid, doubanid=doubanid),
+                mtype=mtype,
+                area=area,
+                season=season,
+                sites=sites,
+            )
         mediainfo = await self.async_recognize_media(tmdbid=tmdbid, doubanid=doubanid, mtype=mtype)
         if not mediainfo:
             logger.error(f'{tmdbid} 媒体信息识别失败！')
@@ -434,7 +795,7 @@ class SearchChain(ChainBase):
     async def async_search_by_title(self, title: str, page: Optional[int] = 0,
                                     sites: List[int] = None, cache_local: Optional[bool] = False) -> List[Context]:
         """
-        根据标题异步搜索资源，不识别不过滤，直接返回站点内容
+        根据标题异步搜索资源，不识别媒体信息，按默认搜索过滤规则返回站点内容
         :param title: 标题，为空时返回所有站点首页内容
         :param page: 页码
         :param sites: 站点ID列表
@@ -442,6 +803,11 @@ class SearchChain(ChainBase):
         """
         if cache_local:
             self.cancel_ai_recommend()
+            await self.async_save_last_search_params(
+                keyword=title,
+                area="title",
+                sites=sites,
+            )
         if title:
             logger.info(f'开始搜索资源，关键词：{title} ...')
         else:
@@ -450,6 +816,10 @@ class SearchChain(ChainBase):
         torrents = await self.__async_search_all_sites(keyword=title, sites=sites, page=page) or []
         if not torrents:
             logger.warn(f'{title} 未搜索到资源')
+            return []
+        torrents = await run_in_threadpool(self.__filter_title_search_torrents, torrents=torrents)
+        if not torrents:
+            logger.warn(f'{title} 没有符合过滤规则的资源')
             return []
         # 组装上下文
         contexts = [
@@ -468,18 +838,29 @@ class SearchChain(ChainBase):
                                            sites: List[int] = None,
                                            cache_local: Optional[bool] = False) -> AsyncIterator[dict]:
         """
-        根据标题渐进式搜索资源，不识别不过滤，按站点完成顺序返回结果
+        根据标题渐进式搜索资源，不识别媒体信息，按默认搜索过滤规则返回结果
         """
         if cache_local:
             self.cancel_ai_recommend()
+            await self.async_save_last_search_params(
+                keyword=title,
+                area="title",
+                sites=sites,
+            )
         if title:
             logger.info(f'开始渐进式搜索资源，关键词：{title} ...')
         else:
             logger.info(f'开始渐进式浏览资源，站点：{sites} ...')
 
         contexts: List[Context] = []
+        rule_groups: List[str] = SystemConfigOper().get(SystemConfigKey.SearchFilterRuleGroups) or []
         async for event in self.__async_search_all_sites_stream(keyword=title, sites=sites, page=page):
             result = event.pop("items", []) or []
+            result = await run_in_threadpool(
+                self.__filter_title_search_torrents,
+                torrents=result,
+                rule_groups=rule_groups,
+            )
             batch_contexts = [
                 Context(
                     meta_info=MetaInfo(title=torrent.title, subtitle=torrent.description),
@@ -509,6 +890,29 @@ class SearchChain(ChainBase):
             "total_items": len(contexts)
         }
 
+    def __filter_title_search_torrents(self,
+                                       torrents: List[TorrentInfo],
+                                       rule_groups: Optional[List[str]] = None) -> List[TorrentInfo]:
+        """
+        对标题搜索结果应用默认搜索过滤规则，不执行媒体识别和标题精确匹配。
+        """
+        if not torrents:
+            return []
+
+        if rule_groups is None:
+            rule_groups = SystemConfigOper().get(SystemConfigKey.SearchFilterRuleGroups) or []
+        if not rule_groups:
+            return torrents
+
+        logger.info(f'开始过滤标题搜索结果，使用规则组：{rule_groups} ...')
+        filtered_torrents = self.filter_torrents(
+            rule_groups=rule_groups,
+            torrent_list=torrents,
+            mediainfo=None,
+        ) or []
+        logger.info(f'标题搜索过滤完成，剩余 {len(filtered_torrents)} 个资源')
+        return filtered_torrents
+
     async def async_search_by_id_stream(self, tmdbid: Optional[int] = None, doubanid: Optional[str] = None,
                                         mtype: MediaType = None, area: Optional[str] = "title",
                                         season: Optional[int] = None, sites: List[int] = None,
@@ -518,6 +922,13 @@ class SearchChain(ChainBase):
         """
         if cache_local:
             self.cancel_ai_recommend()
+            await self.async_save_last_search_params(
+                keyword=self._build_search_keyword(tmdbid=tmdbid, doubanid=doubanid),
+                mtype=mtype,
+                area=area,
+                season=season,
+                sites=sites,
+            )
         mediainfo = await self.async_recognize_media(tmdbid=tmdbid, doubanid=doubanid, mtype=mtype)
         if not mediainfo:
             logger.error(f'{tmdbid} 媒体信息识别失败！')
@@ -702,7 +1113,6 @@ class SearchChain(ChainBase):
 
         # 开始匹配
         _match_torrents = []
-        torrenthelper = TorrentHelper()
         try:
             # 英文标题应该在别名/原标题中，不需要再匹配
             logger.info(f"开始匹配结果 标题：{mediainfo.title}，原标题：{mediainfo.original_title}，别名：{mediainfo.names}")
@@ -736,7 +1146,7 @@ class SearchChain(ChainBase):
                     continue
 
                 # 比对种子
-                if torrenthelper.match_torrent(mediainfo=mediainfo,
+                if TorrentHelper.match_torrent(mediainfo=mediainfo,
                                                torrent_meta=torrent_meta,
                                                torrent=torrent):
                     # 匹配成功
@@ -770,7 +1180,7 @@ class SearchChain(ChainBase):
         # 排序
         progress.update(value=99,
                         text=f'正在对 {len(contexts)} 个资源进行排序，请稍候...')
-        contexts = torrenthelper.sort_torrents(contexts)
+        contexts = TorrentHelper.sort_torrents(contexts)
 
         # 结束进度
         logger.info(f'搜索完成，共 {len(contexts)} 个资源')
@@ -1067,6 +1477,321 @@ class SearchChain(ChainBase):
             "contexts": contexts
         }
 
+    @staticmethod
+    def __build_subtitle_season_episodes(mediainfo: MediaInfo,
+                                          season: Optional[int] = None,
+                                          episode: Optional[int] = None) -> Optional[Dict[int, List[int]]]:
+        """
+        构造字幕匹配用季集约束，未指定集数时只约束到同一季。
+        """
+        if mediainfo.type != MediaType.TV:
+            return None
+        media_season = season if season is not None else mediainfo.season
+        if media_season is None:
+            return None
+        return {media_season: [episode] if episode is not None else []}
+
+    @staticmethod
+    def __build_subtitle_torrent(subtitle: SubtitleInfo, title: Optional[str] = None) -> TorrentInfo:
+        """
+        将字幕结果转换为轻量资源对象，复用既有标题匹配逻辑。
+        """
+        return TorrentInfo(
+            site=subtitle.site,
+            site_name=subtitle.site_name,
+            site_cookie=subtitle.site_cookie,
+            site_ua=subtitle.site_ua,
+            site_proxy=subtitle.site_proxy,
+            site_order=subtitle.site_order,
+            title=title or subtitle.title or subtitle.file_name,
+            description=subtitle.description,
+            enclosure=subtitle.enclosure,
+            page_url=subtitle.page_url,
+            size=subtitle.size,
+            grabs=subtitle.grabs,
+            pubdate=subtitle.pubdate,
+            date_elapsed=subtitle.date_elapsed,
+        )
+
+    @staticmethod
+    def __build_subtitle_names(subtitle: SubtitleInfo) -> List[str]:
+        """
+        提取字幕标题、下载文件名和描述，作为精确匹配的名称候选。
+        """
+        return list(dict.fromkeys(
+            name.strip()
+            for name in (subtitle.title, subtitle.file_name, subtitle.description)
+            if name and name.strip()
+        ))
+
+    @staticmethod
+    def __build_subtitle_meta(title: str,
+                              subtitle: SubtitleInfo,
+                              custom_words: Optional[List[str]] = None) -> MetaInfo:
+        """
+        识别字幕名称。
+        """
+        return MetaInfo(
+            title=title,
+            subtitle=subtitle.description,
+            custom_words=custom_words,
+        )
+
+    @staticmethod
+    def __match_subtitle_episode(meta: MetaInfo,
+                                 season_episodes: Optional[Dict[int, List[int]]],
+                                 episode: Optional[int] = None) -> bool:
+        """
+        判断字幕识别出的季集是否落在目标媒体季集内。
+        """
+        if not season_episodes:
+            return True
+        subtitle_torrent = TorrentInfo(title=meta.org_string)
+        if not TorrentHelper.match_season_episodes(
+                torrent=subtitle_torrent,
+                meta=meta,
+                season_episodes=season_episodes):
+            return False
+        if episode is not None:
+            return bool(meta.episode_list) and episode in meta.episode_list
+        return True
+
+    def __parse_subtitle_result(self,
+                                subtitles: List[SubtitleInfo],
+                                mediainfo: MediaInfo,
+                                keyword: Optional[str] = None,
+                                season_episodes: Optional[Dict[int, List[int]]] = None,
+                                episode: Optional[int] = None,
+                                custom_words: Optional[List[str]] = None) -> List[SubtitleInfo]:
+        """
+        识别并精确匹配字幕搜索结果，不使用任何过滤规则。
+        """
+        if not subtitles:
+            logger.warn(f'{keyword or mediainfo.title} 未搜索到字幕')
+            return []
+
+        match_subtitles = []
+        logger.info(f"开始匹配字幕 标题：{mediainfo.title}，原标题：{mediainfo.original_title}，别名：{mediainfo.names}")
+        for subtitle in subtitles:
+            if global_vars.is_system_stopped:
+                break
+            subtitle_names = self.__build_subtitle_names(subtitle)
+            if not subtitle_names:
+                continue
+
+            for subtitle_name in subtitle_names:
+                subtitle_meta = self.__build_subtitle_meta(
+                    title=subtitle_name,
+                    subtitle=subtitle,
+                    custom_words=custom_words,
+                )
+                if not self.__match_subtitle_episode(
+                        meta=subtitle_meta,
+                        season_episodes=season_episodes,
+                        episode=episode):
+                    continue
+
+                subtitle_torrent = self.__build_subtitle_torrent(
+                    subtitle=subtitle,
+                    title=subtitle_name,
+                )
+                if TorrentHelper.match_torrent(
+                        mediainfo=mediainfo,
+                        torrent_meta=subtitle_meta,
+                        torrent=subtitle_torrent):
+                    match_subtitles.append(subtitle)
+                    break
+
+        logger.info(f"字幕匹配完成，共匹配到 {len(match_subtitles)} 个字幕")
+        return self.__remove_duplicate_subtitles(match_subtitles)
+
+    @staticmethod
+    def __remove_duplicate_subtitles(subtitles: List[SubtitleInfo]) -> List[SubtitleInfo]:
+        """
+        去除重复的字幕结果。
+        """
+        return list({
+            f"{subtitle.site_name}_{subtitle.torrent_id}_{subtitle.subtitle_id}_{subtitle.title}_{subtitle.enclosure}": subtitle
+            for subtitle in subtitles
+        }.values())
+
+    async def __async_search_subtitles_for_media(self,
+                                                 mediainfo: MediaInfo,
+                                                 tmdbid: Optional[int] = None,
+                                                 doubanid: Optional[str] = None,
+                                                 season: Optional[int] = None,
+                                                 episode: Optional[int] = None,
+                                                 sites: List[int] = None,
+                                                 custom_words: List[str] = None) -> List[SubtitleInfo]:
+        """
+        根据媒体信息搜索并精确匹配字幕结果。
+        """
+        if not mediainfo.tmdb_id:
+            meta = MetaInfo(title=mediainfo.title)
+            mediainfo.title = meta.name
+            mediainfo.season = meta.begin_season
+        logger.info(f'开始精确搜索字幕，关键词：{mediainfo.title} ...')
+
+        if not mediainfo.names:
+            mediainfo = await self.async_recognize_media(mtype=mediainfo.type,
+                                                         tmdbid=mediainfo.tmdb_id,
+                                                         doubanid=mediainfo.douban_id)
+            if not mediainfo:
+                logger.error('媒体信息识别失败！')
+                return []
+
+        no_exists = None
+        if season is not None:
+            no_exists = {
+                tmdbid or doubanid: {
+                    season: NotExistMediaInfo(episodes=[episode] if episode is not None else [])
+                }
+            }
+        season_episodes, keywords = self.__prepare_params(
+            mediainfo=mediainfo,
+            no_exists=no_exists,
+        )
+        season_episodes = self.__build_subtitle_season_episodes(
+            mediainfo=mediainfo,
+            season=season,
+            episode=episode,
+        ) or season_episodes
+
+        subtitles: List[SubtitleInfo] = []
+        search_count = 0
+        for search_word in keywords:
+            if search_count > 0:
+                logger.info(f"已搜索 {search_count} 次，强制休眠 1-10 秒 ...")
+                await asyncio.sleep(random.randint(1, 10))
+            subtitles.extend(
+                await self.__async_search_subtitles_all_sites(
+                    keyword=search_word,
+                    sites=sites,
+                ) or []
+            )
+            search_count += 1
+            if not settings.SEARCH_MULTIPLE_NAME and subtitles:
+                logger.info(f"共搜索到 {len(subtitles)} 个字幕，停止搜索")
+                break
+
+        return await run_in_threadpool(
+            self.__parse_subtitle_result,
+            subtitles=subtitles,
+            mediainfo=mediainfo,
+            keyword=mediainfo.title,
+            season_episodes=season_episodes,
+            episode=episode,
+            custom_words=custom_words,
+        )
+
+    async def __async_search_subtitles_for_media_stream(
+            self,
+            mediainfo: MediaInfo,
+            tmdbid: Optional[int] = None,
+            doubanid: Optional[str] = None,
+            season: Optional[int] = None,
+            episode: Optional[int] = None,
+            sites: List[int] = None,
+            custom_words: List[str] = None,
+    ) -> AsyncIterator[Dict[str, Any]]:
+        """
+        根据媒体信息渐进式搜索并精确匹配字幕结果。
+        """
+        if not mediainfo.tmdb_id:
+            meta = MetaInfo(title=mediainfo.title)
+            mediainfo.title = meta.name
+            mediainfo.season = meta.begin_season
+        logger.info(f'开始渐进式精确搜索字幕，关键词：{mediainfo.title} ...')
+
+        if not mediainfo.names:
+            mediainfo = await self.async_recognize_media(mtype=mediainfo.type,
+                                                         tmdbid=mediainfo.tmdb_id,
+                                                         doubanid=mediainfo.douban_id)
+            if not mediainfo:
+                logger.error('媒体信息识别失败！')
+                yield {
+                    "type": "error",
+                    "success": False,
+                    "message": "媒体信息识别失败"
+                }
+                return
+
+        no_exists = None
+        if season is not None:
+            no_exists = {
+                tmdbid or doubanid: {
+                    season: NotExistMediaInfo(episodes=[episode] if episode is not None else [])
+                }
+            }
+        season_episodes, keywords = self.__prepare_params(
+            mediainfo=mediainfo,
+            no_exists=no_exists,
+        )
+        season_episodes = self.__build_subtitle_season_episodes(
+            mediainfo=mediainfo,
+            season=season,
+            episode=episode,
+        ) or season_episodes
+
+        subtitles: List[SubtitleInfo] = []
+        search_count = 0
+        for search_word in keywords:
+            if search_count > 0:
+                logger.info(f"已搜索 {search_count} 次，强制休眠 1-10 秒 ...")
+                await asyncio.sleep(random.randint(1, 10))
+
+            async for event in self.__async_search_subtitles_all_sites_stream(
+                    keyword=search_word,
+                    sites=sites):
+                result = event.pop("items", []) or []
+                subtitles.extend(result)
+                yield {
+                    **event,
+                    "type": "append",
+                    "stage": "searching",
+                    "items": [subtitle.to_dict() for subtitle in result],
+                    "total_items": len(subtitles)
+                }
+
+            search_count += 1
+            if not settings.SEARCH_MULTIPLE_NAME and subtitles:
+                logger.info(f"共搜索到 {len(subtitles)} 个字幕，停止搜索")
+                break
+
+        yield {
+            "type": "progress",
+            "stage": "filtering",
+            "value": 98,
+            "text": f"正在识别匹配 {len(subtitles)} 个候选字幕 ..."
+        }
+
+        match_subtitles = await run_in_threadpool(
+            self.__parse_subtitle_result,
+            subtitles=subtitles,
+            mediainfo=mediainfo,
+            keyword=mediainfo.title,
+            season_episodes=season_episodes,
+            episode=episode,
+            custom_words=custom_words,
+        )
+        final_items = [subtitle.to_dict() for subtitle in match_subtitles]
+        yield {
+            "type": "replace",
+            "stage": "filtered",
+            "value": 100,
+            "text": f"识别匹配完成，共 {len(match_subtitles)} 个字幕",
+            "items": final_items,
+            "total_items": len(match_subtitles)
+        }
+        yield {
+            "type": "done",
+            "stage": "done",
+            "text": f"搜索完成，共 {len(match_subtitles)} 个字幕",
+            "items": final_items,
+            "total_items": len(match_subtitles),
+            "subtitles": match_subtitles
+        }
+
     def __search_all_sites(self, keyword: str,
                            mediainfo: Optional[MediaInfo] = None,
                            sites: List[int] = None,
@@ -1101,42 +1826,72 @@ class SearchChain(ChainBase):
         progress.start()
         # 开始计时
         start_time = datetime.now()
+        search_pages = self._build_search_pages(page)
         # 总数
-        total_num = len(indexer_sites)
+        total_num = len(indexer_sites) * len(search_pages)
         # 完成数
         finish_count = 0
         # 更新进度
         progress.update(value=0,
-                        text=f"开始搜索，共 {total_num} 个站点 ...")
+                        text=f"开始搜索，共 {len(indexer_sites)} 个站点，{len(search_pages)} 页 ...")
         # 结果集
         results = []
-        # 多线程
-        with ThreadPoolExecutor(max_workers=len(indexer_sites)) as executor:
-            all_task = []
-            for site in indexer_sites:
+        # 同一站点按页顺序抓取，避免空页后仍继续请求该站点的后续页。
+        max_workers = min(len(indexer_sites), settings.CONF.threadpool or len(indexer_sites))
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            pending_tasks = {}
+
+            def submit_site_page(site: dict, page_index: int):
+                """
+                提交单个站点页搜索任务，并记录该任务对应的站点和页码位置。
+                """
+                search_page = search_pages[page_index]
+                search_keyword = mediainfo.imdb_id if area == "imdbid" and mediainfo else keyword
                 if area == "imdbid":
                     # 搜索IMDBID
                     task = executor.submit(self.search_torrents, site=site,
-                                           keyword=mediainfo.imdb_id if mediainfo else None,
+                                           keyword=search_keyword,
                                            mtype=mediainfo.type if mediainfo else None,
-                                           page=page)
+                                           page=search_page)
                 else:
                     # 搜索标题
                     task = executor.submit(self.search_torrents, site=site,
-                                           keyword=keyword,
+                                           keyword=search_keyword,
                                            mtype=mediainfo.type if mediainfo else None,
-                                           page=page)
-                all_task.append(task)
-            for future in as_completed(all_task):
-                if global_vars.is_system_stopped:
-                    break
-                finish_count += 1
-                result = future.result()
-                if result:
-                    results.extend(result)
-                logger.info(f"站点搜索进度：{finish_count} / {total_num}")
-                progress.update(value=finish_count / total_num * 100,
-                                text=f"正在搜索{keyword or ''}，已完成 {finish_count} / {total_num} 个站点 ...")
+                                           page=search_page)
+                pending_tasks[task] = (site, page_index, search_page, search_keyword)
+
+            for site in indexer_sites:
+                submit_site_page(site=site, page_index=0)
+
+            try:
+                while pending_tasks:
+                    if global_vars.is_system_stopped:
+                        break
+                    done_tasks, _ = wait(pending_tasks, return_when=FIRST_COMPLETED)
+                    for future in done_tasks:
+                        site, page_index, search_page, search_keyword = pending_tasks.pop(future)
+                        finish_count += 1
+                        result = future.result()
+                        if result:
+                            results.extend(result)
+                        if (
+                            self._should_continue_search_pages(
+                                site=site, page_results=result, keyword=search_keyword
+                            )
+                            and page_index + 1 < len(search_pages)
+                        ):
+                            submit_site_page(site=site, page_index=page_index + 1)
+                        else:
+                            logger.debug(
+                                f"{site.get('name')} 第 {search_page} 页返回 {len(result or [])} 条，停止继续翻页"
+                            )
+                        logger.info(f"站点搜索进度：{finish_count} / {total_num}")
+                        progress.update(value=finish_count / total_num * 100,
+                                        text=f"正在搜索{keyword or ''}，已完成 {finish_count} / {total_num} 个请求 ...")
+            finally:
+                for task in pending_tasks:
+                    task.cancel()
         # 计算耗时
         end_time = datetime.now()
         # 更新进度
@@ -1183,44 +1938,83 @@ class SearchChain(ChainBase):
         progress.start()
         # 开始计时
         start_time = datetime.now()
+        search_pages = self._build_search_pages(page)
         # 总数
-        total_num = len(indexer_sites)
+        total_num = len(indexer_sites) * len(search_pages)
         # 完成数
         finish_count = 0
         # 更新进度
         progress.update(value=0,
-                        text=f"开始搜索，共 {total_num} 个站点 ...")
+                        text=f"开始搜索，共 {len(indexer_sites)} 个站点，{len(search_pages)} 页 ...")
         # 结果集
         results = []
+        semaphore = asyncio.Semaphore(settings.CONF.threadpool or total_num)
 
-        # 创建异步任务列表
-        tasks = []
-        for site in indexer_sites:
-            if area == "imdbid":
-                # 搜索IMDBID
-                task = self.async_search_torrents(site=site,
-                                                  keyword=mediainfo.imdb_id if mediainfo else None,
-                                                  mtype=mediainfo.type if mediainfo else None,
-                                                  page=page)
-            else:
+        async def search_site_page(site: dict, search_page: int) -> List[TorrentInfo]:
+            """
+            控制单次站点页请求的并发量，并返回该页的资源列表。
+            """
+            async with semaphore:
+                if area == "imdbid":
+                    # 搜索IMDBID
+                    return await self.async_search_torrents(site=site,
+                                                            keyword=mediainfo.imdb_id if mediainfo else None,
+                                                            mtype=mediainfo.type if mediainfo else None,
+                                                            page=search_page)
                 # 搜索标题
-                task = self.async_search_torrents(site=site,
-                                                  keyword=keyword,
-                                                  mtype=mediainfo.type if mediainfo else None,
-                                                  page=page)
-            tasks.append(task)
+                return await self.async_search_torrents(site=site,
+                                                        keyword=keyword,
+                                                        mtype=mediainfo.type if mediainfo else None,
+                                                        page=search_page)
 
-        # 使用asyncio.as_completed来处理并发任务
-        for future in asyncio.as_completed(tasks):
-            if global_vars.is_system_stopped:
-                break
-            finish_count += 1
-            result = await future
-            if result:
-                results.extend(result)
-            logger.info(f"站点搜索进度：{finish_count} / {total_num}")
-            progress.update(value=finish_count / total_num * 100,
-                            text=f"正在搜索{keyword or ''}，已完成 {finish_count} / {total_num} 个站点 ...")
+        pending_tasks = {}
+
+        def submit_site_page(site: dict, page_index: int):
+            """
+            提交异步站点页搜索任务，并记录该任务对应的站点和页码位置。
+            """
+            search_page = search_pages[page_index]
+            search_keyword = mediainfo.imdb_id if area == "imdbid" and mediainfo else keyword
+            task = asyncio.create_task(search_site_page(site=site, search_page=search_page))
+            pending_tasks[task] = (site, page_index, search_page, search_keyword)
+
+        for site in indexer_sites:
+            submit_site_page(site=site, page_index=0)
+
+        try:
+            while pending_tasks:
+                if global_vars.is_system_stopped:
+                    break
+                done_tasks, _ = await asyncio.wait(
+                    pending_tasks.keys(),
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                for future in done_tasks:
+                    site, page_index, search_page, search_keyword = pending_tasks.pop(future)
+                    finish_count += 1
+                    result = await future
+                    if result:
+                        results.extend(result)
+                    if (
+                        self._should_continue_search_pages(
+                            site=site, page_results=result, keyword=search_keyword
+                        )
+                        and page_index + 1 < len(search_pages)
+                    ):
+                        submit_site_page(site=site, page_index=page_index + 1)
+                    else:
+                        logger.debug(
+                            f"{site.get('name')} 第 {search_page} 页返回 {len(result or [])} 条，停止继续翻页"
+                        )
+                    logger.info(f"站点搜索进度：{finish_count} / {total_num}")
+                    progress.update(value=finish_count / total_num * 100,
+                                    text=f"正在搜索{keyword or ''}，已完成 {finish_count} / {total_num} 个请求 ...")
+        finally:
+            for task in pending_tasks:
+                if not task.done():
+                    task.cancel()
+            if pending_tasks:
+                await asyncio.gather(*pending_tasks.keys(), return_exceptions=True)
 
         # 计算耗时
         end_time = datetime.now()
@@ -1271,67 +2065,332 @@ class SearchChain(ChainBase):
         progress = ProgressHelper(ProgressKey.Search)
         progress.start()
         start_time = datetime.now()
-        total_num = len(indexer_sites)
+        search_pages = self._build_search_pages(page)
+        total_num = len(indexer_sites) * len(search_pages)
         finish_count = 0
         progress.update(value=0,
-                        text=f"开始搜索，共 {total_num} 个站点 ...")
+                        text=f"开始搜索，共 {len(indexer_sites)} 个站点，{len(search_pages)} 页 ...")
         yield {
             "type": "progress",
             "stage": "searching",
             "value": 0,
-            "text": f"开始搜索，共 {total_num} 个站点 ...",
+            "text": f"开始搜索，共 {len(indexer_sites)} 个站点，{len(search_pages)} 页 ...",
             "items": [],
             "finished": 0,
             "total": total_num
         }
 
-        async def search_site(site: dict) -> Tuple[dict, List[TorrentInfo]]:
-            if area == "imdbid":
-                site_result = await self.async_search_torrents(site=site,
-                                                               keyword=mediainfo.imdb_id if mediainfo else None,
-                                                               mtype=mediainfo.type if mediainfo else None,
-                                                               page=page)
-            else:
-                site_result = await self.async_search_torrents(site=site,
-                                                               keyword=keyword,
-                                                               mtype=mediainfo.type if mediainfo else None,
-                                                               page=page)
-            return site, site_result or []
+        semaphore = asyncio.Semaphore(settings.CONF.threadpool or total_num)
 
-        tasks = [asyncio.create_task(search_site(site)) for site in indexer_sites]
+        async def search_site(site: dict, search_page: int) -> List[TorrentInfo]:
+            """
+            搜索单个站点页，用于渐进式返回入口。
+            """
+            async with semaphore:
+                if area == "imdbid":
+                    site_result = await self.async_search_torrents(site=site,
+                                                                   keyword=mediainfo.imdb_id if mediainfo else None,
+                                                                   mtype=mediainfo.type if mediainfo else None,
+                                                                   page=search_page)
+                else:
+                    site_result = await self.async_search_torrents(site=site,
+                                                                   keyword=keyword,
+                                                                   mtype=mediainfo.type if mediainfo else None,
+                                                                   page=search_page)
+                return site_result or []
+
+        tasks = {}
+
+        def submit_site_page(site: dict, page_index: int):
+            """
+            提交渐进式站点页搜索任务，并保留站点和页码上下文。
+            """
+            search_page = search_pages[page_index]
+            search_keyword = mediainfo.imdb_id if area == "imdbid" and mediainfo else keyword
+            task = asyncio.create_task(search_site(site=site, search_page=search_page))
+            tasks[task] = (site, page_index, search_page, search_keyword)
+
+        for site in indexer_sites:
+            submit_site_page(site=site, page_index=0)
+
         results_count = 0
         try:
-            for future in asyncio.as_completed(tasks):
+            while tasks:
                 if global_vars.is_system_stopped:
                     break
-                finish_count += 1
-                site, result = await future
-                results_count += len(result)
-                logger.info(f"站点搜索进度：{finish_count} / {total_num}")
-                progress_value = finish_count / total_num * 100
-                progress_text = f"正在搜索{keyword or ''}，已完成 {finish_count} / {total_num} 个站点 ..."
-                progress.update(value=progress_value, text=progress_text)
-                yield {
-                    "type": "append",
-                    "stage": "searching",
-                    "value": progress_value,
-                    "text": progress_text,
-                    "items": result,
-                    "site": site.get("name"),
-                    "site_id": site.get("id"),
-                    "finished": finish_count,
-                    "total": total_num,
-                    "total_items": results_count
-                }
+                done_tasks, _ = await asyncio.wait(
+                    tasks.keys(),
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                for future in done_tasks:
+                    site, page_index, search_page, search_keyword = tasks.pop(future)
+                    finish_count += 1
+                    result = await future
+                    results_count += len(result)
+                    if (
+                        self._should_continue_search_pages(
+                            site=site, page_results=result, keyword=search_keyword
+                        )
+                        and page_index + 1 < len(search_pages)
+                    ):
+                        submit_site_page(site=site, page_index=page_index + 1)
+                    else:
+                        logger.debug(
+                            f"{site.get('name')} 第 {search_page} 页返回 {len(result)} 条，停止继续翻页"
+                        )
+                    logger.info(f"站点搜索进度：{finish_count} / {total_num}")
+                    progress_value = finish_count / total_num * 100
+                    progress_text = f"正在搜索{keyword or ''}，已完成 {finish_count} / {total_num} 个请求 ..."
+                    progress.update(value=progress_value, text=progress_text)
+                    yield {
+                        "type": "append",
+                        "stage": "searching",
+                        "value": progress_value,
+                        "text": progress_text,
+                        "items": result,
+                        "site": site.get("name"),
+                        "site_id": site.get("id"),
+                        "page": search_page,
+                        "finished": finish_count,
+                        "total": total_num,
+                        "total_items": results_count
+                    }
         finally:
             for task in tasks:
                 if not task.done():
                     task.cancel()
+            if tasks:
+                await asyncio.gather(*tasks.keys(), return_exceptions=True)
 
         end_time = datetime.now()
         progress.update(value=100,
                         text=f"站点搜索完成，有效资源数：{results_count}，总耗时 {(end_time - start_time).seconds} 秒")
         logger.info(f"站点搜索完成，有效资源数：{results_count}，总耗时 {(end_time - start_time).seconds} 秒")
+        progress.end()
+
+    async def __async_search_subtitles_all_sites(self, keyword: str,
+                                                 sites: List[int] = None,
+                                                 page: Optional[int] = 0) -> Optional[List[SubtitleInfo]]:
+        """
+        异步搜索多个站点的字幕资源。
+        :param keyword: 搜索关键词
+        :param sites: 指定站点ID列表，如有则只搜索指定站点，否则搜索所有站点
+        :param page: 搜索页码
+        :reutrn: 字幕资源列表
+        """
+        indexer_sites = []
+
+        if not sites:
+            sites = SystemConfigOper().get(SystemConfigKey.IndexerSites) or []
+
+        for indexer in await SitesHelper().async_get_indexers():
+            if not indexer.get("subtitles"):
+                continue
+            if not sites or indexer.get("id") in sites:
+                indexer_sites.append(indexer)
+        if not indexer_sites:
+            logger.warn('未开启任何支持字幕搜索的有效站点，无法搜索字幕')
+            return []
+
+        progress = ProgressHelper(ProgressKey.Search)
+        progress.start()
+        start_time = datetime.now()
+        search_pages = self._build_search_pages(page)
+        total_num = len(indexer_sites) * len(search_pages)
+        finish_count = 0
+        progress.update(value=0,
+                        text=f"开始搜索字幕，共 {len(indexer_sites)} 个站点，{len(search_pages)} 页 ...")
+        results = []
+        semaphore = asyncio.Semaphore(settings.CONF.threadpool or total_num)
+
+        async def search_site_page(site: dict, search_page: int) -> List[SubtitleInfo]:
+            """
+            控制单次字幕站点页请求的并发量，并返回该页的字幕列表。
+            """
+            async with semaphore:
+                return await self.async_search_subtitles(
+                    site=site, keyword=keyword, page=search_page
+                )
+
+        pending_tasks = {}
+
+        def submit_site_page(site: dict, page_index: int):
+            """
+            提交异步字幕站点页搜索任务，并记录站点和页码位置。
+            """
+            search_page = search_pages[page_index]
+            task = asyncio.create_task(search_site_page(site=site, search_page=search_page))
+            pending_tasks[task] = (site, page_index, search_page)
+
+        for site in indexer_sites:
+            submit_site_page(site=site, page_index=0)
+
+        try:
+            while pending_tasks:
+                if global_vars.is_system_stopped:
+                    break
+                done_tasks, _ = await asyncio.wait(
+                    pending_tasks.keys(),
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                for future in done_tasks:
+                    site, page_index, search_page = pending_tasks.pop(future)
+                    finish_count += 1
+                    result = await future
+                    if result:
+                        results.extend(result)
+                    if (
+                            self._should_continue_subtitle_search_pages(site=site, page_results=result)
+                            and page_index + 1 < len(search_pages)
+                    ):
+                        submit_site_page(site=site, page_index=page_index + 1)
+                    else:
+                        logger.debug(
+                            f"{site.get('name')} 字幕第 {search_page} 页返回 {len(result or [])} 条，停止继续翻页"
+                        )
+                    logger.info(f"站点字幕搜索进度：{finish_count} / {total_num}")
+                    progress.update(value=finish_count / total_num * 100,
+                                    text=f"正在搜索字幕{keyword or ''}，已完成 {finish_count} / {total_num} 个请求 ...")
+        finally:
+            for task in pending_tasks:
+                if not task.done():
+                    task.cancel()
+            if pending_tasks:
+                await asyncio.gather(*pending_tasks.keys(), return_exceptions=True)
+
+        end_time = datetime.now()
+        progress.update(value=100,
+                        text=f"站点字幕搜索完成，有效字幕数：{len(results)}，总耗时 {(end_time - start_time).seconds} 秒")
+        logger.info(f"站点字幕搜索完成，有效字幕数：{len(results)}，总耗时 {(end_time - start_time).seconds} 秒")
+        progress.end()
+        return results
+
+    async def __async_search_subtitles_all_sites_stream(self, keyword: str,
+                                                        sites: List[int] = None,
+                                                        page: Optional[int] = 0) -> AsyncIterator[Dict[str, Any]]:
+        """
+        异步搜索多个站点的字幕资源，按站点完成顺序渐进式返回结果。
+        :param keyword: 搜索关键词
+        :param sites: 指定站点ID列表，如有则只搜索指定站点，否则搜索所有站点
+        :param page: 搜索页码
+        """
+        indexer_sites = []
+
+        if not sites:
+            sites = SystemConfigOper().get(SystemConfigKey.IndexerSites) or []
+
+        for indexer in await SitesHelper().async_get_indexers():
+            if not indexer.get("subtitles"):
+                continue
+            if not sites or indexer.get("id") in sites:
+                indexer_sites.append(indexer)
+        if not indexer_sites:
+            logger.warn('未开启任何支持字幕搜索的有效站点，无法搜索字幕')
+            yield {
+                "type": "done",
+                "stage": "searching",
+                "value": 100,
+                "text": "未开启任何支持字幕搜索的有效站点，无法搜索字幕",
+                "items": [],
+                "finished": 0,
+                "total": 0
+            }
+            return
+
+        progress = ProgressHelper(ProgressKey.Search)
+        progress.start()
+        start_time = datetime.now()
+        search_pages = self._build_search_pages(page)
+        total_num = len(indexer_sites) * len(search_pages)
+        finish_count = 0
+        progress.update(value=0,
+                        text=f"开始搜索字幕，共 {len(indexer_sites)} 个站点，{len(search_pages)} 页 ...")
+        yield {
+            "type": "progress",
+            "stage": "searching",
+            "value": 0,
+            "text": f"开始搜索字幕，共 {len(indexer_sites)} 个站点，{len(search_pages)} 页 ...",
+            "items": [],
+            "finished": 0,
+            "total": total_num
+        }
+
+        semaphore = asyncio.Semaphore(settings.CONF.threadpool or total_num)
+
+        async def search_site(site: dict, search_page: int) -> List[SubtitleInfo]:
+            """
+            搜索单个站点字幕页，用于渐进式返回入口。
+            """
+            async with semaphore:
+                site_result = await self.async_search_subtitles(
+                    site=site, keyword=keyword, page=search_page
+                )
+                return site_result or []
+
+        tasks = {}
+
+        def submit_site_page(site: dict, page_index: int):
+            """
+            提交渐进式字幕站点页搜索任务，并保留站点和页码上下文。
+            """
+            search_page = search_pages[page_index]
+            task = asyncio.create_task(search_site(site=site, search_page=search_page))
+            tasks[task] = (site, page_index, search_page)
+
+        for site in indexer_sites:
+            submit_site_page(site=site, page_index=0)
+
+        results_count = 0
+        try:
+            while tasks:
+                if global_vars.is_system_stopped:
+                    break
+                done_tasks, _ = await asyncio.wait(
+                    tasks.keys(),
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                for future in done_tasks:
+                    site, page_index, search_page = tasks.pop(future)
+                    finish_count += 1
+                    result = await future
+                    results_count += len(result)
+                    if (
+                            self._should_continue_subtitle_search_pages(site=site, page_results=result)
+                            and page_index + 1 < len(search_pages)
+                    ):
+                        submit_site_page(site=site, page_index=page_index + 1)
+                    else:
+                        logger.debug(
+                            f"{site.get('name')} 字幕第 {search_page} 页返回 {len(result)} 条，停止继续翻页"
+                        )
+                    logger.info(f"站点字幕搜索进度：{finish_count} / {total_num}")
+                    progress_value = finish_count / total_num * 100
+                    progress_text = f"正在搜索字幕{keyword or ''}，已完成 {finish_count} / {total_num} 个请求 ..."
+                    progress.update(value=progress_value, text=progress_text)
+                    yield {
+                        "type": "append",
+                        "stage": "searching",
+                        "value": progress_value,
+                        "text": progress_text,
+                        "items": result,
+                        "site": site.get("name"),
+                        "site_id": site.get("id"),
+                        "page": search_page,
+                        "finished": finish_count,
+                        "total": total_num,
+                        "total_items": results_count
+                    }
+        finally:
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            if tasks:
+                await asyncio.gather(*tasks.keys(), return_exceptions=True)
+
+        end_time = datetime.now()
+        progress.update(value=100,
+                        text=f"站点字幕搜索完成，有效字幕数：{results_count}，总耗时 {(end_time - start_time).seconds} 秒")
+        logger.info(f"站点字幕搜索完成，有效字幕数：{results_count}，总耗时 {(end_time - start_time).seconds} 秒")
         progress.end()
 
     @eventmanager.register(EventType.SiteDeleted)

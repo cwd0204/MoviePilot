@@ -7,6 +7,7 @@ from typing import Any, Optional
 from app.core.config import settings
 from app.core.plugin import PluginManager
 from app.db.systemconfig_oper import SystemConfigOper
+from app.helper.server import MoviePilotServerHelper
 from app.helper.plugin import PluginHelper
 from app.schemas.types import SystemConfigKey
 
@@ -93,10 +94,86 @@ def summarize_plugin(plugin: Any) -> dict[str, Any]:
         "plugin_author": getattr(plugin, "plugin_author", None),
         "installed": bool(getattr(plugin, "installed", False)),
         "has_update": bool(getattr(plugin, "has_update", False)),
+        "system_version_compatible": getattr(plugin, "system_version_compatible", True) is not False,
+        "system_version": getattr(plugin, "system_version", None),
+        "system_version_message": getattr(plugin, "system_version_message", None),
         "state": bool(getattr(plugin, "state", False)),
         "repo_url": repo_url,
         "source": "local_repo" if PluginHelper.is_local_repo_url(repo_url) else "market",
     }
+
+
+def _merge_plugin_source_metadata(plugin: Any, source_plugin: Any) -> Any:
+    """
+    将插件市场或本地仓库中的来源元数据合并到已安装插件对象。
+    """
+    repo_url = getattr(source_plugin, "repo_url", None)
+    if repo_url:
+        setattr(plugin, "repo_url", repo_url)
+
+    for attr in (
+        "has_update",
+        "release",
+        "system_version",
+        "system_version_compatible",
+        "system_version_message",
+    ):
+        value = getattr(source_plugin, attr, None)
+        if value is not None:
+            setattr(plugin, attr, value)
+
+    return plugin
+
+
+def _map_plugins_by_id(plugins: list[Any]) -> dict[str, Any]:
+    """
+    按插件 ID 建立稳定映射，保留同 ID 首个候选来源。
+    """
+    plugin_map: dict[str, Any] = {}
+    for plugin in plugins:
+        plugin_id = getattr(plugin, "id", None)
+        if plugin_id and plugin_id not in plugin_map:
+            plugin_map[plugin_id] = plugin
+    return plugin_map
+
+
+async def enrich_installed_plugin_sources(
+    installed_plugins: list[Any],
+    force_refresh: bool = False,
+) -> list[Any]:
+    """
+    为已安装插件补齐安装来源仓库地址。
+
+    本地插件对象只包含运行目录中的静态元数据，通常没有 repo_url。这里按需从
+    本地插件仓库和插件市场补齐来源，保证 Agent 后续安装、升级判断可以拿到仓库地址。
+    """
+    missing_source_plugins = [
+        plugin for plugin in installed_plugins if not getattr(plugin, "repo_url", None)
+    ]
+    if not missing_source_plugins:
+        return installed_plugins
+
+    plugin_manager = PluginManager()
+    local_repo_map = _map_plugins_by_id(plugin_manager.get_local_repo_plugins())
+    for plugin in missing_source_plugins:
+        source_plugin = local_repo_map.get(getattr(plugin, "id", None))
+        if source_plugin:
+            _merge_plugin_source_metadata(plugin, source_plugin)
+
+    missing_source_plugins = [
+        plugin for plugin in installed_plugins if not getattr(plugin, "repo_url", None)
+    ]
+    if not missing_source_plugins:
+        return installed_plugins
+
+    market_plugins = await plugin_manager.async_get_online_plugins(force=force_refresh)
+    market_map = _map_plugins_by_id(market_plugins or [])
+    for plugin in missing_source_plugins:
+        source_plugin = market_map.get(getattr(plugin, "id", None))
+        if source_plugin:
+            _merge_plugin_source_metadata(plugin, source_plugin)
+
+    return installed_plugins
 
 
 async def load_market_plugins(force_refresh: bool = False) -> list[Any]:
@@ -226,7 +303,7 @@ async def install_plugin_runtime(
     refreshed_only = False
     if not force and plugin_id in plugin_manager.get_plugin_ids():
         refreshed_only = True
-        await plugin_helper.async_install_reg(pid=plugin_id, repo_url=repo_url)
+        await MoviePilotServerHelper.async_install_plugin_reg(plugin_id=plugin_id, repo_url=repo_url)
         message = "插件已存在，已刷新加载"
     else:
         if not repo_url:
@@ -238,6 +315,7 @@ async def install_plugin_runtime(
         )
         if not state:
             return False, message, False
+        await MoviePilotServerHelper.async_install_plugin_reg(plugin_id=plugin_id, repo_url=repo_url)
 
     if plugin_id not in install_plugins:
         install_plugins.append(plugin_id)
@@ -245,7 +323,9 @@ async def install_plugin_runtime(
             SystemConfigKey.UserInstalledPlugins, install_plugins
         )
 
-    reload_plugin_runtime(plugin_id)
+    from app.agent.tools.base import run_agent_blocking
+
+    await run_agent_blocking("plugin", reload_plugin_runtime, plugin_id)
     return True, message or "插件安装成功", refreshed_only
 
 

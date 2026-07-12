@@ -7,6 +7,32 @@ from pydantic import BaseModel, Field, field_validator
 from app.schemas.types import ContentType, NotificationType, MessageChannel
 
 
+class NotificationClearScope(str, Enum):
+    """
+    通知中心清理范围。
+    """
+
+    # 全部消息
+    All = "all"
+    # 系统消息
+    System = "system"
+    # 媒体消息
+    Media = "media"
+
+
+class NotificationClearBefore(BaseModel):
+    """
+    通知中心按范围记录的清理时间。
+    """
+
+    # 全部消息清理时间
+    all: int = 0
+    # 系统消息清理时间
+    system: int = 0
+    # 媒体消息清理时间
+    media: int = 0
+
+
 class MessageResponse(BaseModel):
     """
     消息发送响应，包含消息ID等信息用于后续编辑
@@ -24,6 +50,37 @@ class MessageResponse(BaseModel):
     metadata: Optional[Dict[str, Any]] = None
     # 是否发送成功
     success: bool = False
+
+
+class NotificationHistoryItem(BaseModel):
+    """
+    通知历史记录。
+    """
+
+    # 消息ID
+    id: Optional[int] = None
+    # 消息渠道
+    channel: Optional[str] = None
+    # 消息来源
+    source: Optional[str] = None
+    # 消息类型
+    mtype: Optional[str] = None
+    # 标题
+    title: Optional[str] = None
+    # 文本内容
+    text: Optional[str] = None
+    # 图片
+    image: Optional[str] = None
+    # 链接
+    link: Optional[str] = None
+    # 用户ID
+    userid: Optional[str] = None
+    # 登记时间
+    reg_time: Optional[str] = None
+    # 消息方向：0-接收消息，1-发送消息
+    action: Optional[int] = None
+    # 附件json
+    note: Optional[Union[list, dict]] = None
 
 
 class CommingMessage(BaseModel):
@@ -118,6 +175,8 @@ class CommingMessage(BaseModel):
     message_id: Optional[Union[str, int]] = None
     # 聊天ID（用于回调时定位聊天）
     chat_id: Optional[str] = None
+    # 回复目标消息ID（用于 ForceReply 等回复场景）
+    reply_to_message_id: Optional[Union[str, int]] = None
     # 完整的回调查询信息（原始数据）
     callback_query: Optional[Dict] = None
     # 图片列表（图片URL或file_id）
@@ -186,12 +245,18 @@ class Notification(BaseModel):
     targets: Optional[dict] = None
     # 按钮列表，格式：[[{"text": "按钮文本", "callback_data": "回调数据", "url": "链接"}]]
     buttons: Optional[List[List[dict]]] = None
+    # Telegram ForceReply 回复标记
+    force_reply: bool = False
     # 原消息ID，用于编辑消息
     original_message_id: Optional[Union[str, int]] = None
     # 原消息的聊天ID，用于编辑消息
     original_chat_id: Optional[str] = None
     # 是否禁用链接预览（仅Telegram支持）
     disable_web_page_preview: Optional[bool] = None
+    # Telegram 消息格式类型，默认 MarkdownV2，可传 HTML
+    parse_mode: Optional[str] = None
+    # 是否写入消息历史
+    save_history: bool = True
 
     def to_dict(self):
         """
@@ -250,6 +315,60 @@ class SubscriptionMessage(BaseModel):
     data: Optional[dict] = Field(default_factory=dict)
 
 
+class AgentWebChatRequest(BaseModel):
+    """
+    Web 智能助手对话请求。
+    """
+
+    class AgentWebChatFile(BaseModel):
+        """
+        Web 智能助手输入附件。
+        """
+
+        ref: str = Field(..., min_length=1)
+        name: Optional[str] = Field(None)
+        mime_type: Optional[str] = Field(None)
+        size: Optional[int] = Field(None)
+        local_path: Optional[str] = Field(None)
+        status: Optional[str] = Field(None)
+
+    # 用户本轮输入
+    text: str = Field(default="")
+    # 展示历史中记录的用户可读文本；为空时使用 text
+    display_text: Optional[str] = Field(None)
+    # 前端会话标识，相同标识复用同一段 Agent 记忆
+    session_id: Optional[str] = Field(None)
+    # 图片 URL 或 data URL 列表
+    images: Optional[List[str]] = Field(default_factory=list)
+    # 语音/音频引用列表
+    audio_refs: Optional[List[str]] = Field(default_factory=list)
+    # 文件附件列表
+    files: Optional[List[AgentWebChatFile]] = Field(default_factory=list)
+    # 用户通过按钮选择时的完整选择快照
+    choice_selection: Optional[Dict[str, Any]] = Field(default=None)
+    # WebAgent 按钮回调关联的原消息 ID，用于传统交互原地编辑卡片
+    original_message_id: Optional[Union[str, int]] = Field(default=None)
+    # WebAgent 按钮回调关联的原聊天 ID，用于传统交互原地编辑卡片
+    original_chat_id: Optional[Union[str, int]] = Field(default=None)
+    # 是否在展示历史中记录本轮用户消息
+    echo_user: bool = Field(default=True)
+
+
+class AgentWebChoiceRequest(BaseModel):
+    """
+    Web 智能助手按钮选择请求。
+    """
+
+    # 前端会话标识，用于保持与原对话窗口的关联
+    session_id: Optional[str] = Field(None)
+    # Agent 工具生成的按钮回调数据
+    callback_data: str = Field(..., min_length=1)
+    # WebAgent 原助手消息 ID，用于传统按钮回调原地编辑
+    original_message_id: Optional[Union[str, int]] = Field(default=None)
+    # WebAgent 原聊天 ID，用于传统按钮回调原地编辑
+    original_chat_id: Optional[Union[str, int]] = Field(default=None)
+
+
 class ChannelCapability(Enum):
     """
     渠道能力枚举
@@ -273,6 +392,8 @@ class ChannelCapability(Enum):
     IMAGES = "images"
     # 支持链接
     LINKS = "links"
+    # 支持原生语音输出
+    AUDIO_OUTPUT = "audio_output"
     # 支持文件发送
     FILE_SENDING = "file_sending"
     # 支持可收口的消息处理状态提示，如 reaction 或 typing
@@ -313,6 +434,7 @@ class ChannelCapabilityManager:
                 ChannelCapability.RICH_TEXT,
                 ChannelCapability.IMAGES,
                 ChannelCapability.LINKS,
+                ChannelCapability.AUDIO_OUTPUT,
                 ChannelCapability.FILE_SENDING,
                 ChannelCapability.PROCESSING_STATUS,
             },
@@ -327,6 +449,7 @@ class ChannelCapabilityManager:
             capabilities={
                 ChannelCapability.IMAGES,
                 ChannelCapability.LINKS,
+                ChannelCapability.AUDIO_OUTPUT,
                 ChannelCapability.MENU_COMMANDS,
             },
             fallback_enabled=True,
@@ -341,6 +464,7 @@ class ChannelCapabilityManager:
                 ChannelCapability.RICH_TEXT,
                 ChannelCapability.IMAGES,
                 ChannelCapability.LINKS,
+                ChannelCapability.AUDIO_OUTPUT,
                 ChannelCapability.FILE_SENDING,
                 ChannelCapability.PROCESSING_STATUS,
             },
@@ -439,13 +563,33 @@ class ChannelCapabilityManager:
             },
             fallback_enabled=True,
         ),
+        MessageChannel.WebAgent: ChannelCapabilities(
+            channel=MessageChannel.WebAgent,
+            capabilities={
+                ChannelCapability.INLINE_BUTTONS,
+                ChannelCapability.CALLBACK_QUERIES,
+                ChannelCapability.MESSAGE_EDITING,
+                ChannelCapability.MARKDOWN,
+                ChannelCapability.RICH_TEXT,
+                ChannelCapability.IMAGES,
+                ChannelCapability.LINKS,
+                ChannelCapability.AUDIO_OUTPUT,
+                ChannelCapability.FILE_SENDING,
+            },
+            fallback_enabled=False,
+        ),
         MessageChannel.QQ: ChannelCapabilities(
             channel=MessageChannel.QQ,
             capabilities={
                 ChannelCapability.RICH_TEXT,
                 ChannelCapability.IMAGES,
                 ChannelCapability.LINKS,
+                ChannelCapability.INLINE_BUTTONS,
+                ChannelCapability.CALLBACK_QUERIES,
             },
+            max_buttons_per_row=5,
+            max_button_rows=5,
+            max_button_text_length=30,
             fallback_enabled=True,
         ),
     }

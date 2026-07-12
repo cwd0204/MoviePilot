@@ -6,13 +6,13 @@ from typing import Optional, Type
 from pydantic import BaseModel, Field
 
 from app.agent.tools.base import MoviePilotTool
+from app.agent.tools.tags import ToolTag
 from app.chain.tmdb import TmdbChain
 from app.log import logger
 
 
 class QueryEpisodeScheduleInput(BaseModel):
     """查询剧集上映时间工具的输入参数模型"""
-    explanation: str = Field(..., description="Clear explanation of why this tool is being used in the current context")
     tmdb_id: int = Field(..., description="TMDB ID of the TV series (can be obtained from search_media tool)")
     season: int = Field(..., description="Season number to query")
     episode_group: Optional[str] = Field(None, description="Episode group ID (optional)")
@@ -20,6 +20,10 @@ class QueryEpisodeScheduleInput(BaseModel):
 
 class QueryEpisodeScheduleTool(MoviePilotTool):
     name: str = "query_episode_schedule"
+    tags: list[str] = [
+        ToolTag.Read,
+        ToolTag.Media,
+    ]
     description: str = "Query TV series episode air dates and schedule. Returns non-duplicated schedule fields, including episode list, air-date statistics, and per-episode metadata. Filters out episodes without air dates."
     args_schema: Type[BaseModel] = QueryEpisodeScheduleInput
 

@@ -1,3 +1,4 @@
+import hashlib
 import json
 import time
 from datetime import datetime
@@ -14,6 +15,10 @@ from app.schemas.types import StorageSchema
 from app.utils.http import RequestUtils
 from app.utils.singleton import WeakSingleton
 from app.utils.url import UrlUtils
+
+
+# OpenList/AList 在 per_page<=0 时会退回后端默认 200，显式指定最大页大小避免大目录被截断。
+OPENLIST_MAX_LIST_PAGE_SIZE = 500
 
 
 class Alist(StorageBase, metaclass=WeakSingleton):
@@ -60,6 +65,29 @@ class Alist(StorageBase, metaclass=WeakSingleton):
             if fileitem:
                 return fileitem
         return None
+
+    def __build_transfer_item(
+            self, source_item: schemas.FileItem, target_path: Path
+    ) -> schemas.FileItem:
+        """
+        根据目标路径构造文件项，用于 OpenList 操作成功但元数据短时间不可见的场景。
+        目录项路径需要遵循 FileItem 以斜杠结尾的约定。
+        """
+        target_path_str = target_path.as_posix()
+        if source_item.type == "dir" and not target_path_str.endswith("/"):
+            target_path_str = f"{target_path_str}/"
+
+        return schemas.FileItem(
+            storage=self.schema.value,
+            type=source_item.type,
+            path=target_path_str,
+            name=target_path.name,
+            basename=target_path.stem,
+            extension=target_path.suffix[1:] if source_item.type != "dir" else None,
+            size=getattr(source_item, "size", None),
+            modify_time=getattr(source_item, "modify_time", None),
+            thumbnail=getattr(source_item, "thumbnail", None),
+        )
 
     @property
     def __get_base_url(self) -> str:
@@ -178,6 +206,8 @@ class Alist(StorageBase, metaclass=WeakSingleton):
             return []
         items = []
         current_page = page
+        auto_page = per_page <= 0
+        effective_per_page = OPENLIST_MAX_LIST_PAGE_SIZE if auto_page else per_page
         while True:
             resp = RequestUtils(headers=self.__get_header_with_token()).post_res(
                 self.__get_api_url("/api/fs/list"),
@@ -185,7 +215,7 @@ class Alist(StorageBase, metaclass=WeakSingleton):
                     "path": fileitem.path,
                     "password": password,
                     "page": current_page,
-                    "per_page": per_page,
+                    "per_page": effective_per_page,
                     "refresh": refresh,
                 },
             )
@@ -244,7 +274,8 @@ class Alist(StorageBase, metaclass=WeakSingleton):
                 )
                 return []
 
-            page_content = result["data"].get("content") or []
+            page_data = result["data"]
+            page_content = page_data.get("content") or []
             items.extend(
                 [
                     schemas.FileItem(
@@ -263,11 +294,15 @@ class Alist(StorageBase, metaclass=WeakSingleton):
                 ]
             )
 
-            if per_page > 0:
+            if not auto_page:
                 return items
 
-            total = result["data"].get("total") or 0
+            total = page_data.get("filtered_total") or page_data.get("total") or 0
+            pages_total = page_data.get("pages_total") or 0
+            has_more = page_data.get("has_more")
             if not page_content or len(items) >= total:
+                return items
+            if has_more is False or (pages_total and current_page >= pages_total):
                 return items
 
             current_page += 1
@@ -313,7 +348,18 @@ class Alist(StorageBase, metaclass=WeakSingleton):
             )
             return None
 
-        return self._delay_get_item(path, refresh=True)
+        return self._delay_get_item(
+            path, refresh=True
+        ) or self.__build_transfer_item(
+            schemas.FileItem(
+                storage=self.schema.value,
+                type="dir",
+                path=fileitem.path,
+                name=name,
+                basename=Path(name).stem,
+            ),
+            path,
+        )
 
     def get_folder(self, path: Path) -> Optional[schemas.FileItem]:
         """
@@ -433,57 +479,24 @@ class Alist(StorageBase, metaclass=WeakSingleton):
         """
         return self.get_folder(Path(fileitem.path).parent)
 
-    def __is_empty_dir(self, fileitem: schemas.FileItem) -> bool:
-        """
-        判断目录是否为空
-
-        :param fileitem: 文件项
-        :return: 是否为空目录
-        """
-        if fileitem.type != "dir":
-            return False
-        # 获取目录内容
-        items = self.list(fileitem)
-        return len(items) == 0
-
     def delete(self, fileitem: schemas.FileItem) -> bool:
         """
-        删除文件或目录，空目录用专用API
+        删除文件或目录
 
         :param fileitem: 文件项
         :return: 是否删除成功
         """
-        # 如果是空目录，优先用 remove_empty_directory
-        if fileitem.type == "dir" and self.__is_empty_dir(fileitem):
-            resp = RequestUtils(headers=self.__get_header_with_token()).post_res(
-                self.__get_api_url("/api/fs/remove_empty_directory"),
-                json={
-                    "src_dir": fileitem.path,
-                },
-            )
-            if resp is None:
-                logger.warn(
-                    f"【OpenList】请求删除空目录 {fileitem.path} 失败，无法连接alist服务"
-                )
-                return False
-            if resp.status_code != 200:
-                logger.warn(
-                    f"【OpenList】请求删除空目录 {fileitem.path} 失败，状态码：{resp.status_code}"
-                )
-                return False
-            result = resp.json()
-            if result["code"] != 200:
-                logger.warn(
-                    f"【OpenList】删除空目录 {fileitem.path} 失败，错误信息：{result['message']}"
-                )
-                return False
-            return True
-        # 其它情况（文件或非空目录）
+        path = Path(fileitem.path)
+        name = fileitem.name or path.name
+        if not name:
+            logger.warn(f"【OpenList】删除路径 {fileitem.path} 无效")
+            return False
+
         resp = RequestUtils(headers=self.__get_header_with_token()).post_res(
             self.__get_api_url("/api/fs/remove"),
             json={
-                "dir": Path(fileitem.path).parent.as_posix(),
-                "names": [fileitem.name],
+                "dir": path.parent.as_posix(),
+                "names": [name],
             },
         )
         if resp is None:
@@ -663,6 +676,7 @@ class Alist(StorageBase, metaclass=WeakSingleton):
             # 获取文件大小
             target_name = new_name or path.name
             target_path = Path(fileitem.path) / target_name
+            stat = path.stat()
 
             # 初始化进度回调
             progress_callback = transfer_process(path.as_posix())
@@ -673,6 +687,9 @@ class Alist(StorageBase, metaclass=WeakSingleton):
             headers.setdefault("Content-Type", "application/octet-stream")
             headers.setdefault("As-Task", str(task).lower())
             headers.setdefault("File-Path", encoded_path)
+            headers.setdefault("Content-Length", str(stat.st_size))
+            headers.setdefault("Last-Modified", str(int(stat.st_mtime * 1000)))
+            headers.update(self.__get_upload_hash_headers(path))
 
             # 创建自定义的文件流，支持进度回调
             class ProgressFileReader:
@@ -738,6 +755,28 @@ class Alist(StorageBase, metaclass=WeakSingleton):
             logger.error(f"【OpenList】上传文件 {path} 失败：{e}")
             return None
 
+    @staticmethod
+    def __get_upload_hash_headers(path: Path) -> dict:
+        """
+        计算 OpenList 秒传所需的文件哈希请求头。
+        """
+        md5_hash = hashlib.md5()
+        sha1_hash = hashlib.sha1()
+        sha256_hash = hashlib.sha256()
+        with open(path, "rb") as file_handler:
+            while True:
+                chunk = file_handler.read(1024 * 1024)
+                if not chunk:
+                    break
+                md5_hash.update(chunk)
+                sha1_hash.update(chunk)
+                sha256_hash.update(chunk)
+        return {
+            "X-File-Md5": md5_hash.hexdigest(),
+            "X-File-Sha1": sha1_hash.hexdigest(),
+            "X-File-Sha256": sha256_hash.hexdigest(),
+        }
+
     def detail(self, fileitem: schemas.FileItem) -> Optional[schemas.FileItem]:
         """
         获取文件详情
@@ -799,6 +838,28 @@ class Alist(StorageBase, metaclass=WeakSingleton):
                 self.rename(new_item, new_name)
         return True
 
+    def copy_item(
+            self, fileitem: schemas.FileItem, path: Path, new_name: str
+    ) -> Optional[schemas.FileItem]:
+        """
+        复制文件并返回目标文件项，兼容 OpenList 成功响应不携带目标对象的格式。
+        """
+        if not self.copy(fileitem=fileitem, path=path, new_name=new_name):
+            return None
+        target_path = path / new_name
+        target_item = self._delay_get_item(target_path, refresh=True)
+        if target_item:
+            return target_item
+        if fileitem.name == new_name:
+            return self.__build_transfer_item(fileitem, target_path)
+
+        copied_item = self._delay_get_item(path / fileitem.name, refresh=True)
+        if copied_item and self.rename(copied_item, new_name):
+            return self._delay_get_item(
+                target_path, refresh=True
+            ) or self.__build_transfer_item(fileitem, target_path)
+        return None
+
     def move(self, fileitem: schemas.FileItem, path: Path, new_name: str) -> bool:
         """
         移动文件
@@ -851,6 +912,19 @@ class Alist(StorageBase, metaclass=WeakSingleton):
             )
             return False
         return True
+
+    def move_item(
+            self, fileitem: schemas.FileItem, path: Path, new_name: str
+    ) -> Optional[schemas.FileItem]:
+        """
+        移动文件并返回目标文件项，兼容 OpenList 成功响应不携带目标对象的格式。
+        """
+        if not self.move(fileitem=fileitem, path=path, new_name=new_name):
+            return None
+        target_path = path / new_name
+        return self._delay_get_item(target_path, refresh=True) or self.__build_transfer_item(
+            fileitem, target_path
+        )
 
     def link(self, fileitem: schemas.FileItem, target_file: Path) -> bool:
         """

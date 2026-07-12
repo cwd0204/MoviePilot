@@ -22,10 +22,13 @@ from app.db.models.siteuserdata import SiteUserData
 from app.db.site_oper import SiteOper
 from app.db.systemconfig_oper import SystemConfigOper
 from app.db.user_oper import (
+    get_current_active_manage_user,
+    get_current_active_manage_user_async,
     get_current_active_superuser,
     get_current_active_superuser_async,
 )
 from app.helper.sites import SitesHelper  # noqa
+from app.log import logger
 from app.scheduler import Scheduler
 from app.schemas.types import SystemConfigKey, EventType
 from app.utils.string import StringUtils
@@ -36,7 +39,7 @@ router = APIRouter()
 @router.get("/", summary="所有站点", response_model=List[schemas.Site])
 async def read_sites(
     db: AsyncSession = Depends(get_async_db),
-    _: User = Depends(get_current_active_superuser),
+    _: User = Depends(get_current_active_manage_user_async),
 ) -> List[dict]:
     """
     获取站点列表
@@ -49,7 +52,7 @@ async def add_site(
     *,
     db: AsyncSession = Depends(get_async_db),
     site_in: schemas.Site,
-    _: User = Depends(get_current_active_superuser),
+    _: User = Depends(get_current_active_manage_user_async),
 ) -> Any:
     """
     新增站点
@@ -88,7 +91,7 @@ async def update_site(
     *,
     db: AsyncSession = Depends(get_async_db),
     site_in: schemas.Site,
-    _: User = Depends(get_current_active_superuser),
+    _: User = Depends(get_current_active_manage_user_async),
 ) -> Any:
     """
     更新站点信息
@@ -149,7 +152,7 @@ def reset(
 async def update_sites_priority(
     priorities: List[dict],
     db: AsyncSession = Depends(get_async_db),
-    _: User = Depends(get_current_active_superuser_async),
+    _: User = Depends(get_current_active_manage_user_async),
 ) -> Any:
     """
     批量更新站点优先级
@@ -161,6 +164,61 @@ async def update_sites_priority(
     return schemas.Response(success=True)
 
 
+def _update_site_cookie(
+    site_id: int,
+    username: str,
+    password: str,
+    code: Optional[str],
+    db: Session,
+) -> schemas.Response:
+    """
+    执行站点 Cookie 与 UA 更新。
+
+    :param site_id: 站点编号
+    :param username: 站点登录用户名
+    :param password: 站点登录密码
+    :param code: 二步验证码或密钥
+    :param db: 数据库会话
+    :return: 更新结果
+    """
+    site_info = Site.get(db, site_id)
+    if not site_info:
+        raise HTTPException(
+            status_code=404,
+            detail=f"站点 {site_id} 不存在！",
+        )
+    logger.info(f"开始更新站点【{site_info.name}】Cookie&UA")
+    state, message = SiteChain().update_cookie(
+        site_info=site_info, username=username, password=password, two_step_code=code
+    )
+    if state:
+        logger.info(f"站点【{site_info.name}】Cookie&UA更新成功")
+    else:
+        logger.error(f"站点【{site_info.name}】Cookie&UA更新失败：{message}")
+    return schemas.Response(success=state, message=message)
+
+
+@router.post(
+    "/cookie/{site_id}", summary="更新站点Cookie&UA", response_model=schemas.Response
+)
+def update_cookie_by_body(
+    site_id: int,
+    site_cookie_update: schemas.SiteCookieUpdate,
+    db: Session = Depends(get_db),
+    _: User = Depends(get_current_active_manage_user),
+) -> Any:
+    """
+    使用请求体中的用户密码更新站点Cookie
+    """
+    return _update_site_cookie(
+        site_id=site_id,
+        username=site_cookie_update.username,
+        password=site_cookie_update.password,
+        code=site_cookie_update.code,
+        db=db,
+    )
+
+
 @router.get(
     "/cookie/{site_id}", summary="更新站点Cookie&UA", response_model=schemas.Response
 )
@@ -170,23 +228,18 @@ def update_cookie(
     password: str,
     code: Optional[str] = None,
     db: Session = Depends(get_db),
-    _: User = Depends(get_current_active_superuser),
+    _: User = Depends(get_current_active_manage_user),
 ) -> Any:
     """
     使用用户密码更新站点Cookie
     """
-    # 查询站点
-    site_info = Site.get(db, site_id)
-    if not site_info:
-        raise HTTPException(
-            status_code=404,
-            detail=f"站点 {site_id} 不存在！",
-        )
-    # 更新Cookie
-    state, message = SiteChain().update_cookie(
-        site_info=site_info, username=username, password=password, two_step_code=code
+    return _update_site_cookie(
+        site_id=site_id,
+        username=username,
+        password=password,
+        code=code,
+        db=db,
     )
-    return schemas.Response(success=state, message=message)
 
 
 @router.post(
@@ -195,7 +248,7 @@ def update_cookie(
 def refresh_userdata(
     site_id: int,
     db: Session = Depends(get_db),
-    _: User = Depends(get_current_active_superuser),
+    _: User = Depends(get_current_active_manage_user),
 ) -> Any:
     """
     刷新站点用户数据
@@ -222,7 +275,7 @@ def refresh_userdata(
 )
 async def read_userdata_latest(
     db: AsyncSession = Depends(get_async_db),
-    _: User = Depends(get_current_active_superuser_async),
+    _: User = Depends(get_current_active_manage_user_async),
 ) -> Any:
     """
     查询所有站点最新用户数据
@@ -240,7 +293,7 @@ async def read_userdata(
     site_id: int,
     workdate: Optional[str] = None,
     db: AsyncSession = Depends(get_async_db),
-    _: User = Depends(get_current_active_superuser_async),
+    _: User = Depends(get_current_active_manage_user_async),
 ) -> Any:
     """
     查询站点用户数据
@@ -344,7 +397,7 @@ async def site_resource(
     cat: Optional[str] = None,
     page: Optional[int] = 0,
     db: AsyncSession = Depends(get_async_db),
-    _: User = Depends(get_current_active_superuser_async),
+    _: User = Depends(get_current_active_manage_user_async),
 ) -> Any:
     """
     浏览站点资源
@@ -492,7 +545,7 @@ async def support_sites(_: User = Depends(get_current_active_superuser_async)):
 async def read_site(
     site_id: int,
     db: AsyncSession = Depends(get_async_db),
-    _: User = Depends(get_current_active_superuser_async),
+    _: User = Depends(get_current_active_manage_user_async),
 ) -> Any:
     """
     通过ID获取站点信息
@@ -510,7 +563,7 @@ async def read_site(
 async def delete_site(
     site_id: int,
     db: AsyncSession = Depends(get_async_db),
-    _: User = Depends(get_current_active_superuser_async),
+    _: User = Depends(get_current_active_manage_user_async),
 ) -> Any:
     """
     删除站点

@@ -1,11 +1,16 @@
 import asyncio
+import io
 import json
+import re
+import zipfile
 from collections import deque
 from datetime import datetime
+from pathlib import Path
 from typing import Any, Optional, Union, Annotated
 from urllib.parse import urljoin, urlparse
 
 import aiofiles
+import anyio
 import pillow_avif  # noqa 用于自动注册AVIF支持
 from anyio import Path as AsyncPath
 from app.helper.sites import SitesHelper  # noqa  # noqa
@@ -30,11 +35,11 @@ from app.db.user_oper import (
     get_current_active_user_async,
 )
 from app.helper.image import ImageHelper
-from app.helper.mediaserver import MediaServerHelper
+from app.helper.locale import LocaleHelper
 from app.helper.message import MessageHelper
 from app.helper.progress import ProgressHelper
 from app.helper.rule import RuleHelper
-from app.helper.subscribe import SubscribeHelper
+from app.helper.server import MoviePilotServerHelper
 from app.helper.system import SystemHelper
 from app.log import logger
 from app.scheduler import Scheduler
@@ -42,6 +47,7 @@ from app.schemas import ConfigChangeEventData
 from app.schemas.types import SystemConfigKey, EventType
 from app.utils.crypto import HashUtils
 from app.utils.http import RequestUtils, AsyncRequestUtils
+from app.utils import rust_accel
 from app.utils.security import SecurityUtils
 from app.utils.url import UrlUtils
 from version import APP_VERSION
@@ -49,6 +55,113 @@ from version import APP_VERSION
 router = APIRouter()
 
 _NETTEST_REDIRECT_STATUS_CODES = {301, 302, 303, 307, 308}
+_PUBLIC_SYSTEM_CONFIG_KEYS = {
+    item.value: item
+    for item in (
+        SystemConfigKey.Directories,
+        SystemConfigKey.Storages,
+        SystemConfigKey.IndexerSites,
+        SystemConfigKey.EpisodeFormatRuleTable,
+        SystemConfigKey.DefaultMovieSubscribeConfig,
+        SystemConfigKey.DefaultTvSubscribeConfig,
+        SystemConfigKey.FollowSubscribers,
+    )
+}
+_PUBLIC_SETTINGS_KEYS = {"PLUGIN_MARKET"}
+_LOG_DOWNLOAD_LIMIT = 10
+_LOG_DOWNLOAD_NAME_PATTERN = re.compile(r"^[A-Za-z0-9_-]+$")
+_PLUGIN_MARKET_WIKI_START = "<!-- plugin-market-repos:start -->"
+_PLUGIN_MARKET_WIKI_END = "<!-- plugin-market-repos:end -->"
+_PLUGIN_MARKET_WIKI_URL = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Wiki/main/plugin.md"
+_PLUGIN_MARKET_REPO_PATTERN = re.compile(
+    r"https?://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+(?:\.git)?/?",
+    re.IGNORECASE,
+)
+
+
+def _normalize_plugin_market_repo_url(repo_url: str) -> Optional[str]:
+    """
+    规范化插件仓库地址，便于跨来源合并去重。
+    """
+    repo_url = (repo_url or "").strip().rstrip("/")
+    if not repo_url:
+        return None
+    repo_url = repo_url.removesuffix(".git")
+    parsed_url = urlparse(repo_url)
+    if parsed_url.scheme not in {"http", "https"}:
+        return None
+    if (parsed_url.hostname or "").lower() != "github.com":
+        return None
+    paths = [item for item in parsed_url.path.split("/") if item]
+    if len(paths) < 2:
+        return None
+    return f"https://github.com/{paths[0]}/{paths[1]}"
+
+
+def _is_allowed_plugin_market_wiki_url(wiki_url: str) -> bool:
+    """
+    校验插件市场 Wiki 地址是否属于固定文档源。
+    """
+    parsed_url = urlparse(wiki_url)
+    if parsed_url.scheme != "https":
+        return False
+    if (parsed_url.hostname or "").lower() != "raw.githubusercontent.com":
+        return False
+    return bool(
+        re.fullmatch(
+            r"/jxxghp/MoviePilot-Wiki/[^/]+/plugin\.md",
+            parsed_url.path,
+        )
+    )
+
+
+def _split_plugin_market_repo_urls(value: Optional[str]) -> list[str]:
+    """
+    拆分插件市场仓库配置并保持原有顺序去重。
+    """
+    repos: list[str] = []
+    seen_repos = set()
+    for item in re.split(r"[\n,，]+", value or ""):
+        normalized_repo = _normalize_plugin_market_repo_url(item)
+        if not normalized_repo or normalized_repo.lower() in seen_repos:
+            continue
+        repos.append(normalized_repo)
+        seen_repos.add(normalized_repo.lower())
+    return repos
+
+
+def _extract_plugin_market_repos_from_wiki(markdown: str) -> list[str]:
+    """
+    从 Wiki 插件文档中提取插件仓库地址。
+    """
+    content = markdown or ""
+    if _PLUGIN_MARKET_WIKI_START in content and _PLUGIN_MARKET_WIKI_END in content:
+        content = content.split(_PLUGIN_MARKET_WIKI_START, 1)[1].split(_PLUGIN_MARKET_WIKI_END, 1)[0]
+
+    repos: list[str] = []
+    seen_repos = set()
+    for item in _PLUGIN_MARKET_REPO_PATTERN.findall(content):
+        normalized_repo = _normalize_plugin_market_repo_url(item)
+        if not normalized_repo or normalized_repo.lower() in seen_repos:
+            continue
+        repos.append(normalized_repo)
+        seen_repos.add(normalized_repo.lower())
+    return repos
+
+
+def _merge_plugin_market_repos(local_repos: list[str], wiki_repos: list[str]) -> list[str]:
+    """
+    合并本地与 Wiki 插件仓库地址，保留本地顺序并追加 Wiki 新地址。
+    """
+    merged_repos: list[str] = []
+    seen_repos = set()
+    for repo in local_repos + wiki_repos:
+        normalized_repo = _normalize_plugin_market_repo_url(repo)
+        if not normalized_repo or normalized_repo.lower() in seen_repos:
+            continue
+        merged_repos.append(normalized_repo)
+        seen_repos.add(normalized_repo.lower())
+    return merged_repos
 
 
 def _match_nettest_prefix(url: str, prefix: str) -> bool:
@@ -272,6 +385,108 @@ def _build_nettest_rules() -> list[dict[str, Any]]:
     return rules
 
 
+def _collect_named_log_files(name: str) -> list[Path]:
+    """
+    根据前端传入的日志标识收集可下载日志文件。
+
+    `moviepilot` 固定表示主程序日志，其余标识按插件 ID 处理并映射到
+    `plugins/<plugin_id>.log*`。这里不接收路径或后缀，避免下载入口变成任意
+    日志文件选择器；滚动日志按当前文件优先、备份文件按修改时间倒序补足。
+    """
+    normalized_name = (name or "").strip().lower()
+    if not normalized_name or not _LOG_DOWNLOAD_NAME_PATTERN.fullmatch(normalized_name):
+        raise HTTPException(status_code=404, detail="Not Found")
+
+    log_root = settings.LOG_PATH
+    if normalized_name == "moviepilot":
+        log_dir = log_root
+        log_prefix = "moviepilot.log"
+    else:
+        log_dir = log_root / "plugins"
+        log_prefix = f"{normalized_name}.log"
+
+    if not log_dir.exists() or not log_dir.is_dir():
+        raise HTTPException(status_code=404, detail="Not Found")
+
+    current_log = log_dir / log_prefix
+    backup_logs = [
+        item
+        for item in log_dir.iterdir()
+        if item.is_file() and item.name.startswith(f"{log_prefix}.")
+    ]
+    backup_logs.sort(key=lambda item: item.stat().st_mtime, reverse=True)
+
+    log_files = []
+    if current_log.exists() and current_log.is_file():
+        log_files.append(current_log)
+    log_files.extend(backup_logs)
+    return log_files[:_LOG_DOWNLOAD_LIMIT]
+
+
+def _verify_log_resource_superuser(
+    token_payload: schemas.TokenPayload = Depends(verify_resource_token),
+) -> schemas.TokenPayload:
+    """
+    校验日志资源访问权限。
+
+    日志接口通过浏览器新窗口和 EventSource 访问，不能依赖普通 API 请求头；
+    因此这里复用资源 Cookie 完成身份识别，再额外要求管理员身份，避免普通
+    登录用户读取可能包含敏感信息的日志。
+    """
+    if not token_payload.super_user:
+        raise HTTPException(status_code=403, detail="用户权限不足")
+    return token_payload
+
+
+async def _build_log_zip_response(name: str) -> StreamingResponse:
+    """
+    将指定日志标识对应的日志文件打包为 zip 响应。
+
+    打包前逐个校验文件仍位于日志根目录内，避免符号链接或并发文件变更绕过
+    `name` 到固定目录的映射约束。zip 内使用日志根目录相对路径，便于区分
+    主程序日志与插件日志。
+    """
+    zip_data, zip_stem = await anyio.to_thread.run_sync(_build_log_zip_data, name)
+    headers = {
+        "Content-Disposition": f'attachment; filename="{zip_stem}.zip"'
+    }
+    return StreamingResponse(
+        iter([zip_data]),
+        media_type="application/zip",
+        headers=headers,
+    )
+
+
+def _build_log_zip_data(name: str) -> tuple[bytes, str]:
+    """
+    同步生成日志 zip 内容和文件名前缀。
+
+    日志收集、路径解析、文件读取和压缩都属于可能阻塞的本地 I/O；调用方需要
+    将本函数放到 worker thread 中执行，避免日志下载占用 ASGI 事件循环。
+    """
+    log_files = _collect_named_log_files(name)
+    if not log_files:
+        raise HTTPException(status_code=404, detail="Not Found")
+
+    log_root = settings.LOG_PATH
+    zip_buffer = io.BytesIO()
+    filename_time = datetime.now().strftime("%Y%m%d-%H%M%S")
+    safe_name = (name or "logs").strip().lower() or "logs"
+    zip_stem = f"{safe_name}-logs-{filename_time}"
+    with zipfile.ZipFile(zip_buffer, mode="w", compression=zipfile.ZIP_DEFLATED) as archive:
+        for log_file in log_files:
+            if not SecurityUtils.is_safe_path(
+                base_path=log_root,
+                user_path=log_file,
+            ):
+                raise HTTPException(status_code=404, detail="Not Found")
+            arcname = f"{zip_stem}/{log_file.name}"
+            archive.write(log_file, arcname)
+
+    zip_buffer.seek(0)
+    return zip_buffer.getvalue(), zip_stem
+
+
 def _validate_nettest_url(url: str) -> Optional[str]:
     """
     对实际请求地址做基础安全校验。
@@ -358,13 +573,17 @@ async def fetch_image(
     if allowed_domains is None:
         allowed_domains = set(settings.SECURITY_IMAGE_DOMAINS)
 
+    fetch_url = SecurityUtils.strip_url_signature(url)
     # 验证URL安全性
-    if not SecurityUtils.is_safe_url(url, allowed_domains):
-        logger.warn(f"Blocked unsafe image URL: {url}")
+    if not await SecurityUtils.is_safe_image_url_async(
+        url,
+        allowed_domains,
+        allowed_private_ranges=settings.IMAGE_PROXY_ALLOWED_PRIVATE_RANGES,
+    ):
         return None
 
     content = await ImageHelper().async_fetch_image(
-        url=url,
+        url=fetch_url,
         proxy=proxy,
         use_cache=use_cache,
         cookies=cookies,
@@ -379,7 +598,7 @@ async def fetch_image(
         # 返回缓存图片
         return Response(
             content=content,
-            media_type=UrlUtils.get_mime_type(url, "image/jpeg"),
+            media_type=UrlUtils.get_mime_type(fetch_url, "image/jpeg"),
             headers=headers,
         )
     return None
@@ -397,13 +616,7 @@ async def proxy_img(
     """
     图片代理，可选是否使用代理服务器，支持 HTTP 缓存
     """
-    # 媒体服务器添加图片代理支持
-    hosts = [
-        config.config.get("host")
-        for config in MediaServerHelper().get_configs().values()
-        if config and config.config and config.config.get("host")
-    ]
-    allowed_domains = set(settings.SECURITY_IMAGE_DOMAINS) | set(hosts)
+    allowed_domains = set(settings.SECURITY_IMAGE_DOMAINS)
     cookies = (
         MediaServerChain().get_image_cookies(server=None, image_url=imgurl)
         if use_cookies
@@ -476,6 +689,7 @@ async def get_user_global_setting(_: User = Depends(get_current_active_user_asyn
     info = settings.model_dump(
         include={
             "AI_AGENT_ENABLE",
+            "AI_AGENT_HIDE_ENTRY",
             "LLM_SUPPORT_AUDIO_INPUT",
             "LLM_SUPPORT_AUDIO_OUTPUT",
             "RECOGNIZE_SOURCE",
@@ -491,10 +705,10 @@ async def get_user_global_setting(_: User = Depends(get_current_active_user_asyn
         info["LLM_SUPPORT_AUDIO_OUTPUT"] = False
 
     # 追加用户唯一ID和订阅分享管理权限
-    share_admin = SubscribeHelper().is_admin_user()
+    share_admin = await MoviePilotServerHelper.async_is_admin_user()
     info.update(
         {
-            "USER_UNIQUE_ID": SubscribeHelper().get_user_uuid(),
+            "USER_UNIQUE_ID": MoviePilotServerHelper.get_user_uuid(),
             "SUBSCRIBE_SHARE_MANAGE": share_admin,
             "WORKFLOW_SHARE_MANAGE": share_admin,
         }
@@ -503,7 +717,9 @@ async def get_user_global_setting(_: User = Depends(get_current_active_user_asyn
 
 
 @router.get("/env", summary="查询系统配置", response_model=schemas.Response)
-async def get_env_setting(_: User = Depends(get_current_active_user_async)):
+async def get_env_setting(
+    _: User = Depends(get_current_active_superuser_async),
+) -> schemas.Response:
     """
     查询系统环境变量，包括当前版本号（仅管理员）
     """
@@ -514,9 +730,27 @@ async def get_env_setting(_: User = Depends(get_current_active_user_async)):
             "AUTH_VERSION": SitesHelper().auth_version,
             "INDEXER_VERSION": SitesHelper().indexer_version,
             "FRONTEND_VERSION": SystemChain().get_frontend_version(),
+            "RUST_ACCEL_AVAILABLE": rust_accel.is_available(),
+            "RUST_ACCEL_ENABLED": rust_accel.is_enabled(),
         }
     )
     return schemas.Response(success=True, data=info)
+
+
+@router.get("/usage/statistic", summary="查询安装版本统计报表", response_model=schemas.Response)
+async def usage_statistic(_: User = Depends(get_current_active_user_async)):
+    """
+    查询安装版本统计报表
+    """
+    return schemas.Response(success=True, data=await MoviePilotServerHelper.async_get_usage_statistic())
+
+
+@router.get("/ping", summary="服务存活检测", response_model=schemas.Response)
+async def ping(_: User = Depends(get_current_active_user_async)) -> schemas.Response:
+    """
+    检测服务是否可用
+    """
+    return schemas.Response(success=True)
 
 
 @router.post("/env", summary="更新系统配置", response_model=schemas.Response)
@@ -564,13 +798,14 @@ async def get_progress(
     实时获取处理进度，返回格式为SSE
     """
     progress = ProgressHelper(process_type)
+    locale = LocaleHelper.get_current_locale()
 
     async def event_generator():
         try:
             while not global_vars.is_system_stopped:
                 if await request.is_disconnected():
                     break
-                detail = progress.get()
+                detail = progress.get(locale=locale)
                 yield f"data: {json.dumps(detail)}\n\n"
                 await asyncio.sleep(0.5)
         except asyncio.CancelledError:
@@ -579,8 +814,92 @@ async def get_progress(
     return StreamingResponse(event_generator(), media_type="text/event-stream")
 
 
+@router.get("/setting/public/{key}", summary="查询公开系统设置", response_model=schemas.Response)
+async def get_public_setting(
+    key: str, _: User = Depends(get_current_active_user_async)
+) -> schemas.Response:
+    """
+    查询普通用户可读取的非敏感系统设置
+    """
+    if key in _PUBLIC_SETTINGS_KEYS:
+        return schemas.Response(success=True, data={"value": getattr(settings, key)})
+    if key not in _PUBLIC_SYSTEM_CONFIG_KEYS:
+        raise HTTPException(status_code=404, detail="配置项不存在")
+    value = SystemConfigOper().get(_PUBLIC_SYSTEM_CONFIG_KEYS[key])
+    return schemas.Response(success=True, data={"value": value})
+
+
+@router.post(
+    "/setting/PLUGIN_MARKET/sync-wiki",
+    summary="从Wiki同步插件市场仓库",
+    response_model=schemas.Response,
+)
+async def sync_plugin_market_from_wiki(
+    request: Optional[schemas.PluginMarketSyncRequest] = Body(default=None),
+    _: User = Depends(get_current_active_superuser_async),
+) -> schemas.Response:
+    """
+    从 Wiki 插件文档同步插件市场仓库地址。
+    """
+    wiki_url = (request.wiki_url if request else None) or _PLUGIN_MARKET_WIKI_URL
+    wiki_url = wiki_url.strip()
+    if not _is_allowed_plugin_market_wiki_url(wiki_url):
+        return schemas.Response(success=False, message="不支持的 Wiki 同步地址")
+
+    res = await AsyncRequestUtils(
+        ua=settings.USER_AGENT,
+        proxies=settings.PROXY,
+        timeout=30,
+        content_type=None,
+        accept_type="text/plain,*/*",
+    ).get_res(wiki_url)
+    if res is None:
+        return schemas.Response(success=False, message="无法访问 Wiki 插件仓库清单")
+    if res.status_code != 200:
+        return schemas.Response(
+            success=False,
+            message=f"访问 Wiki 插件仓库清单失败，状态码：{res.status_code}",
+        )
+
+    wiki_repos = _extract_plugin_market_repos_from_wiki(res.text)
+    if not wiki_repos:
+        return schemas.Response(success=False, message="未在 Wiki 中识别到插件仓库地址")
+
+    local_repos = _split_plugin_market_repo_urls(settings.PLUGIN_MARKET)
+    local_repo_keys = {repo.lower() for repo in local_repos}
+    added_count = len([repo for repo in wiki_repos if repo.lower() not in local_repo_keys])
+    merged_repos = _merge_plugin_market_repos(local_repos, wiki_repos)
+    merged_value = ",".join(merged_repos)
+
+    success, message = settings.update_setting("PLUGIN_MARKET", merged_value)
+    if success:
+        await eventmanager.async_send_event(
+            etype=EventType.ConfigChanged,
+            data=ConfigChangeEventData(
+                key="PLUGIN_MARKET", value=merged_value, change_type="update"
+            ),
+        )
+    elif success is None:
+        success = True
+
+    return schemas.Response(
+        success=success,
+        message=message,
+        data={
+            "value": merged_value,
+            "repos": merged_repos,
+            "wiki_repos": wiki_repos,
+            "added_count": added_count,
+            "total_count": len(merged_repos),
+            "source_url": wiki_url,
+        },
+    )
+
+
 @router.get("/setting/{key}", summary="查询系统设置", response_model=schemas.Response)
-async def get_setting(key: str, _: User = Depends(get_current_active_user_async)):
+async def get_setting(
+    key: str, _: User = Depends(get_current_active_superuser_async)
+) -> schemas.Response:
     """
     查询系统设置（仅管理员）
     """
@@ -657,7 +976,7 @@ async def get_logging(
     request: Request,
     length: Optional[int] = 50,
     logfile: Optional[str] = "moviepilot.log",
-    _: schemas.TokenPayload = Depends(verify_resource_token),
+    _: schemas.TokenPayload = Depends(_verify_log_resource_superuser),
 ):
     """
     实时获取系统日志
@@ -685,7 +1004,7 @@ async def get_logging(
 
             # 读取历史日志
             async with aiofiles.open(
-                log_path, mode="r", encoding="utf-8", errors="ignore"
+                log_path, mode="r", encoding="utf-8", errors="replace"
             ) as f:
                 # 优化大文件读取策略
                 if file_size > 100 * 1024:
@@ -714,7 +1033,7 @@ async def get_logging(
 
             # 实时监听新日志
             async with aiofiles.open(
-                log_path, mode="r", encoding="utf-8", errors="ignore"
+                log_path, mode="r", encoding="utf-8", errors="replace"
             ) as f:
                 # 移动文件指针到文件末尾，继续监听新增内容
                 await f.seek(0, 2)
@@ -753,7 +1072,7 @@ async def get_logging(
         try:
             # 使用 aiofiles 异步读取文件
             async with aiofiles.open(
-                log_path, mode="r", encoding="utf-8", errors="ignore"
+                log_path, mode="r", encoding="utf-8", errors="replace"
             ) as file:
                 text = await file.read()
             # 倒序输出
@@ -764,6 +1083,17 @@ async def get_logging(
     else:
         # 返回SSE流响应
         return StreamingResponse(log_generator(), media_type="text/event-stream")
+
+
+@router.get("/logging/download/{name}", summary="下载日志")
+async def download_logging(
+    name: str,
+    _: schemas.TokenPayload = Depends(_verify_log_resource_superuser),
+):
+    """
+    按日志标识下载主程序或插件滚动日志，返回 zip 文件。
+    """
+    return await _build_log_zip_response(name)
 
 
 @router.get(
@@ -943,13 +1273,20 @@ def modulelist(_: schemas.TokenPayload = Depends(verify_token)):
     """
     查询已加载的模块ID列表
     """
-    modules = [
-        {
-            "id": k,
-            "name": v.get_name(),
-        }
-        for k, v in ModuleManager().get_modules().items()
-    ]
+    modules = []
+    for module_id, module in ModuleManager().get_modules().items():
+        name = module.get_name()
+        modules.append(
+            {
+                "id": module_id,
+                "name": name,
+                "name_i18n": LocaleHelper.translate(
+                    f"system.modules.{module_id}.name",
+                    default=name,
+                ),
+                "name_key": f"system.modules.{module_id}.name",
+            }
+        )
     return schemas.Response(success=True, data={"modules": modules})
 
 

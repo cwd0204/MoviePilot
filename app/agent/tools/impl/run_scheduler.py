@@ -5,16 +5,13 @@ from typing import Optional, Type
 from pydantic import BaseModel, Field
 
 from app.agent.tools.base import MoviePilotTool
+from app.agent.tools.tags import ToolTag
 from app.log import logger
 
 
 class RunSchedulerInput(BaseModel):
     """运行定时服务工具的输入参数模型"""
 
-    explanation: str = Field(
-        ...,
-        description="Clear explanation of why this tool is being used in the current context",
-    )
     job_id: str = Field(
         ...,
         description="The ID of the scheduled job to run (can be obtained from query_schedulers tool)",
@@ -23,6 +20,11 @@ class RunSchedulerInput(BaseModel):
 
 class RunSchedulerTool(MoviePilotTool):
     name: str = "run_scheduler"
+    tags: list[str] = [
+        ToolTag.Write,
+        ToolTag.Scheduler,
+        ToolTag.Admin,
+    ]
     description: str = "Manually trigger a scheduled task to run immediately. This will execute the specified scheduler job by its ID."
     args_schema: Type[BaseModel] = RunSchedulerInput
     require_admin: bool = True

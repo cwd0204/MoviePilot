@@ -1,25 +1,33 @@
 """查询下载工具"""
 
 import json
-from typing import Any, Dict, List, Optional, Type, Union
+from typing import Any, Dict, List, Optional, Type
 
 from pydantic import BaseModel, Field
 
 from app.agent.tools.base import MoviePilotTool
+from app.agent.tools.tags import ToolTag
 from app.chain.download import DownloadChain
 from app.db.downloadhistory_oper import DownloadHistoryOper
 from app.log import logger
-from app.schemas import TransferTorrent, DownloadingTorrent
-from app.schemas.types import TorrentStatus, media_type_to_agent
+from app.schemas import DownloaderTorrent
+from app.schemas.types import TorrentQueryStatus, media_type_to_agent
 
 
 class QueryDownloadTasksInput(BaseModel):
     """查询下载工具的输入参数模型"""
-    explanation: str = Field(..., description="Clear explanation of why this tool is being used in the current context")
     downloader: Optional[str] = Field(None,
                                       description="Name of specific downloader to query (optional, if not provided queries all configured downloaders)")
     status: Optional[str] = Field("all",
                                   description="Filter downloads by status: 'downloading' for active downloads, 'completed' for finished downloads, 'paused' for paused downloads, 'all' for all downloads")
+    include_all_tags: Optional[bool] = Field(
+        False,
+        description="Include tasks without the MoviePilot built-in tag. Default false keeps the normal MoviePilot task scope.",
+    )
+    include_trackers: Optional[bool] = Field(
+        False,
+        description="Include tracker URLs when supported. Hash queries always include trackers.",
+    )
     hash: Optional[str] = Field(None, description="Query specific download task by hash (optional, if provided will search for this specific task regardless of status)")
     title: Optional[str] = Field(None, description="Query download tasks by title/name (optional, supports partial match, searches all tasks if provided)")
     tag: Optional[str] = Field(None, description="Filter download tasks by tag (optional, supports partial match, e.g. 'movie' will match tasks with tag 'movie' or 'movie_2024')")
@@ -27,30 +35,53 @@ class QueryDownloadTasksInput(BaseModel):
 
 class QueryDownloadTasksTool(MoviePilotTool):
     name: str = "query_download_tasks"
+    tags: list[str] = [
+        ToolTag.Read,
+        ToolTag.Download,
+    ]
     description: str = "Query download status and list download tasks. Can query all active downloads, or search for specific tasks by hash, title, or tag. Shows download progress, completion status, tags, and task details from configured downloaders."
     args_schema: Type[BaseModel] = QueryDownloadTasksInput
 
     @staticmethod
-    def _get_all_torrents(download_chain: DownloadChain, downloader: Optional[str] = None) -> List[Union[TransferTorrent, DownloadingTorrent]]:
+    def _normalize_query_status(status: Optional[str]) -> TorrentQueryStatus:
+        """
+        归一下载任务查询状态。
+        """
+        status_value = str(status or "").strip().lower()
+        if not status_value or status_value == TorrentQueryStatus.ALL.value:
+            return TorrentQueryStatus.ALL
+        if status_value in {"completed", "complete", "seeding"}:
+            return TorrentQueryStatus.COMPLETED
+        if status_value in {"paused", "pause"}:
+            return TorrentQueryStatus.PAUSED
+        if status_value == TorrentQueryStatus.DOWNLOADING.value:
+            return TorrentQueryStatus.DOWNLOADING
+        return TorrentQueryStatus.ALL
+
+    @staticmethod
+    def _normalize_include_all_tags(include_all_tags: Any) -> bool:
+        """
+        归一全部标签查询开关。
+        """
+        if isinstance(include_all_tags, bool):
+            return include_all_tags
+        if isinstance(include_all_tags, str):
+            return include_all_tags.strip().lower() in {"1", "true", "yes", "on", "是"}
+        return bool(include_all_tags)
+
+    @staticmethod
+    def _get_all_torrents(
+        download_chain: DownloadChain,
+        downloader: Optional[str] = None,
+        include_all_tags: bool = False,
+    ) -> List[DownloaderTorrent]:
         """
         查询所有状态的任务（包括下载中和已完成的任务）
         """
-        all_torrents = []
-        # 查询下载的任务
-        downloading_torrents = download_chain.list_torrents(
-            downloader=downloader, 
-            status=TorrentStatus.DOWNLOADING
-        ) or []
-        all_torrents.extend(downloading_torrents)
-        
-        # 查询已完成的任务（可转移状态）
-        transfer_torrents = download_chain.list_torrents(
+        return download_chain.list_torrents(
             downloader=downloader,
-            status=TorrentStatus.TRANSFER
+            include_all_tags=include_all_tags,
         ) or []
-        all_torrents.extend(transfer_torrents)
-        
-        return all_torrents
 
     @staticmethod
     def _format_progress(progress: Optional[float]) -> Optional[str]:
@@ -66,7 +97,7 @@ class QueryDownloadTasksTool(MoviePilotTool):
 
     @staticmethod
     def _apply_download_history(
-        torrent: Union[TransferTorrent, DownloadingTorrent], history: Any
+        torrent: DownloaderTorrent, history: Any
     ) -> None:
         """将下载历史中的补充信息回填到下载任务结果中。"""
         if not history:
@@ -86,7 +117,7 @@ class QueryDownloadTasksTool(MoviePilotTool):
 
     @classmethod
     def _load_history_map(
-        cls, torrents: List[Union[TransferTorrent, DownloadingTorrent]]
+        cls, torrents: List[DownloaderTorrent]
     ) -> Dict[str, Any]:
         """批量加载下载历史，避免逐条查询形成 N+1。"""
         hashes = [torrent.hash for torrent in torrents if getattr(torrent, "hash", None)]
@@ -102,15 +133,23 @@ class QueryDownloadTasksTool(MoviePilotTool):
         hash_value: Optional[str] = None,
         title: Optional[str] = None,
         tag: Optional[str] = None,
+        include_all_tags: bool = False,
+        include_trackers: bool = False,
     ) -> Dict[str, Any]:
         """
         同步查询下载器和下载历史，整个链路放在线程池中执行。
         """
         download_chain = DownloadChain()
+        query_status = cls._normalize_query_status(status)
+        include_all_tags = cls._normalize_include_all_tags(include_all_tags)
 
         if hash_value:
             torrents = (
-                download_chain.list_torrents(downloader=downloader, hashs=[hash_value])
+                download_chain.list_torrents(
+                    downloader=downloader,
+                    hashs=[hash_value],
+                    include_all_tags=include_all_tags,
+                )
                 or []
             )
             if not torrents:
@@ -123,7 +162,11 @@ class QueryDownloadTasksTool(MoviePilotTool):
                 cls._apply_download_history(torrent, history_map.get(torrent.hash))
             filtered_downloads = list(torrents)
         elif title:
-            all_torrents = cls._get_all_torrents(download_chain, downloader)
+            all_torrents = cls._get_all_torrents(
+                download_chain,
+                downloader,
+                include_all_tags=include_all_tags,
+            )
             history_map = cls._load_history_map(all_torrents)
             filtered_downloads = []
             title_lower = title.lower()
@@ -145,7 +188,7 @@ class QueryDownloadTasksTool(MoviePilotTool):
             if not filtered_downloads:
                 return {"message": f"未找到标题包含 '{title}' 的下载任务"}
         else:
-            if status == "downloading":
+            if query_status == TorrentQueryStatus.DOWNLOADING and not include_all_tags:
                 downloads = download_chain.downloading(name=downloader) or []
                 filtered_downloads = [
                     dl
@@ -153,19 +196,12 @@ class QueryDownloadTasksTool(MoviePilotTool):
                     if not downloader or dl.downloader == downloader
                 ]
             else:
-                all_torrents = cls._get_all_torrents(download_chain, downloader)
-                filtered_downloads = []
-                for torrent in all_torrents:
-                    if downloader and torrent.downloader != downloader:
-                        continue
-                    if status == "completed" and torrent.state not in [
-                        "seeding",
-                        "completed",
-                    ]:
-                        continue
-                    if status == "paused" and torrent.state != "paused":
-                        continue
-                    filtered_downloads.append(torrent)
+                list_status = None if query_status == TorrentQueryStatus.ALL else query_status.value
+                filtered_downloads = download_chain.list_torrents(
+                    downloader=downloader,
+                    status=list_status,
+                    include_all_tags=include_all_tags,
+                ) or []
 
                 history_map = cls._load_history_map(filtered_downloads)
                 for torrent in filtered_downloads:
@@ -182,6 +218,16 @@ class QueryDownloadTasksTool(MoviePilotTool):
         if not filtered_downloads:
             return {"message": "未找到相关下载任务"}
 
+        if hash_value or include_trackers:
+            for torrent in filtered_downloads:
+                if not getattr(torrent, "hash", None):
+                    continue
+                tracker_map = download_chain.get_torrent_trackers(
+                    hash_string=torrent.hash,
+                    downloader=getattr(torrent, "downloader", None) or downloader,
+                ) or {}
+                torrent.trackers = tracker_map.get(getattr(torrent, "downloader", None)) or []
+
         return {"downloads": filtered_downloads}
 
     def get_tool_message(self, **kwargs) -> Optional[str]:
@@ -190,6 +236,9 @@ class QueryDownloadTasksTool(MoviePilotTool):
         status = kwargs.get("status", "all")
         hash_value = kwargs.get("hash")
         title = kwargs.get("title")
+        include_all_tags = self._normalize_include_all_tags(
+            kwargs.get("include_all_tags", False)
+        )
         
         parts = ["查询下载任务"]
         
@@ -208,6 +257,10 @@ class QueryDownloadTasksTool(MoviePilotTool):
         tag = kwargs.get("tag")
         if tag:
             parts.append(f"标签: {tag}")
+        if include_all_tags:
+            parts.append("范围: 全部标签")
+        if kwargs.get("include_trackers"):
+            parts.append("包含Tracker")
         
         return " | ".join(parts) if len(parts) > 1 else parts[0]
 
@@ -215,8 +268,15 @@ class QueryDownloadTasksTool(MoviePilotTool):
                   status: Optional[str] = "all",
                   hash: Optional[str] = None,
                   title: Optional[str] = None,
-                  tag: Optional[str] = None, **kwargs) -> str:
-        logger.info(f"执行工具: {self.name}, 参数: downloader={downloader}, status={status}, hash={hash}, title={title}, tag={tag}")
+                  tag: Optional[str] = None,
+                  include_all_tags: Optional[bool] = False,
+                  include_trackers: Optional[bool] = False,
+                  **kwargs) -> str:
+        logger.info(
+            f"执行工具: {self.name}, 参数: downloader={downloader}, status={status}, "
+            f"hash={hash}, title={title}, tag={tag}, include_all_tags={include_all_tags}, "
+            f"include_trackers={include_trackers}"
+        )
         try:
             payload = await self.run_blocking(
                 "downloader",
@@ -226,6 +286,8 @@ class QueryDownloadTasksTool(MoviePilotTool):
                 hash,
                 title,
                 tag,
+                self._normalize_include_all_tags(include_all_tags),
+                self._normalize_include_all_tags(include_trackers),
             )
             if payload.get("message"):
                 return payload["message"]
@@ -251,6 +313,16 @@ class QueryDownloadTasksTool(MoviePilotTool):
                         "upspeed": getattr(d, "upspeed", None),
                         "dlspeed": getattr(d, "dlspeed", None),
                         "tags": d.tags,
+                        "save_path": getattr(d, "save_path", None),
+                        "content_path": getattr(d, "content_path", None) or (
+                            d.path.as_posix() if getattr(d, "path", None) else None
+                        ),
+                        "category": getattr(d, "category", None),
+                        "download_limit": getattr(d, "download_limit", None),
+                        "upload_limit": getattr(d, "upload_limit", None),
+                        "ratio_limit": getattr(d, "ratio_limit", None),
+                        "seeding_time_limit": getattr(d, "seeding_time_limit", None),
+                        "trackers": getattr(d, "trackers", None) or [],
                         "left_time": getattr(d, "left_time", None)
                     }
                     # 精简 media 字段

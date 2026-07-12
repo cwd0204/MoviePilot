@@ -4,9 +4,10 @@ import asyncio
 from datetime import datetime
 from typing import Dict, List, Optional
 
-from langchain_core.messages import BaseMessage
+from langchain_core.messages import BaseMessage, messages_from_dict, messages_to_dict
 
 from app.core.config import settings
+from app.db.agentchat_oper import AgentChatOper
 from app.log import logger
 from app.schemas.agent import ConversationMemory
 
@@ -27,6 +28,8 @@ class MemoryManager:
         初始化记忆管理器
         """
         try:
+            if self.cleanup_task and not self.cleanup_task.done():
+                return
             # 启动内存缓存清理任务（Redis通过TTL自动过期）
             self.cleanup_task = asyncio.create_task(
                 self._cleanup_expired_memories()
@@ -46,6 +49,7 @@ class MemoryManager:
                 await self.cleanup_task
             except asyncio.CancelledError:
                 pass
+            self.cleanup_task = None
 
         logger.info("对话记忆管理器已关闭")
 
@@ -67,24 +71,43 @@ class MemoryManager:
             self, session_id: str, user_id: str
     ) -> List[BaseMessage]:
         """
-        为Agent获取最近的消息（仅内存缓存）
+        为Agent获取最近的消息。
 
-        如果消息Token数量超过模型最大上下文长度的阀值，会自动进行摘要裁剪
+        优先使用内存缓存，缓存不存在时从数据库恢复上一轮持久化的原始 messages。
         """
         memory = self.get_memory(session_id, user_id)
-        if not memory:
+        if memory:
+            return memory.messages
+
+        try:
+            chat = AgentChatOper().get(session_id=session_id, user_id=user_id)
+            if not chat:
+                chat = AgentChatOper().get(session_id=session_id)
+        except Exception as e:
+            logger.debug(f"读取持久化Agent会话失败: {e}")
+            return []
+        if not chat or not chat.agent_messages:
             return []
 
-        # 获取所有消息
+        try:
+            messages = messages_from_dict(chat.agent_messages)
+        except Exception as e:
+            logger.debug(f"恢复持久化Agent消息失败: {e}")
+            return []
+
+        memory = ConversationMemory(
+            session_id=session_id,
+            user_id=user_id,
+            messages=messages,
+        )
+        self.save_memory(memory)
         return memory.messages
 
     def save_agent_messages(
             self, session_id: str, user_id: str, messages: List[BaseMessage]
     ):
         """
-        保存Agent消息（仅内存缓存）
-
-        注意：Redis中的记忆通过TTL机制自动过期，这里只更新内存缓存，Redis会在下次访问时自动过期
+        保存Agent消息到内存缓存与持久化会话表。
         """
         memory = self.get_memory(session_id, user_id)
         if not memory:
@@ -95,6 +118,14 @@ class MemoryManager:
 
         # 更新内存缓存
         self.save_memory(memory)
+        try:
+            AgentChatOper().save_agent_messages(
+                session_id=session_id,
+                user_id=user_id,
+                messages=messages_to_dict(messages),
+            )
+        except Exception as e:
+            logger.debug(f"持久化Agent消息失败: {e}")
 
     def save_memory(self, memory: ConversationMemory):
         """

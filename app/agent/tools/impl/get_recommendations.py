@@ -6,6 +6,7 @@ from typing import Optional, Type
 from pydantic import BaseModel, Field
 
 from app.agent.tools.base import MoviePilotTool
+from app.agent.tools.tags import ToolTag
 from app.chain.recommend import RecommendChain
 from app.log import logger
 from app.schemas.types import MediaType, media_type_to_agent
@@ -14,10 +15,6 @@ from app.schemas.types import MediaType, media_type_to_agent
 class GetRecommendationsInput(BaseModel):
     """获取推荐工具的输入参数模型"""
 
-    explanation: str = Field(
-        ...,
-        description="Clear explanation of why this tool is being used in the current context",
-    )
     source: Optional[str] = Field(
         "tmdb_trending",
         description="Recommendation source: "
@@ -46,6 +43,11 @@ class GetRecommendationsInput(BaseModel):
 
 class GetRecommendationsTool(MoviePilotTool):
     name: str = "get_recommendations"
+    tags: list[str] = [
+        ToolTag.Read,
+        ToolTag.Media,
+        ToolTag.Recommendation,
+    ]
     description: str = "Get trending and popular media recommendations from various sources. Returns curated lists of popular movies, TV shows, and anime based on different criteria like trending, ratings, or calendar schedules. Supports pagination with 20 items per page."
     args_schema: Type[BaseModel] = GetRecommendationsInput
 

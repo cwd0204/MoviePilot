@@ -7,16 +7,13 @@ from pydantic import BaseModel, Field
 
 from app.agent.runtime import agent_runtime_manager
 from app.agent.tools.base import MoviePilotTool
+from app.agent.tools.tags import ToolTag
 from app.log import logger
 
 
 class QueryPersonasInput(BaseModel):
     """查询人格工具的输入参数模型。"""
 
-    explanation: str = Field(
-        ...,
-        description="Clear explanation of why this tool is being used in the current context",
-    )
     query: Optional[str] = Field(
         None,
         description=(
@@ -28,6 +25,10 @@ class QueryPersonasInput(BaseModel):
 
 class QueryPersonasTool(MoviePilotTool):
     name: str = "query_personas"
+    tags: list[str] = [
+        ToolTag.Read,
+        ToolTag.Persona,
+    ]
     description: str = (
         "List all available personas (人格) and show which one is currently active. "
         "Use this before switching persona when the user asks for a different speaking style but does not name "

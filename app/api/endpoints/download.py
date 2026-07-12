@@ -5,19 +5,46 @@ from fastapi import APIRouter, Depends, Body
 from app import schemas
 from app.chain.download import DownloadChain
 from app.chain.media import MediaChain
-from app.core.context import MediaInfo, Context, TorrentInfo
+from app.core.context import MediaInfo, Context, SubtitleInfo, TorrentInfo
 from app.core.metainfo import MetaInfo
 from app.core.security import verify_token
 from app.db.models.user import User
+from app.db.site_oper import SiteOper
 from app.db.systemconfig_oper import SystemConfigOper
 from app.db.user_oper import get_current_active_user
 from app.helper.directory import DirectoryHelper
 from app.schemas.types import SystemConfigKey
+from app.utils.security import SecurityUtils
 
 router = APIRouter()
 
 
-@router.get("/", summary="正在下载", response_model=List[schemas.DownloadingTorrent])
+def _prepare_subtitle_download(subtitle: SubtitleInfo) -> tuple[bool, str]:
+    """
+    校验字幕下载签名，并用服务端站点配置覆盖请求凭据。
+    """
+    if subtitle.site is None:
+        return False, "字幕站点信息为空"
+
+    clean_url = SecurityUtils.verify_signed_url(
+        subtitle.enclosure,
+        purpose=SecurityUtils.subtitle_download_purpose(subtitle.site),
+    )
+    if not clean_url:
+        return False, "字幕下载链接签名无效"
+
+    site = SiteOper().get(subtitle.site)
+    if not site:
+        return False, "字幕站点信息不存在"
+
+    subtitle.enclosure = clean_url
+    subtitle.site_cookie = site.cookie
+    subtitle.site_ua = site.ua
+    subtitle.site_proxy = bool(site.proxy)
+    return True, ""
+
+
+@router.get("/", summary="正在下载", response_model=List[schemas.DownloaderTorrent])
 def current(
     name: Optional[str] = None, _: schemas.TokenPayload = Depends(verify_token)
 ) -> Any:
@@ -112,6 +139,37 @@ def add(
     if not did:
         return schemas.Response(success=False, message="任务添加失败")
     return schemas.Response(success=True, data={"download_id": did})
+
+
+@router.post("/subtitle", summary="下载字幕", response_model=schemas.Response)
+def download_subtitle(
+    subtitle_in: schemas.SubtitleInfo,
+    tmdbid: Annotated[int | None, Body()] = None,
+    doubanid: Annotated[str | None, Body()] = None,
+    save_path: Annotated[str | None, Body()] = None,
+    current_user: User = Depends(get_current_active_user),
+) -> Any:
+    """
+    下载字幕资源。
+    """
+    subtitle_info = SubtitleInfo()
+    subtitle_info.from_dict(subtitle_in.model_dump())
+    valid, message = _prepare_subtitle_download(subtitle_info)
+    if not valid:
+        return schemas.Response(success=False, message=message)
+
+    success, message, saved_files = DownloadChain().download_subtitle(
+        subtitle=subtitle_info,
+        tmdbid=tmdbid,
+        doubanid=doubanid,
+        save_path=save_path,
+        username=current_user.name,
+    )
+    return schemas.Response(
+        success=success,
+        message=message,
+        data={"files": saved_files} if saved_files else None,
+    )
 
 
 @router.get("/start/{hashString}", summary="开始任务", response_model=schemas.Response)

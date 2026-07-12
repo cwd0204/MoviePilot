@@ -6,6 +6,7 @@ from typing import Optional, Type
 from pydantic import BaseModel, Field
 
 from app.agent.tools.base import MoviePilotTool
+from app.agent.tools.tags import ToolTag
 from app.db.subscribe_oper import SubscribeOper
 from app.log import logger
 from app.schemas.subscribe import Subscribe as SubscribeSchema
@@ -47,10 +48,6 @@ QUERY_SUBSCRIBE_OUTPUT_FIELDS = [
 class QuerySubscribesInput(BaseModel):
     """查询订阅工具的输入参数模型"""
 
-    explanation: str = Field(
-        ...,
-        description="Clear explanation of why this tool is being used in the current context",
-    )
     status: Optional[str] = Field(
         "all",
         description="Filter subscriptions by status: 'R' for enabled subscriptions, 'S' for paused ones, 'all' for all subscriptions",
@@ -73,6 +70,10 @@ class QuerySubscribesInput(BaseModel):
 
 class QuerySubscribesTool(MoviePilotTool):
     name: str = "query_subscribes"
+    tags: list[str] = [
+        ToolTag.Read,
+        ToolTag.Subscription,
+    ]
     description: str = "Query subscription status and list user subscriptions. Returns full subscription parameters for each matched subscription. Supports pagination with 100 items per page."
     args_schema: Type[BaseModel] = QuerySubscribesInput
 

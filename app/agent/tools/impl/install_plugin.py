@@ -6,6 +6,7 @@ from typing import Optional, Type
 from pydantic import BaseModel, Field
 
 from app.agent.tools.base import MoviePilotTool
+from app.agent.tools.tags import ToolTag
 from app.agent.tools.impl._plugin_tool_utils import (
     get_plugin_snapshot,
     install_plugin_runtime,
@@ -18,10 +19,6 @@ from app.log import logger
 class InstallPluginInput(BaseModel):
     """安装插件工具的输入参数模型"""
 
-    explanation: str = Field(
-        ...,
-        description="Clear explanation of why this tool is being used in the current context",
-    )
     plugin_id: str = Field(
         ...,
         description="Exact plugin ID to install. Use query_market_plugins first to find the correct plugin_id.",
@@ -38,6 +35,11 @@ class InstallPluginInput(BaseModel):
 
 class InstallPluginTool(MoviePilotTool):
     name: str = "install_plugin"
+    tags: list[str] = [
+        ToolTag.Write,
+        ToolTag.Plugin,
+        ToolTag.Admin,
+    ]
     description: str = (
         "Install a plugin by exact plugin_id from the plugin market or local plugin repositories. "
         "Use query_market_plugins first when you need filtering or discovery."

@@ -6,6 +6,7 @@ from typing import Optional, Type
 from pydantic import BaseModel, Field
 
 from app.agent.tools.base import MoviePilotTool
+from app.agent.tools.tags import ToolTag
 from app.core.plugin import PluginManager
 from app.log import logger
 
@@ -13,10 +14,6 @@ from app.log import logger
 class QueryPluginCapabilitiesInput(BaseModel):
     """查询插件能力工具的输入参数模型"""
 
-    explanation: str = Field(
-        ...,
-        description="Clear explanation of why this tool is being used in the current context",
-    )
     plugin_id: Optional[str] = Field(
         None,
         description="Optional plugin ID to query capabilities for a specific plugin. "
@@ -27,6 +24,11 @@ class QueryPluginCapabilitiesInput(BaseModel):
 
 class QueryPluginCapabilitiesTool(MoviePilotTool):
     name: str = "query_plugin_capabilities"
+    tags: list[str] = [
+        ToolTag.Read,
+        ToolTag.Plugin,
+        ToolTag.Admin,
+    ]
     description: str = (
         "Query the capabilities of installed plugins, including supported commands and scheduled services. "
         "Commands are slash-commands (e.g. /xxx) that can be executed via the run_slash_command tool. "

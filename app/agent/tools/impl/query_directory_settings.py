@@ -6,13 +6,13 @@ from typing import Optional, Type
 from pydantic import BaseModel, Field
 
 from app.agent.tools.base import MoviePilotTool
+from app.agent.tools.tags import ToolTag
 from app.helper.directory import DirectoryHelper
 from app.log import logger
 
 
 class QueryDirectorySettingsInput(BaseModel):
     """查询系统目录设置工具的输入参数模型"""
-    explanation: str = Field(..., description="Clear explanation of why this tool is being used in the current context")
     directory_type: Optional[str] = Field("all",
                                           description="Filter directories by type: 'download' for download directories, 'library' for media library directories, 'all' for all directories")
     storage_type: Optional[str] = Field("all",
@@ -23,6 +23,12 @@ class QueryDirectorySettingsInput(BaseModel):
 
 class QueryDirectorySettingsTool(MoviePilotTool):
     name: str = "query_directory_settings"
+    tags: list[str] = [
+        ToolTag.Read,
+        ToolTag.Directory,
+        ToolTag.Settings,
+        ToolTag.Admin,
+    ]
     description: str = "Query system directory configuration settings (NOT file listings). Returns configured directory paths, storage types, transfer modes, and other directory-related settings. Use 'list_directory' to list actual files and folders in a directory."
     require_admin: bool = True
     args_schema: Type[BaseModel] = QueryDirectorySettingsInput

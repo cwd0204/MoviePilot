@@ -1,21 +1,13 @@
 import base64
 import re
 from datetime import datetime
-from typing import List, Optional, Tuple, Union, Dict
+from typing import Callable, List, Optional, Tuple, Union, Dict
 from urllib.parse import urljoin
 
+from app.helper.sites import SitesHelper  # noqa
 from lxml import etree
 
 from app.chain import ChainBase
-from app.helper.interaction import (
-    SlashInteractionManager,
-    build_navigation_buttons,
-    format_markdown_table,
-    page_items,
-    supports_interaction_buttons,
-    supports_markdown,
-    update_or_post_message,
-)
 from app.core.config import global_vars, settings
 from app.core.event import Event, eventmanager
 from app.db.models.site import Site
@@ -25,15 +17,22 @@ from app.helper.browser import PlaywrightHelper
 from app.helper.cloudflare import under_challenge
 from app.helper.cookie import CookieHelper
 from app.helper.cookiecloud import CookieCloudHelper
+from app.helper.interaction import (
+    SlashInteractionManager,
+    build_navigation_buttons,
+    format_markdown_table,
+    page_items,
+    supports_interaction_buttons,
+    supports_markdown,
+    update_or_post_message,
+)
 from app.helper.rss import RssHelper
-from app.helper.sites import SitesHelper  # noqa
 from app.log import logger
 from app.schemas import MessageChannel, Notification, SiteUserData
 from app.schemas.types import EventType, NotificationType
 from app.utils.http import RequestUtils
 from app.utils.site import SiteUtils
 from app.utils.string import StringUtils
-
 
 site_interaction_manager = SlashInteractionManager()
 
@@ -104,24 +103,54 @@ class SiteChain(ChainBase):
                 ))
         return userdata
 
-    def refresh_userdatas(self) -> Optional[Dict[str, SiteUserData]]:
+    def refresh_userdatas(
+            self,
+            progress_callback: Optional[Callable[..., None]] = None,
+    ) -> Optional[Dict[str, SiteUserData]]:
         """
         刷新所有站点的用户数据
+
+        :param progress_callback: 定时服务进度更新回调
         """
         any_site_updated = False
         result = {}
-        for site in SitesHelper().get_indexers():
+        sites = [site for site in SitesHelper().get_indexers() if site.get("is_active")]
+        total_num = len(sites)
+        if progress_callback:
+            progress_callback(
+                value=0,
+                text=f"开始刷新站点数据，共 {total_num} 个站点 ...",
+                data={"total": total_num, "finished": 0},
+            )
+        for index, site in enumerate(sites, start=1):
             if global_vars.is_system_stopped:
                 return None
-            if site.get("is_active"):
-                userdata = self.refresh_userdata(site)
-                if userdata:
-                    any_site_updated = True
-                    result[site.get("name")] = userdata
+            if progress_callback:
+                progress_callback(
+                    value=(index - 1) / total_num * 100 if total_num else 100,
+                    text=f"正在刷新站点数据（{index}/{total_num}）{site.get('name')} ...",
+                    data={
+                        "total": total_num,
+                        "finished": index - 1,
+                        "current": site.get("id"),
+                    },
+                )
+            userdata = self.refresh_userdata(site)
+            if userdata:
+                any_site_updated = True
+                result[site.get("name")] = userdata
+            if progress_callback:
+                progress_callback(
+                    value=index / total_num * 100 if total_num else 100,
+                    text=f"站点数据（{index}/{total_num}）刷新完成",
+                    data={"total": total_num, "finished": index},
+                )
         if any_site_updated:
             eventmanager.send_event(EventType.SiteRefreshed, {
                 "site_id": "*"
             })
+        if progress_callback:
+            progress_callback(value=100, text="站点数据刷新完成")
 
         return result
 
@@ -324,9 +353,16 @@ class SiteChain(ChainBase):
                 del html
         return favicon_url, None
 
-    def sync_cookies(self, manual=False) -> Tuple[bool, str]:
+    def sync_cookies(
+            self,
+            manual: bool = False,
+            progress_callback: Optional[Callable[..., None]] = None,
+    ) -> Tuple[bool, str]:
         """
         通过CookieCloud同步站点Cookie
+
+        :param manual: 是否手动同步
+        :param progress_callback: 定时服务进度更新回调
         """
 
         def __indexer_domain(inx: dict, sub_domain: str) -> str:
@@ -341,9 +377,13 @@ class SiteChain(ChainBase):
             return sub_domain
 
         logger.info("开始同步CookieCloud站点 ...")
+        if progress_callback:
+            progress_callback(value=0, text="开始下载 CookieCloud 数据 ...")
         cookies, msg = CookieCloudHelper().download()
         if not cookies:
             logger.error(f"CookieCloud同步失败：{msg}")
+            if progress_callback:
+                progress_callback(value=100, text=f"CookieCloud同步失败：{msg}")
             if manual:
                 self.messagehelper.put(msg, title="CookieCloud同步失败", role="system")
             return False, msg
@@ -354,12 +394,23 @@ class SiteChain(ChainBase):
         siteshelper = SitesHelper()
         siteoper = SiteOper()
         rsshelper = RssHelper()
-        for domain, cookie in cookies.items():
+        total_num = len(cookies)
+        for index, (domain, cookie) in enumerate(cookies.items(), start=1):
             # 检查系统是否停止
             if global_vars.is_system_stopped:
                 logger.info("系统正在停止，中断CookieCloud同步")
                 return False, "系统正在停止，同步被中断"
-                
+            if progress_callback:
+                progress_callback(
+                    value=(index - 1) / total_num * 100 if total_num else 100,
+                    text=f"正在同步 CookieCloud 站点（{index}/{total_num}）{domain} ...",
+                    data={
+                        "total": total_num,
+                        "finished": index - 1,
+                        "current": domain,
+                    },
+                )
+
             # 索引器信息
             indexer = siteshelper.get_indexer(domain)
             # 数据库的站点信息
@@ -466,6 +517,12 @@ class SiteChain(ChainBase):
                 eventmanager.send_event(EventType.SiteUpdated, {
                     "domain": domain,
                 })
+            if progress_callback:
+                progress_callback(
+                    value=index / total_num * 100 if total_num else 100,
+                    text=f"CookieCloud 站点（{index}/{total_num}）同步完成",
+                    data={"total": total_num, "finished": index},
+                )
         # 处理完成
         ret_msg = f"更新了{_update_count}个站点，新增了{_add_count}个站点"
         if _fail_count > 0:
@@ -473,6 +530,8 @@ class SiteChain(ChainBase):
         if manual:
             self.messagehelper.put(ret_msg, title="CookieCloud同步成功", role="system")
         logger.info(f"CookieCloud同步成功：{ret_msg}")
+        if progress_callback:
+            progress_callback(value=100, text=f"CookieCloud同步成功：{ret_msg}")
         return True, ret_msg
 
     @eventmanager.register(EventType.SiteUpdated)
@@ -642,11 +701,11 @@ class SiteChain(ChainBase):
         return True, "连接成功"
 
     def remote_list(
-        self,
-        arg_str: str = "",
-        channel: MessageChannel = None,
-        userid: Union[str, int] = None,
-        source: Optional[str] = None,
+            self,
+            arg_str: str = "",
+            channel: MessageChannel = None,
+            userid: Union[str, int] = None,
+            source: Optional[str] = None,
     ):
         """
         /sites 统一入口。
@@ -660,11 +719,11 @@ class SiteChain(ChainBase):
         )
         normalized_arg = (arg_str or "").strip()
         if normalized_arg and self.handle_text_interaction(
-            channel=channel,
-            source=source,
-            userid=userid,
-            username="",
-            text=normalized_arg,
+                channel=channel,
+                source=source,
+                userid=userid,
+                username="",
+                text=normalized_arg,
         ):
             return
         self._render_site_interaction(
@@ -688,14 +747,14 @@ class SiteChain(ChainBase):
         return parts[1], parts[2]
 
     def handle_callback_interaction(
-        self,
-        callback_data: str,
-        channel: MessageChannel,
-        source: str,
-        userid: Union[str, int],
-        username: str,
-        original_message_id: Optional[Union[str, int]] = None,
-        original_chat_id: Optional[str] = None,
+            self,
+            callback_data: str,
+            channel: MessageChannel,
+            source: str,
+            userid: Union[str, int],
+            username: str,
+            original_message_id: Optional[Union[str, int]] = None,
+            original_chat_id: Optional[str] = None,
     ) -> bool:
         """
         处理 /sites 按钮交互。
@@ -760,12 +819,12 @@ class SiteChain(ChainBase):
         return True
 
     def handle_text_interaction(
-        self,
-        channel: MessageChannel,
-        source: str,
-        userid: Union[str, int],
-        username: str,
-        text: str,
+            self,
+            channel: MessageChannel,
+            source: str,
+            userid: Union[str, int],
+            username: str,
+            text: str,
     ) -> bool:
         """
         处理 /sites 文本补充输入。
@@ -790,6 +849,7 @@ class SiteChain(ChainBase):
                     userid=userid,
                     username=username,
                     title="站点交互已结束",
+                    save_history=False,
                 )
             )
             return True
@@ -987,14 +1047,14 @@ class SiteChain(ChainBase):
         return True
 
     def _render_site_interaction(
-        self,
-        request,
-        channel: MessageChannel,
-        source: Optional[str],
-        userid: Union[str, int],
-        username: Optional[str],
-        original_message_id: Optional[Union[str, int]] = None,
-        original_chat_id: Optional[str] = None,
+            self,
+            request,
+            channel: MessageChannel,
+            source: Optional[str],
+            userid: Union[str, int],
+            username: Optional[str],
+            original_message_id: Optional[Union[str, int]] = None,
+            original_chat_id: Optional[str] = None,
     ) -> None:
         """
         渲染 /sites 当前页面。
@@ -1202,7 +1262,8 @@ class SiteChain(ChainBase):
             self.post_message(Notification(
                 channel=channel,
                 title=f"站点编号 {site_id} 不存在！",
-                userid=userid))
+                userid=userid,
+                save_history=False))
             return
         # 禁用站点
         siteoper.update(site_id, {
@@ -1229,7 +1290,9 @@ class SiteChain(ChainBase):
             if not site:
                 self.post_message(Notification(
                     channel=channel,
-                    title=f"站点编号 {site_id} 不存在！", userid=userid))
+                    title=f"站点编号 {site_id} 不存在！",
+                    userid=userid,
+                    save_history=False))
                 return
             # 禁用站点
             siteoper.update(site_id, {
@@ -1280,7 +1343,9 @@ class SiteChain(ChainBase):
             self.post_message(Notification(
                 channel=channel,
                 source=source,
-                title=err_title, userid=userid))
+                title=err_title,
+                userid=userid,
+                save_history=False))
             return
         arg_str = str(arg_str).strip()
         args = arg_str.split()
@@ -1292,14 +1357,18 @@ class SiteChain(ChainBase):
             self.post_message(Notification(
                 channel=channel,
                 source=source,
-                title=err_title, userid=userid))
+                title=err_title,
+                userid=userid,
+                save_history=False))
             return
         site_id = args[0]
         if not site_id.isdigit():
             self.post_message(Notification(
                 channel=channel,
                 source=source,
-                title=err_title, userid=userid))
+                title=err_title,
+                userid=userid,
+                save_history=False))
             return
         # 站点ID
         site_id = int(site_id)
@@ -1309,12 +1378,16 @@ class SiteChain(ChainBase):
             self.post_message(Notification(
                 channel=channel,
                 source=source,
-                title=f"站点编号 {site_id} 不存在！", userid=userid))
+                title=f"站点编号 {site_id} 不存在！",
+                userid=userid,
+                save_history=False))
             return
         self.post_message(Notification(
             channel=channel,
             source=source,
-            title=f"开始更新【{site_info.name}】Cookie&UA ...", userid=userid))
+            title=f"开始更新【{site_info.name}】Cookie&UA ...",
+            userid=userid,
+            save_history=False))
         # 用户名
         username = args[1]
         # 密码
@@ -1331,13 +1404,15 @@ class SiteChain(ChainBase):
                 source=source,
                 title=f"【{site_info.name}】 Cookie&UA更新失败！",
                 text=f"错误原因：{msg}",
-                userid=userid))
+                userid=userid,
+                save_history=False))
         else:
             self.post_message(Notification(
                 channel=channel,
                 source=source,
                 title=f"【{site_info.name}】 Cookie&UA更新成功",
-                userid=userid))
+                userid=userid,
+                save_history=False))
 
     def remote_refresh_userdatas(self, channel: MessageChannel,
                                  userid: Union[str, int] = None, source: Optional[str] = None):
@@ -1349,7 +1424,8 @@ class SiteChain(ChainBase):
             channel=channel,
             source=source,
             title="开始刷新站点数据 ...",
-            userid=userid
+            userid=userid,
+            save_history=False,
         ))
         # 刷新站点数据
         site_datas = self.refresh_userdatas()
@@ -1392,12 +1468,14 @@ class SiteChain(ChainBase):
                     source=source,
                     title="【站点数据统计】",
                     text="\n".join(sorted_messages),
-                    userid=userid
+                    userid=userid,
+                    save_history=False
                 ))
         else:
             self.post_message(Notification(
                 channel=channel,
                 source=source,
                 title="没有刷新到任何站点数据！",
-                userid=userid
+                userid=userid,
+                save_history=False,
             ))
