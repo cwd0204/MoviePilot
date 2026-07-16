@@ -1123,33 +1123,64 @@ def ruletest(
     """
     过滤规则测试，规则类型 1-订阅，2-洗版，3-搜索
     """
+    metainfo = MetaInfo(title=title, subtitle=subtitle)
     torrent = schemas.TorrentInfo(
         title=title,
         description=subtitle,
     )
     # 查询规则组详情
     rulegroup = RuleHelper().get_rule_group(rulegroup_name)
+    result_data = {
+        "title": title,
+        "subtitle": subtitle,
+        "rulegroup_name": rulegroup_name,
+        "rulegroup": rulegroup.model_dump() if rulegroup else None,
+        "meta_info": metainfo.to_dict(),
+        "media_info": None,
+        "torrent_info": torrent.model_dump(),
+        "priority": None,
+        "matched": False,
+    }
     if not rulegroup:
         return schemas.Response(
-            success=False, message=f"过滤规则组 {rulegroup_name} 不存在！"
+            success=False,
+            message=f"过滤规则组 {rulegroup_name} 不存在！",
+            data=result_data,
         )
 
     # 根据标题查询媒体信息
     media_info = MediaChain().recognize_by_meta(
-        MetaInfo(title=title, subtitle=subtitle),
+        metainfo,
         obtain_images=False,
     )
+    result_data["media_info"] = media_info.to_dict() if media_info else None
     if not media_info:
-        return schemas.Response(success=False, message="未识别到媒体信息！")
+        return schemas.Response(
+            success=False,
+            message="未识别到媒体信息！",
+            data=result_data,
+        )
 
     # 过滤
     result = SearchChain().filter_torrents(
         rule_groups=[rulegroup.name], torrent_list=[torrent], mediainfo=media_info
     )
     if not result:
-        return schemas.Response(success=False, message="不符合过滤规则！")
+        return schemas.Response(
+            success=False,
+            message="不符合过滤规则！",
+            data=result_data,
+        )
+    result_data.update(
+        {
+            "matched": True,
+            "priority": 100 - result[0].pri_order + 1,
+            "torrent_info": result[0].model_dump(),
+        }
+    )
     return schemas.Response(
-        success=True, data={"priority": 100 - result[0].pri_order + 1}
+        success=True,
+        data=result_data,
     )
 
 
@@ -1308,12 +1339,7 @@ def restart_system(_: User = Depends(get_current_active_superuser)):
     """
     if not SystemHelper.can_restart():
         return schemas.Response(success=False, message="当前运行环境不支持重启操作！")
-    # 标识停止事件
-    global_vars.stop_system()
-    # 执行重启
     ret, msg = SystemHelper.restart()
-    if not ret:
-        global_vars.resume_system()
     return schemas.Response(success=ret, message=msg)
 
 
@@ -1331,11 +1357,7 @@ def upgrade_system(
     if not SystemHelper.can_restart():
         return schemas.Response(success=False, message="当前运行环境不支持升级操作！")
 
-    # 标识停止事件
-    global_vars.stop_system()
     ret, msg = SystemHelper.upgrade(mode=mode or "release")
-    if not ret:
-        global_vars.resume_system()
     return schemas.Response(success=ret, message=msg)
 
 
