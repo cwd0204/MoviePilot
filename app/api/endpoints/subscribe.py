@@ -23,6 +23,7 @@ from app.log import logger
 from app.scheduler import Scheduler
 from app.schemas.event import SubscribeModifiedEventData
 from app.schemas.types import MediaType, EventType, SystemConfigKey
+from app.utils.media import normalize_media_source, parse_media_key
 
 router = APIRouter()
 
@@ -104,6 +105,35 @@ def select_accessible_subscribe(
     return None
 
 
+async def list_subscribes_by_media_key(
+        db: AsyncSession, media_key: str, season: Optional[int] = None,
+) -> List[Subscribe]:
+    """按统一媒体键查询订阅，并兼容迁移前的专用 ID 字段。"""
+    source, media_id = parse_media_key(media_key)
+    if not source or not media_id:
+        return await Subscribe.async_list_by_mediaid(db, media_key)
+
+    subscribes = list(await Subscribe.async_list_by_media_identity(
+        db, media_source=source, media_id=media_id
+    ))
+    if source == "themoviedb" and media_id.isdigit():
+        subscribes.extend(await Subscribe.async_get_by_tmdbid(db, int(media_id), season))
+    elif source == "douban":
+        subscribes.extend(await Subscribe.async_list_by_doubanid(db, media_id))
+    elif source == "bangumi" and media_id.isdigit():
+        subscribes.extend(await Subscribe.async_list_by_bangumiid(db, int(media_id)))
+    elif source == "anilist" and media_id.isdigit():
+        subscribes.extend(await Subscribe.async_list_by_anilistid(db, int(media_id)))
+
+    unique_subscribes = {subscribe.id: subscribe for subscribe in subscribes}
+    if season is not None:
+        return [
+            subscribe for subscribe in unique_subscribes.values()
+            if subscribe.season == season
+        ]
+    return list(unique_subscribes.values())
+
+
 @router.get("/", summary="查询所有订阅", response_model=List[schemas.Subscribe])
 async def read_subscribes(
     db: AsyncSession = Depends(get_async_db),
@@ -141,8 +171,13 @@ async def create_subscribe(
         mtype = MediaType(subscribe_in.type)
     else:
         mtype = None
-    # 豆瓣标理
-    if subscribe_in.doubanid or subscribe_in.bangumiid:
+    # 非 TMDB 来源的标题可能自带季标记，入库前统一拆分。
+    if (
+            subscribe_in.doubanid
+            or subscribe_in.bangumiid
+            or subscribe_in.anilistid
+            or normalize_media_source(subscribe_in.media_source) not in (None, "themoviedb")
+    ):
         meta = MetaInfo(subscribe_in.name)
         subscribe_in.name = meta.name
         if subscribe_in.season is None:
@@ -152,14 +187,8 @@ async def create_subscribe(
         title = subscribe_in.name
     else:
         title = None
-    # 订阅用户
-    subscribe_in.username = current_user.name
-    # 转化为字典
-    subscribe_dict = subscribe_in.model_dump()
-    if subscribe_in.id:
-        subscribe_dict.pop("id", None)
-    # completed_episode 是响应派生字段，禁止写入持久层
-    subscribe_dict.pop("completed_episode", None)
+    subscribe_dict = subscribe_in.to_public_write_payload()
+    subscribe_dict["username"] = current_user.name
     sid, message = await SubscribeChain().async_add(
         mtype=mtype,
         title=title,
@@ -183,23 +212,14 @@ async def update_subscribe(
     subscribe = await get_accessible_subscribe(db, subscribe_in.id, current_user)
     if not subscribe:
         return schemas.Response(success=False, message="订阅不存在")
-    # 避免更新缺失集数
     old_subscribe_dict = subscribe.to_dict()
-    subscribe_dict = subscribe_in.model_dump()
+    subscribe_dict = subscribe_in.to_public_write_payload()
     subscribe_dict["username"] = subscribe.username
-    if subscribe_in.episode_priority is None:
-        subscribe_dict.pop("episode_priority", None)
-    # completed_episode 是响应派生字段，禁止写入持久层
-    subscribe_dict.pop("completed_episode", None)
-    if not subscribe_in.lack_episode:
-        # 没有缺失集数时，缺失集数清空，避免更新为0
-        subscribe_dict.pop("lack_episode")
-    elif subscribe_in.total_episode:
-        # 总集数增加时，缺失集数也要增加
-        if subscribe_in.total_episode > (subscribe.total_episode or 0):
-            subscribe_dict["lack_episode"] = subscribe.lack_episode + (
-                subscribe_in.total_episode - (subscribe.total_episode or 0)
-            )
+    if subscribe_in.total_episode and subscribe_in.total_episode > (subscribe.total_episode or 0):
+        # 扩大目标范围时，新增加的集数尚无下载事实，应同步计入缺失集数。
+        subscribe_dict["lack_episode"] = (subscribe.lack_episode or 0) + (
+            subscribe_in.total_episode - (subscribe.total_episode or 0)
+        )
     # 是否手动修改过总集数
     if subscribe_in.total_episode != subscribe.total_episode:
         subscribe_dict["manual_total_episode"] = 1
@@ -262,36 +282,12 @@ async def subscribe_mediaid(
     current_user: User = Depends(get_current_active_user_async),
 ) -> Any:
     """
-    根据 TMDBID/豆瓣ID/BangumiId 查询订阅 tmdb:/douban:
+    根据 TMDB、豆瓣、Bangumi、AniList 或插件媒体键查询订阅。
     """
-    title_check = False
-    if mediaid.startswith("tmdb:"):
-        tmdbid = mediaid[5:]
-        if not tmdbid or not str(tmdbid).isdigit():
-            return Subscribe()
-        subscribes = await Subscribe.async_get_by_tmdbid(db, int(tmdbid), season)
-        result = select_accessible_subscribe(subscribes, current_user)
-    elif mediaid.startswith("douban:"):
-        doubanid = mediaid[7:]
-        if not doubanid:
-            return Subscribe()
-        subscribes = await Subscribe.async_list_by_doubanid(db, doubanid)
-        result = select_accessible_subscribe(subscribes, current_user)
-        if not result and title:
-            title_check = True
-    elif mediaid.startswith("bangumi:"):
-        bangumiid = mediaid[8:]
-        if not bangumiid or not str(bangumiid).isdigit():
-            return Subscribe()
-        subscribes = await Subscribe.async_list_by_bangumiid(db, int(bangumiid))
-        result = select_accessible_subscribe(subscribes, current_user)
-        if not result and title:
-            title_check = True
-    else:
-        subscribes = await Subscribe.async_list_by_mediaid(db, mediaid)
-        result = select_accessible_subscribe(subscribes, current_user)
-        if not result and title:
-            title_check = True
+    subscribes = await list_subscribes_by_media_key(db, mediaid, season)
+    result = select_accessible_subscribe(subscribes, current_user)
+    source, _ = parse_media_key(mediaid)
+    title_check = not result and bool(title) and source != "themoviedb"
     # 使用名称检查订阅
     if title_check and title:
         meta = MetaInfo(title)
@@ -339,6 +335,8 @@ async def reset_subscribes(
                 "lack_episode": subscribe.total_episode,
                 "current_priority": None,
                 "episode_priority": {},
+                # 重置代表放弃手动总集数，后续订阅检查重新按 TMDB 集数更新。
+                "manual_total_episode": 0,
                 "state": "R",
             },
         )
@@ -432,24 +430,9 @@ async def delete_subscribe_by_mediaid(
     current_user: User = Depends(get_current_active_user_async),
 ) -> Any:
     """
-    根据TMDBID或豆瓣ID删除订阅 tmdb:/douban:
+    根据任意媒体数据源 ID 删除订阅。
     """
-    delete_subscribes = []
-    if mediaid.startswith("tmdb:"):
-        tmdbid = mediaid[5:]
-        if not tmdbid or not str(tmdbid).isdigit():
-            return schemas.Response(success=False)
-        subscribes = await Subscribe.async_get_by_tmdbid(db, int(tmdbid), season)
-        delete_subscribes.extend(subscribes)
-    elif mediaid.startswith("douban:"):
-        doubanid = mediaid[7:]
-        if not doubanid:
-            return schemas.Response(success=False)
-        subscribes = await Subscribe.async_list_by_doubanid(db, doubanid)
-        delete_subscribes.extend(subscribes)
-    else:
-        subscribes = await Subscribe.async_list_by_mediaid(db, mediaid)
-        delete_subscribes.extend(subscribes)
+    delete_subscribes = await list_subscribes_by_media_key(db, mediaid, season)
     delete_events = []
     for subscribe in [
         subscribe
@@ -521,7 +504,8 @@ async def seerr_subscribe(
             tmdbid=tmdbId,
             title=subject,
             year="",
-            season=0,
+            # 电影不传季号，避免被误判为剧集（S00）并污染通知标题
+            season=None,
             username=user_name,
         )
     else:
@@ -637,7 +621,7 @@ async def popular_subscribes(
             # 处理标题
             title = sub.get("name")
             season = sub.get("season")
-            if season and int(season) > 1 and media.tmdb_id:
+            if season not in (None, "") and int(season) != 1 and media.tmdb_id:
                 # 小写数据转大写
                 season_str = cn2an.an2cn(season, "low")
                 title = f"{title} 第{season_str}季"
@@ -645,6 +629,9 @@ async def popular_subscribes(
             media.year = sub.get("year")
             media.douban_id = sub.get("doubanid")
             media.bangumi_id = sub.get("bangumiid")
+            media.anilist_id = sub.get("anilistid")
+            media.source = sub.get("media_source")
+            media.media_id = sub.get("media_id")
             media.tvdb_id = sub.get("tvdbid")
             media.imdb_id = sub.get("imdbid")
             media.season = sub.get("season")
@@ -871,6 +858,14 @@ async def delete_subscribe(
         )
         # 统计订阅
         MoviePilotServerHelper.sub_done_async(
-            {"tmdbid": subscribe_info.get("tmdbid"), "doubanid": subscribe_info.get("doubanid")}
+            {
+                "tmdbid": subscribe_info.get("tmdbid"),
+                "doubanid": subscribe_info.get("doubanid"),
+                "bangumiid": subscribe_info.get("bangumiid"),
+                "anilistid": subscribe_info.get("anilistid"),
+                "media_source": subscribe_info.get("media_source"),
+                "media_id": subscribe_info.get("media_id"),
+                "season": subscribe_info.get("season"),
+            }
         )
     return schemas.Response(success=True)

@@ -23,6 +23,7 @@ from app.schemas import (
     TransferRenameBuildEventData,
     TransferRenameEventData,
 )
+from app.schemas.exception import StorageQueryError
 from app.schemas.types import MediaType, ChainEventType
 from app.utils.system import SystemUtils
 
@@ -189,6 +190,21 @@ class TransHandler:
                 return True
             return False
 
+        def __is_special_extra_file(_fileitem: FileItem) -> bool:
+            """
+            判断是否为特典/附加视频文件（如 NCOP/NCED/Menu/CM/PV/Event/Logo 等无集数编号的视频/样本）
+            """
+            file_name = _fileitem.name or ""
+            return bool(
+                re.search(
+                    r"(?:^|[\s_.\-\[【(])("
+                    r"NC(?:OP|ED)|NCOP|NCED|OP|ED|MENU|PV|CM|TRAILER|TV\s*SPOT|SP|OVA|OAD|EVENT|IV|INTERVIEW|LOGO|PRODUCER\s*LOGO|BEHIND\s*THE\s*SCENES|FEATURETTE"
+                    r")(?:\d*|[\s_.\-\]】)]|$)",
+                    file_name,
+                    re.IGNORECASE,
+                )
+            )
+
         # 整理结果
         result = TransferInfo()
 
@@ -298,6 +314,17 @@ class TransHandler:
                 if mediainfo.type == MediaType.TV:
                     # 电视剧
                     if in_meta.begin_episode is None:
+                        if __is_special_extra_file(fileitem):
+                            logger.info(f"文件 {fileitem.path} 未识别到文件集数，识别为特典/附加视频文件，跳过正片集数整理")
+                            self.__update_result(
+                                result=result,
+                                success=True,
+                                fileitem=fileitem,
+                                transfer_type=transfer_type,
+                                need_notify=False,
+                            )
+                            return result
+
                         logger.warn(f"文件 {fileitem.path} 整理失败：未识别到文件集数")
                         self.__update_result(
                             result=result,
@@ -405,8 +432,23 @@ class TransHandler:
                 # 判断是否要覆盖，附加文件强制覆盖
                 overflag = False
                 if not __is_extra_file(fileitem):
-                    # 目标文件
-                    target_item = target_oper.get_item(new_file)
+                    # 目标文件（严格查询：无法确认状态时拒绝覆盖，避免已有文件被误覆盖）
+                    try:
+                        target_item = target_oper.get_item_strict(new_file)
+                    except StorageQueryError as query_err:
+                        errmsg = f"无法确认目标文件状态，已跳过整理以避免误覆盖：{new_file} - {query_err}"
+                        logger.warn(errmsg)
+                        self.__update_result(
+                            result=result,
+                            success=False,
+                            message=errmsg,
+                            fileitem=fileitem,
+                            target_diritem=target_diritem,
+                            fail_list=[fileitem.path],
+                            transfer_type=transfer_type,
+                            need_notify=need_notify,
+                        )
+                        return result
                     if target_item:
                         # 目标文件已存在
                         target_file = new_file

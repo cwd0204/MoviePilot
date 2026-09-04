@@ -31,12 +31,18 @@ class DownloadHistory(Base):
     imdbid = Column(String)
     tvdbid = Column(Integer)
     doubanid = Column(String)
+    bangumiid = Column(Integer, index=True)
+    anilistid = Column(Integer, index=True)
+    media_source = Column(String, index=True)
+    media_id = Column(String, index=True)
     # Sxx
     seasons = Column(String)
     # Exx
     episodes = Column(String)
-    # 海报
+    # 背景图
     image = Column(String)
+    # 海报
+    poster = Column(String)
     # 下载器
     downloader = Column(String)
     # 下载任务Hash
@@ -67,6 +73,7 @@ class DownloadHistory(Base):
     __table_args__ = (
         Index('ix_downloadhistory_download_hash_date', 'download_hash', 'date'),
         Index('ix_downloadhistory_date_id', 'date', 'id'),
+        Index('ix_downloadhistory_media_identity', 'media_source', 'media_id'),
     )
 
     @classmethod
@@ -115,17 +122,27 @@ class DownloadHistory(Base):
 
     @classmethod
     @db_query
-    def get_by_mediaid(cls, db: Session, tmdbid: int, doubanid: str):
-        if tmdbid:
-            return (
-                db.query(DownloadHistory).filter(DownloadHistory.tmdbid == tmdbid).all()
-            )
-        elif doubanid:
-            return (
-                db.query(DownloadHistory)
-                .filter(DownloadHistory.doubanid == doubanid)
-                .all()
-            )
+    def get_by_mediaid(
+            cls, db: Session, tmdbid: Optional[int] = None,
+            doubanid: Optional[str] = None, bangumiid: Optional[int] = None,
+            anilistid: Optional[int] = None, media_source: Optional[str] = None,
+            media_id: Optional[str] = None,
+    ):
+        """按统一媒体身份或兼容 ID 查询下载历史。"""
+        query = db.query(DownloadHistory)
+        if media_source and media_id:
+            return query.filter(
+                DownloadHistory.media_source == media_source,
+                DownloadHistory.media_id == str(media_id),
+            ).all()
+        if tmdbid is not None:
+            return query.filter(DownloadHistory.tmdbid == tmdbid).all()
+        if doubanid:
+            return query.filter(DownloadHistory.doubanid == doubanid).all()
+        if bangumiid is not None:
+            return query.filter(DownloadHistory.bangumiid == bangumiid).all()
+        if anilistid is not None:
+            return query.filter(DownloadHistory.anilistid == anilistid).all()
         return []
 
     @classmethod
@@ -133,14 +150,25 @@ class DownloadHistory(Base):
     def list_by_page(
         cls, db: Session, page: Optional[int] = 1, count: Optional[int] = 30
     ):
-        return db.query(DownloadHistory).offset((page - 1) * count).limit(count).all()
+        return (
+            db.query(DownloadHistory)
+            .order_by(DownloadHistory.date.desc(), DownloadHistory.id.desc())
+            .offset((page - 1) * count)
+            .limit(count)
+            .all()
+        )
 
     @classmethod
     @async_db_query
     async def async_list_by_page(
         cls, db: AsyncSession, page: Optional[int] = 1, count: Optional[int] = 30
     ):
-        result = await db.execute(select(cls).offset((page - 1) * count).limit(count))
+        result = await db.execute(
+            select(cls)
+            .order_by(cls.date.desc(), cls.id.desc())
+            .offset((page - 1) * count)
+            .limit(count)
+        )
         return result.scalars().all()
 
     @classmethod

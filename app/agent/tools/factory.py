@@ -42,8 +42,13 @@ from app.agent.tools.impl.send_message import SendMessageTool
 from app.agent.tools.impl.ask_user_choice import AskUserChoiceTool
 from app.agent.tools.impl.send_local_file import SendLocalFileTool
 from app.agent.tools.impl.send_voice_message import SendVoiceMessageTool
+from app.agent.tools.impl.create_agent_task import CreateAgentTaskTool
+from app.agent.tools.impl.delete_agent_task import DeleteAgentTaskTool
+from app.agent.tools.impl.query_agent_tasks import QueryAgentTasksTool
 from app.agent.tools.impl.query_schedulers import QuerySchedulersTool
+from app.agent.tools.impl.run_agent_task import RunAgentTaskTool
 from app.agent.tools.impl.run_scheduler import RunSchedulerTool
+from app.agent.tools.impl.update_agent_task import UpdateAgentTaskTool
 from app.agent.tools.impl.query_workflows import QueryWorkflowsTool
 from app.agent.tools.impl.run_workflow import RunWorkflowTool
 from app.agent.tools.impl.query_personas import QueryPersonasTool
@@ -141,6 +146,11 @@ class MoviePilotToolFactory:
         QueryTransferHistoryTool,
         TransferFileTool,
         SendMessageTool,
+        CreateAgentTaskTool,
+        QueryAgentTasksTool,
+        UpdateAgentTaskTool,
+        RunAgentTaskTool,
+        DeleteAgentTaskTool,
         QuerySchedulersTool,
         RunSchedulerTool,
         QueryWorkflowsTool,
@@ -181,6 +191,8 @@ class MoviePilotToolFactory:
         "edit_file",
         "execute_command",
         "ask_user_choice",
+        "create_agent_task",
+        "query_agent_tasks",
     )
 
     @staticmethod

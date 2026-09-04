@@ -1,7 +1,7 @@
 import asyncio
 import mimetypes
 import shutil
-from typing import Annotated, Any, List, Optional
+from typing import Annotated, Any, Dict, List, Optional
 
 import aiofiles
 from anyio import Path as AsyncPath
@@ -11,6 +11,7 @@ from starlette import status
 from starlette.responses import StreamingResponse
 
 from app import schemas
+from app.api.apiv2_utils import API_V2_STR, OPENAPI_V2_PATH
 from app.command import Command
 from app.core.cache import async_fresh
 from app.core.config import settings
@@ -36,8 +37,15 @@ from app.scheduler import Scheduler
 from app.schemas.event import PluginDataResetEventData
 from app.schemas.types import ChainEventType, SystemConfigKey
 
-PROTECTED_ROUTES = {"/api/v1/openapi.json", "/docs", "/docs/oauth2-redirect", "/redoc"}
+PROTECTED_ROUTES = {
+    "/api/v1/openapi.json",
+    OPENAPI_V2_PATH,
+    "/docs",
+    "/docs/oauth2-redirect",
+    "/redoc",
+}
 PLUGIN_PREFIX = f"{settings.API_V1_STR}/plugin"
+PLUGIN_V2_PREFIX = f"{API_V2_STR}/plugin"
 
 router = APIRouter()
 _plugin_release_refresh_tasks: set[asyncio.Task] = set()
@@ -158,8 +166,11 @@ def _update_plugin_api_routes(plugin_id: Optional[str], action: str):
                     elif Depends(verify_apikey) not in dependencies:
                         dependencies.append(Depends(verify_apikey))
                 app.add_api_route(**api, tags=["plugin"])
+                v2_api = api.copy()
+                v2_api["path"] = api_path.replace(PLUGIN_PREFIX, PLUGIN_V2_PREFIX, 1)
+                app.add_api_route(**v2_api, tags=["plugin"])
                 is_modified = True
-                logger.debug(f"Added plugin route: {api_path}")
+                logger.debug(f"Added plugin routes: {api_path}, {v2_api['path']}")
             except Exception as e:
                 logger.error(f"Error adding plugin route {api_path}: {str(e)}")
 
@@ -177,8 +188,13 @@ def _remove_routes(plugin_id: str) -> bool:
     """
     if not plugin_id:
         return False
-    prefix = f"{PLUGIN_PREFIX}/{plugin_id}/"
-    routes_to_remove = [route for route in app.routes if route.path.startswith(prefix)]
+    prefixes = {
+        f"{PLUGIN_PREFIX}/{plugin_id}/",
+        f"{PLUGIN_V2_PREFIX}/{plugin_id}/",
+    }
+    routes_to_remove = [
+        route for route in app.routes if any(route.path.startswith(prefix) for prefix in prefixes)
+    ]
     removed = False
     for route in routes_to_remove:
         try:
@@ -474,6 +490,71 @@ async def statistic(_: schemas.TokenPayload = Depends(verify_token)) -> Any:
     插件安装统计
     """
     return await MoviePilotServerHelper.async_get_plugin_statistic()
+
+
+@router.get(
+    "/rating",
+    summary="批量查询插件评分",
+    response_model=Dict[str, schemas.PluginRating],
+)
+async def plugin_ratings(
+    plugin_ids: Optional[str] = None,
+    _: User = Depends(get_current_active_superuser_async),
+) -> Dict[str, schemas.PluginRating]:
+    """
+    批量查询插件平均分、评分人数和当前安装实例评分。
+    """
+    requested_ids = plugin_ids.split(",") if plugin_ids is not None else None
+    ratings = await MoviePilotServerHelper.async_get_plugin_ratings(requested_ids)
+    return {
+        plugin_id: schemas.PluginRating.model_validate(rating)
+        for plugin_id, rating in ratings.items()
+    }
+
+
+@router.get(
+    "/rating/{plugin_id}",
+    summary="查询插件评分",
+    response_model=schemas.PluginRating,
+)
+async def plugin_rating(
+    plugin_id: str,
+    _: User = Depends(get_current_active_superuser_async),
+) -> schemas.PluginRating:
+    """
+    查询单个插件平均分、评分人数和当前安装实例评分。
+    """
+    rating = await MoviePilotServerHelper.async_get_plugin_rating(plugin_id)
+    return schemas.PluginRating.model_validate(rating)
+
+
+@router.post(
+    "/rating/{plugin_id}",
+    summary="提交插件评分",
+    response_model=schemas.Response,
+)
+async def rate_plugin(
+    plugin_id: str,
+    payload: schemas.PluginRatingRequest,
+    _: User = Depends(get_current_active_superuser_async),
+) -> schemas.Response:
+    """
+    为已安装插件新增或更新当前安装实例评分。
+    """
+    installed_plugins = SystemConfigOper().get(SystemConfigKey.UserInstalledPlugins) or []
+    if plugin_id not in installed_plugins:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"插件 {plugin_id} 未安装，无法评分",
+        )
+
+    rating = await MoviePilotServerHelper.async_submit_plugin_rating(
+        plugin_id,
+        payload.rating,
+    )
+    if rating is None:
+        return schemas.Response(success=False, message="连接MoviePilot服务器失败")
+    return schemas.Response(success=True, data=rating)
 
 
 @router.get(

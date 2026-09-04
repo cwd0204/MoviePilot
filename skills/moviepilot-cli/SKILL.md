@@ -1,6 +1,6 @@
 ---
 name: moviepilot-cli
-version: 3
+version: 6
 description: >-
   Use this skill when the user asks to operate MoviePilot through the local
   `moviepilot tool` MCP CLI for normal product workflows: media search, torrent
@@ -45,6 +45,10 @@ List all available commands: `moviepilot tool list`
 
 Show parameters and usage for a specific command: `moviepilot tool show <command>`
 
+The tool list includes tools declared by enabled plugins. Re-run `tool list` and
+`tool show` after a plugin is enabled, disabled, reloaded, or reconfigured so the
+command selection uses the refreshed runtime registry.
+
 Always run `show <command>` before calling a command — parameter names are not inferable, do not guess.
 
 ## Command Groups
@@ -58,7 +62,7 @@ Always run `show <command>` before calling a command — parameter names are not
 | Library | query_library_exists, query_library_latest, transfer_file, scrape_metadata, query_transfer_history |
 | Files | list_directory, query_directory_settings |
 | Sites | query_sites, query_site_userdata, test_site, update_site, update_site_cookie |
-| System | query_schedulers, run_scheduler, query_workflows, run_workflow, query_rule_groups, query_episode_schedule, send_message |
+| System | query_schedulers, run_scheduler, create_agent_task, query_agent_tasks, update_agent_task, run_agent_task, delete_agent_task, query_workflows, run_workflow, query_rule_groups, query_episode_schedule, send_message |
 
 ## Workflows
 
@@ -98,6 +102,9 @@ Filter values must come from the `filter_options` returned by `search_torrents` 
 
 Fetch results with selected filters:
 `moviepilot tool run get_search_results resolution='1080p,2160p' free_state='免费,50%'`
+
+To filter subtitle, audio, DIY, translation, or release notes that may appear outside the title, use `content_pattern`. It matches the torrent title, description, and labels while `title_pattern` continues to match the title only. Set `include_description=true` when the description is needed to explain why a result matched, and `include_labels=true` when the labels should be returned:
+`moviepilot tool run get_search_results content_pattern='特效字幕|国语|DIY' include_description=true include_labels=true`
 
 If empty, tell the user which filter to relax and ask before retrying.
 
@@ -186,6 +193,47 @@ Trigger a search for missing episodes (confirm with user first):
 Remove a subscription (confirm with user first):
 `moviepilot tool run delete_subscribe subscribe_id=123`
 
+### Manage Autonomous Agent Tasks
+
+Use autonomous tasks only when the user explicitly requests delayed, recurring,
+reminder, or monitoring behavior. Immediate work should run directly. Use the
+MoviePilot `TZ` setting for local times.
+
+Scheduled runs reuse the original Agent session context, but user-facing
+messages are broadcast through MoviePilot's configured notification channels
+instead of being tied to the channel that created the task. If the Agent sends
+the complete result with a message tool during execution, it does not send the
+same final reply again when the run finishes.
+
+Autonomous task tools use the integer `task_id` returned by
+`query_agent_tasks`. `query_schedulers` and `run_scheduler` are only for
+MoviePilot system, plugin, and workflow runtime services and use string
+`job_id` values; never mix these IDs or use those tools for autonomous tasks.
+
+For a relative one-time request, use `date` with `delay_minutes`; MoviePilot
+calculates and persists the exact run time:
+`moviepilot tool run create_agent_task name="检查电影资源" content="搜索电影《示例电影》是否有资源并报告，不要自动下载。" trigger_type=date delay_minutes=30`
+
+For a one-time task at a fixed time, use `date` with an ISO 8601 `trigger`:
+`moviepilot tool run create_agent_task name="今晚检查资源" content="检查目标电影是否有资源并报告。" trigger_type=date trigger="2026-07-19 20:30:00"`
+
+For recurring work, use a standard five-field cron expression. This example
+runs every day at 20:30:
+`moviepilot tool run create_agent_task name="每日资源检查" content="检查目标电影是否有资源并报告。" trigger_type=cron trigger="30 20 * * *"`
+
+List tasks and inspect `next_run_at` and the latest result:
+`moviepilot tool run query_agent_tasks`
+
+Pause or resume a task:
+`moviepilot tool run update_agent_task task_id=1 enabled=false`
+
+Queue an enabled task for immediate execution without waiting in the current
+Agent turn:
+`moviepilot tool run run_agent_task task_id=1`
+
+Delete a task only after confirming permanent removal with the user:
+`moviepilot tool run delete_agent_task task_id=1`
+
 ### Check Library and Subscriptions
 
 Run before any download or subscription to avoid duplicates.
@@ -219,5 +267,6 @@ Use `air_date` to find a block of recently-aired episodes that likely correspond
 ## Error handling
 
 Missing configuration or authentication failure: run `moviepilot doctor` to
-verify the local MoviePilot installation and settings. Do not ask the user to
-paste the API key into the prompt for local CLI usage.
+verify the local MoviePilot installation and settings. Plugin-only log findings
+remain visible but do not by themselves downgrade the overall Doctor status.
+Do not ask the user to paste the API key into the prompt for local CLI usage.

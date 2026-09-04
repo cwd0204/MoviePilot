@@ -1,4 +1,4 @@
-moviepilot-rust~=0.2.3
+moviepilot-rust~=0.2.4
 pydantic>=2.13.4,<3.0.0
 pydantic-settings>=2.14.1,<3.0.0
 SQLAlchemy~=2.0.50
@@ -38,7 +38,7 @@ pillow~=12.2.0
 pillow-avif-plugin~=1.5.5
 pyTelegramBotAPI~=4.34.0
 telegramify-markdown~=1.2.0
-cloakbrowser~=0.4.0
+cloakbrowser~=0.5.3
 torrentool~=1.2.0
 fast-bencode~=1.1.8
 slack-bolt~=1.28.0

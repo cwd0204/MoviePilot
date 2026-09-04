@@ -1,6 +1,6 @@
 ---
 name: feedback-issue
-version: 7
+version: 8
 description: >-
   Use this skill ONLY when the user EXPLICITLY requests filing an
   upstream issue for MoviePilot core, frontend, or an installed plugin,
@@ -92,6 +92,9 @@ Log relevance rules:
   then applies a recent time window, removes Agent/tool dispatch noise,
   and keeps only timestamped log blocks whose first line contains a
   normalized keyword.
+- Consecutive log records with the same template are compacted to the
+  first record, a repetition count, and the last record. Verify the
+  retained boundary records before treating the excerpt as evidence.
 - If no specific keyword survives normalization, the script records the
   doctor report and log-selection metadata but does not include recent
   log lines. This avoids attaching unrelated noise.
@@ -120,7 +123,9 @@ you need to show the preview generated in the next step.
 The collect script also runs `moviepilot doctor --json` or falls back to
 `python -m app.cli doctor --json`, stores the structured doctor report
 inside `diagnostics_file`, and later preview/submit steps include a
-short doctor summary automatically.
+short doctor summary automatically. Plugin-only log findings remain in
+the report as diagnostic evidence with `affects_report_status=false`, so
+they do not by themselves downgrade the overall MoviePilot status.
 
 If `success=false` with `no_explicit_feedback_intent`, stop this skill
 and return to local diagnosis.

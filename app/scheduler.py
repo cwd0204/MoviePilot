@@ -1,5 +1,6 @@
 import asyncio
 import gc
+import hashlib
 import inspect
 import json
 import multiprocessing
@@ -28,6 +29,7 @@ from app.core.config import settings, global_vars
 from app.core.event import Event, eventmanager
 from app.core.plugin import PluginManager
 from app.db import SessionFactory
+from app.db.agenttask_oper import AgentTaskOper
 from app.db.models.downloadhistory import DownloadHistory, DownloadFiles
 from app.db.models.message import Message
 from app.db.models.siteuserdata import SiteUserData
@@ -37,6 +39,7 @@ from app.helper.image import WallpaperHelper
 from app.helper.message import MessageHelper
 from app.helper.progress import ProgressHelper
 from app.helper.server import MoviePilotServerHelper
+from app.helper.service import ServiceConfigHelper
 from app.helper.sites import SitesHelper  # noqa
 from app.log import logger
 from app.schemas import Notification, NotificationType, Workflow
@@ -48,6 +51,7 @@ from app.utils.timer import TimerUtils
 
 lock = threading.Lock()
 SCHEDULER_PROGRESS_PREFIX = "scheduler"
+AGENT_TASK_JOB_PREFIX = "agent-task"
 
 
 class SchedulerChain(ChainBase):
@@ -178,16 +182,16 @@ class SchedulerChain(ChainBase):
 
         message_cutoff = (
                 started_at - timedelta(days=message_days)
-        ).strftime("%Y-%m-%d %H:%M:%S")
+        ).strftime("%Y-%m-%d")
         download_history_cutoff = (
                 started_at - timedelta(days=download_history_days)
-        ).strftime("%Y-%m-%d %H:%M:%S")
+        ).strftime("%Y-%m-%d")
         site_userdata_cutoff = (
                 started_at - timedelta(days=site_userdata_days)
         ).strftime("%Y-%m-%d")
         transfer_history_cutoff = (
                 started_at - timedelta(days=transfer_history_days)
-        ).strftime("%Y-%m-%d %H:%M:%S")
+        ).strftime("%Y-%m-%d")
 
         return [
             {
@@ -278,6 +282,7 @@ class Scheduler(ConfigReloadMixin, metaclass=SingletonClass):
         "DEV",
         "COOKIECLOUD_INTERVAL",
         "MEDIASERVER_SYNC_INTERVAL",
+        SystemConfigKey.MediaServers.value,
         "SUBSCRIBE_SEARCH",
         "SUBSCRIBE_SEARCH_INTERVAL",
         "SUBSCRIBE_MODE",
@@ -322,6 +327,58 @@ class Scheduler(ConfigReloadMixin, metaclass=SingletonClass):
         return "定时服务"
 
     @staticmethod
+    def _get_mediaserver_sync_interval(
+            mediaserver: schemas.MediaServerConf,
+            default_interval: Optional[int],
+    ) -> Optional[int]:
+        """
+        获取媒体服务器的有效同步间隔，未设置时回退旧全局配置。
+        """
+        interval = mediaserver.sync_interval
+        if interval is None:
+            interval = default_interval
+        try:
+            interval = int(interval)
+        except (TypeError, ValueError):
+            return None
+        return interval if interval > 0 else None
+
+    @classmethod
+    def _build_mediaserver_sync_schedules(
+            cls,
+            mediaservers: List[schemas.MediaServerConf],
+            default_interval: Optional[int],
+    ) -> List[dict]:
+        """
+        构建已启用媒体服务器的独立自动同步任务描述。
+        """
+        schedules = []
+        job_ids = set()
+        for mediaserver in mediaservers:
+            if not mediaserver or not mediaserver.enabled or not mediaserver.name:
+                continue
+            interval = cls._get_mediaserver_sync_interval(
+                mediaserver=mediaserver,
+                default_interval=default_interval,
+            )
+            if not interval:
+                continue
+            digest = hashlib.sha256(mediaserver.name.encode("utf-8")).hexdigest()[:12]
+            job_id = f"mediaserver_sync_{digest}"
+            if job_id in job_ids:
+                continue
+            job_ids.add(job_id)
+            schedules.append(
+                {
+                    "id": job_id,
+                    "name": f"同步媒体服务器 - {mediaserver.name}",
+                    "server": mediaserver.name,
+                    "interval": interval,
+                }
+            )
+        return schedules
+
+    @staticmethod
     def _get_progress_key(job_id: str) -> str:
         """
         获取定时服务进度缓存键。
@@ -349,6 +406,7 @@ class Scheduler(ConfigReloadMixin, metaclass=SingletonClass):
 
         with lock:
             # 各服务的运行状态
+            mediaserver_chain = MediaServerChain()
             self._jobs = {
                 "cookiecloud": {
                     "name": "同步CookieCloud站点",
@@ -357,7 +415,7 @@ class Scheduler(ConfigReloadMixin, metaclass=SingletonClass):
                 },
                 "mediaserver_sync": {
                     "name": "同步媒体服务器",
-                    "func": MediaServerChain().sync,
+                    "func": mediaserver_chain.sync,
                     "running": False,
                 },
                 "subscribe_tmdb": {
@@ -476,19 +534,27 @@ class Scheduler(ConfigReloadMixin, metaclass=SingletonClass):
                     kwargs={"job_id": "cookiecloud"},
                 )
 
-            # 媒体服务器同步
-            if (
-                    settings.MEDIASERVER_SYNC_INTERVAL
-                    and str(settings.MEDIASERVER_SYNC_INTERVAL).isdigit()
-            ):
+            # 按媒体服务器分别注册自动同步任务
+            mediaserver_schedules = self._build_mediaserver_sync_schedules(
+                mediaservers=ServiceConfigHelper.get_mediaserver_configs(),
+                default_interval=settings.MEDIASERVER_SYNC_INTERVAL,
+            )
+            for mediaserver_schedule in mediaserver_schedules:
+                job_id = mediaserver_schedule["id"]
+                self._jobs[job_id] = {
+                    "name": mediaserver_schedule["name"],
+                    "func": mediaserver_chain.sync,
+                    "running": False,
+                    "kwargs": {"server": mediaserver_schedule["server"]},
+                }
                 self._scheduler.add_job(
                     self.start,
                     "interval",
-                    id="mediaserver_sync",
-                    name="同步媒体服务器",
-                    hours=int(settings.MEDIASERVER_SYNC_INTERVAL),
+                    id=job_id,
+                    name=mediaserver_schedule["name"],
+                    hours=mediaserver_schedule["interval"],
                     next_run_time=datetime.now(pytz.timezone(settings.TZ)) + timedelta(minutes=10),
-                    kwargs={"job_id": "mediaserver_sync"},
+                    kwargs={"job_id": job_id},
                 )
 
             # 新增订阅时搜索（5分钟检查一次）
@@ -594,16 +660,6 @@ class Scheduler(ConfigReloadMixin, metaclass=SingletonClass):
                 kwargs={"job_id": "scheduler_job"},
             )
 
-            # 缓存清理服务，每隔24小时
-            self._scheduler.add_job(
-                self.start,
-                "interval",
-                id="clear_cache",
-                name="缓存清理",
-                hours=settings.CONF.meta / 3600,
-                kwargs={"job_id": "clear_cache"},
-            )
-
             # 数据表清理服务，每天凌晨执行一次
             if settings.DATA_CLEANUP_ENABLE:
                 self._scheduler.add_job(
@@ -704,6 +760,10 @@ class Scheduler(ConfigReloadMixin, metaclass=SingletonClass):
 
             # 初始化工作流服务
             self.init_workflow_jobs()
+
+            # 恢复 Agent 自主定时任务
+            if settings.AI_AGENT_ENABLE:
+                self.init_agent_task_jobs()
 
             # 初始化插件服务
             self.init_plugin_jobs()
@@ -979,6 +1039,160 @@ class Scheduler(ConfigReloadMixin, metaclass=SingletonClass):
             if not deferred_finish:
                 # 运行结束
                 self.__finish_job(job_id=job_id, success=success, error=error)
+
+    @staticmethod
+    def _get_agent_task_job_id(task_id: int) -> str:
+        """生成 Agent 自主定时任务的调度器 Job ID。"""
+        return f"{AGENT_TASK_JOB_PREFIX}-{task_id}"
+
+    def start_agent_task(self, task_id: int) -> bool:
+        """
+        将指定 Agent 自主定时任务提交到运行时调度器立即执行。
+
+        :param task_id: Agent 自主定时任务 ID
+        :return: 任务存在且未运行时返回 True，否则返回 False
+        """
+        job_id = self._get_agent_task_job_id(task_id)
+        with self._lock:
+            job = self._jobs.get(job_id)
+            if not job or job.get("running"):
+                return False
+        self.start(job_id)
+        return True
+
+    def init_agent_task_jobs(self) -> None:
+        """
+        从数据库恢复所有启用的 Agent 自主定时任务。
+        """
+        oper = AgentTaskOper()
+        for task in oper.list(enabled=True):
+            if task.last_status == "running":
+                oper.update(
+                    task_id=task.id,
+                    payload={
+                        "last_status": "waiting",
+                        "last_result": "服务重启后恢复调度",
+                    },
+                )
+            self.update_agent_task_job(task.id)
+
+    def update_agent_task_job(self, task_id: int) -> Optional[str]:
+        """
+        按数据库中的最新配置新增或替换 Agent 自主定时任务。
+
+        :param task_id: Agent 定时任务 ID
+        :return: 下一次执行时间，不可调度时返回 None
+        """
+        self.remove_agent_task_job(task_id)
+        task = AgentTaskOper().get(task_id)
+        if (
+                not settings.AI_AGENT_ENABLE
+                or not task
+                or not task.enabled
+                or not self._scheduler
+        ):
+            return None
+
+        trigger_value = (
+            task.cron_expression if task.trigger_type == "cron" else task.run_at
+        )
+        try:
+            trigger = TimerUtils.build_schedule_trigger(
+                trigger_type=task.trigger_type,
+                trigger_value=trigger_value,
+                timezone_name=settings.TZ,
+            )
+        except (TypeError, ValueError) as err:
+            logger.error(f"Agent 定时任务 {task_id} 的触发配置无效：{str(err)}")
+            return None
+
+        job_id = self._get_agent_task_job_id(task_id)
+        with self._lock:
+            self._jobs[job_id] = {
+                "name": task.name,
+                "provider_name": "[Agent]",
+                "func": self.execute_agent_task,
+                "running": False,
+                "kwargs": {"task_id": task_id},
+            }
+            self._scheduler.add_job(
+                self.start,
+                trigger=trigger,
+                id=job_id,
+                name=task.name,
+                kwargs={"job_id": job_id, "task_id": task_id},
+                coalesce=True,
+                max_instances=1,
+                misfire_grace_time=None,
+                replace_existing=True,
+            )
+        return self.get_agent_task_next_run(task_id)
+
+    def remove_agent_task_job(self, task_id: int) -> None:
+        """
+        从运行时调度器移除 Agent 自主定时任务。
+
+        :param task_id: Agent 定时任务 ID
+        """
+        job_id = self._get_agent_task_job_id(task_id)
+        with self._lock:
+            self._jobs.pop(job_id, None)
+            if not self._scheduler:
+                return
+            try:
+                self._scheduler.remove_job(job_id)
+            except JobLookupError:
+                pass
+
+    def get_agent_task_next_run(self, task_id: int) -> Optional[str]:
+        """
+        查询 Agent 自主定时任务的下一次执行时间。
+
+        :param task_id: Agent 定时任务 ID
+        :return: 带时区的 ISO 8601 时间，不再执行时返回 None
+        """
+        job_id = self._get_agent_task_job_id(task_id)
+        if self._scheduler:
+            job = self._scheduler.get_job(job_id)
+            next_run_time = getattr(job, "next_run_time", None) if job else None
+            if next_run_time:
+                return next_run_time.isoformat(timespec="seconds")
+
+        task = AgentTaskOper().get(task_id)
+        if not task or not task.enabled:
+            return None
+        trigger_value = (
+            task.cron_expression if task.trigger_type == "cron" else task.run_at
+        )
+        try:
+            next_run_time = TimerUtils.get_schedule_next_run_time(
+                trigger_type=task.trigger_type,
+                trigger_value=trigger_value,
+                timezone_name=settings.TZ,
+            )
+        except (TypeError, ValueError):
+            return None
+        return (
+            next_run_time.isoformat(timespec="seconds")
+            if next_run_time
+            else None
+        )
+
+    async def execute_agent_task(self, task_id: int) -> tuple[bool, str]:
+        """
+        唤醒 Agent 执行指定自主定时任务。
+
+        :param task_id: Agent 定时任务 ID
+        :return: 执行是否成功及结果摘要
+        """
+        from app.agent import agent_manager
+
+        try:
+            return await agent_manager.execute_scheduled_task(task_id)
+        finally:
+            task = AgentTaskOper().get(task_id)
+            if task and task.trigger_type == "date" and not task.enabled:
+                self.remove_agent_task_job(task_id)
 
     def init_plugin_jobs(self):
         """

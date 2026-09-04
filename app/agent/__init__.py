@@ -58,6 +58,7 @@ from app.chain import ChainBase
 from app.core.config import settings
 from app.core.event import eventmanager
 from app.db.agentchat_oper import AgentChatOper
+from app.db.agenttask_oper import AgentTaskOper
 from app.db.user_oper import UserOper
 from app.log import logger
 from app.schemas import AgentLLMProviderEventData, AgentTokensUsageEventData, Notification, NotificationType
@@ -67,6 +68,8 @@ from app.utils.identity import SYSTEM_INTERNAL_USER_ID
 
 
 class AgentChain(ChainBase):
+    """Agent 业务处理链。"""
+
     pass
 
 
@@ -126,9 +129,18 @@ class _SessionUsageSnapshot:
     last_output_tokens: int = 0
     last_total_tokens: int = 0
     last_context_usage_ratio: Optional[float] = None
+    last_cache_usage_available: bool = False
+    last_cache_read_input_tokens: int = 0
+    last_cache_write_input_tokens: int = 0
+    last_uncached_input_tokens: int = 0
+    last_cache_hit_ratio: Optional[float] = None
     total_input_tokens: int = 0
     total_output_tokens: int = 0
     total_tokens: int = 0
+    total_cache_read_input_tokens: int = 0
+    total_cache_write_input_tokens: int = 0
+    total_uncached_input_tokens: int = 0
+    cache_usage_available: bool = False
     model_call_count: int = 0
     last_updated_at: Optional[datetime] = None
 
@@ -141,9 +153,23 @@ class _SessionUsageSnapshot:
             "last_output_tokens": self.last_output_tokens,
             "last_total_tokens": self.last_total_tokens,
             "last_context_usage_ratio": self.last_context_usage_ratio,
+            "last_cache_usage_available": self.last_cache_usage_available,
+            "last_cache_read_input_tokens": self.last_cache_read_input_tokens,
+            "last_cache_write_input_tokens": self.last_cache_write_input_tokens,
+            "last_uncached_input_tokens": self.last_uncached_input_tokens,
+            "last_cache_hit_ratio": self.last_cache_hit_ratio,
             "total_input_tokens": self.total_input_tokens,
             "total_output_tokens": self.total_output_tokens,
             "total_tokens": self.total_tokens,
+            "total_cache_read_input_tokens": self.total_cache_read_input_tokens,
+            "total_cache_write_input_tokens": self.total_cache_write_input_tokens,
+            "total_uncached_input_tokens": self.total_uncached_input_tokens,
+            "cache_usage_available": self.cache_usage_available,
+            "total_cache_hit_ratio": (
+                self.total_cache_read_input_tokens / self.total_input_tokens
+                if self.cache_usage_available and self.total_input_tokens
+                else None
+            ),
             "model_call_count": self.model_call_count,
             "last_updated_at": self.last_updated_at.strftime("%Y-%m-%d %H:%M:%S")
             if self.last_updated_at
@@ -315,13 +341,19 @@ class MoviePilotAgent:
         """
         构造可展示的 Agent 会话消息。
         """
+        normalized_content = content or ""
         return {
             "id": f"{role}-{uuid.uuid4().hex}",
             "role": role,
-            "content": content or "",
+            "content": normalized_content,
             "createdAt": cls._current_timestamp_ms(),
             "status": status,
             "tools": [],
+            "segments": (
+                [{"type": "text", "content": normalized_content}]
+                if normalized_content
+                else []
+            ),
             "attachments": attachments or [],
             "choices": [],
         }
@@ -545,9 +577,33 @@ class MoviePilotAgent:
         self._session_usage.last_output_tokens = output_tokens
         self._session_usage.last_total_tokens = total_tokens
         self._session_usage.last_context_usage_ratio = usage.get("context_usage_ratio")
+        cache_usage_available = bool(usage.get("cache_usage_available"))
+        cache_read_input_tokens = self._coerce_int(
+            usage.get("cache_read_input_tokens")
+        ) or 0
+        cache_write_input_tokens = self._coerce_int(
+            usage.get("cache_write_input_tokens")
+        ) or 0
+        uncached_input_tokens = self._coerce_int(
+            usage.get("uncached_input_tokens")
+        )
+        if uncached_input_tokens is None:
+            uncached_input_tokens = max(
+                input_tokens - cache_read_input_tokens - cache_write_input_tokens,
+                0,
+            )
+        self._session_usage.last_cache_usage_available = cache_usage_available
+        self._session_usage.last_cache_read_input_tokens = cache_read_input_tokens
+        self._session_usage.last_cache_write_input_tokens = cache_write_input_tokens
+        self._session_usage.last_uncached_input_tokens = uncached_input_tokens
+        self._session_usage.last_cache_hit_ratio = usage.get("cache_hit_ratio")
         self._session_usage.total_input_tokens += input_tokens
         self._session_usage.total_output_tokens += output_tokens
         self._session_usage.total_tokens += total_tokens
+        self._session_usage.total_cache_read_input_tokens += cache_read_input_tokens
+        self._session_usage.total_cache_write_input_tokens += cache_write_input_tokens
+        self._session_usage.total_uncached_input_tokens += uncached_input_tokens
+        self._session_usage.cache_usage_available |= cache_usage_available
 
     def get_session_status(self) -> dict[str, Any]:
         if not self._session_usage.model:
@@ -581,6 +637,17 @@ class MoviePilotAgent:
                 input_tokens=self._session_usage.total_input_tokens,
                 output_tokens=self._session_usage.total_output_tokens,
                 total_tokens=self._session_usage.total_tokens,
+                cache_read_input_tokens=self._session_usage.total_cache_read_input_tokens,
+                cache_write_input_tokens=self._session_usage.total_cache_write_input_tokens,
+                uncached_input_tokens=self._session_usage.total_uncached_input_tokens,
+                cache_hit_ratio=(
+                    self._session_usage.total_cache_read_input_tokens
+                    / self._session_usage.total_input_tokens
+                    if self._session_usage.cache_usage_available
+                    and self._session_usage.total_input_tokens
+                    else None
+                ),
+                cache_usage_available=self._session_usage.cache_usage_available,
                 model_call_count=self._session_usage.model_call_count,
                 success=success,
                 error=error,
@@ -712,7 +779,7 @@ class MoviePilotAgent:
         """
         通过链式事件解析本次 Agent 可用的 LLM 运行时配置。
 
-        若没有插件返回 selected_provider_id，则沿用系统配置，保持既有行为。
+        插件未返回有效配置时沿用系统配置，显式返回的配置优先。
         """
         if self._llm_runtime_config is not None:
             return self._llm_runtime_config
@@ -725,7 +792,9 @@ class MoviePilotAgent:
             base_url_preset=settings.LLM_BASE_URL_PRESET,
             user_agent=settings.LLM_USER_AGENT,
             use_proxy=settings.LLM_USE_PROXY,
-            thinking_level=None,
+            thinking_level=settings.LLM_THINKING_LEVEL,
+            api_protocol=settings.LLM_API_PROTOCOL,
+            web_search_mode=settings.LLM_WEB_SEARCH_MODE,
         )
         selected_event = await eventmanager.async_send_event(
             ChainEventType.AgentLLMProvider,
@@ -760,9 +829,18 @@ class MoviePilotAgent:
         use_proxy = self._get_event_value(resolved_data, "use_proxy")
         if use_proxy is None:
             use_proxy = settings.LLM_USE_PROXY
-        thinking_level = self._clean_optional_text(
-            self._get_event_value(resolved_data, "thinking_level")
+        thinking_level = (
+                self._clean_optional_text(
+                    self._get_event_value(resolved_data, "thinking_level")
+                )
+                or settings.LLM_THINKING_LEVEL
         )
+        api_protocol = self._clean_optional_text(
+            self._get_event_value(resolved_data, "api_protocol")
+        ) or settings.LLM_API_PROTOCOL
+        web_search_mode = self._clean_optional_text(
+            self._get_event_value(resolved_data, "web_search_mode")
+        ) or settings.LLM_WEB_SEARCH_MODE
         selected_provider_id = self._clean_optional_text(
             self._get_event_value(resolved_data, "selected_provider_id")
         )
@@ -788,6 +866,8 @@ class MoviePilotAgent:
             "user_agent": user_agent,
             "use_proxy": bool(use_proxy),
             "thinking_level": thinking_level,
+            "api_protocol": api_protocol,
+            "web_search_mode": web_search_mode,
         }
         return self._llm_runtime_config
 
@@ -797,7 +877,17 @@ class MoviePilotAgent:
         :param streaming: 是否启用流式输出
         """
         runtime_config = await self._resolve_llm_runtime_config()
-        return await LLMHelper.get_llm(streaming=streaming, **runtime_config)
+        return await LLMHelper.get_llm(
+            streaming=streaming,
+            prompt_cache_key=self._build_prompt_cache_key(),
+            **runtime_config,
+        )
+
+    def _build_prompt_cache_key(self) -> str:
+        """生成不暴露用户标识、且在同一会话内稳定的提示词缓存键。"""
+        cache_identity = f"{self.user_id or ''}\x00{self.session_id}"
+        digest = hashlib.sha256(cache_identity.encode("utf-8")).hexdigest()[:32]
+        return f"moviepilot-agent-{digest}"
 
     @classmethod
     def _has_image_input_content(cls, content: Any) -> bool:
@@ -995,6 +1085,13 @@ class MoviePilotAgent:
             allow_message_tools=self.allow_message_tools,
         )
 
+    @staticmethod
+    def _filter_local_web_search_tools(tools: List, enabled: bool) -> List:
+        """按联网搜索策略保留或移除本地 search_web 工具。"""
+        if enabled:
+            return tools
+        return [tool for tool in tools if getattr(tool, "name", None) != "search_web"]
+
     def _refresh_tool_context(self, values: Dict[str, object]) -> None:
         """
         刷新本轮工具共享上下文。
@@ -1023,6 +1120,8 @@ class MoviePilotAgent:
             runtime_config.get("user_agent"),
             bool(runtime_config.get("use_proxy")),
             runtime_config.get("thinking_level"),
+            runtime_config.get("api_protocol"),
+            runtime_config.get("web_search_mode"),
         )
 
     async def _agent_bundle_signature(self, streaming: bool) -> tuple[Any, ...]:
@@ -1039,6 +1138,7 @@ class MoviePilotAgent:
             self.has_message_context,
             self.is_background,
             settings.AI_AGENT_VERBOSE,
+            settings.LLM_TEMPERATURE,
             settings.LLM_MAX_TOOLS,
             settings.LLM_MAX_ITERATIONS,
             self._public_runtime_config_signature(runtime_config),
@@ -1152,6 +1252,8 @@ class MoviePilotAgent:
             # LLM 模型（用于 agent 执行）
             agent_model = await self._initialize_llm(streaming=streaming)
             self._sync_model_profile(agent_model)
+            server_tools = LLMHelper.get_server_tools(agent_model)
+            use_local_web_search = LLMHelper.should_use_local_web_search(agent_model)
 
             # 为内部模型调用准备非流式 LLM，避免与用户流式回复复用同一实例。
             non_streaming_model = (
@@ -1161,7 +1263,10 @@ class MoviePilotAgent:
             )
 
             # 工具列表
-            tools = self._initialize_tools()
+            tools = self._filter_local_web_search_tools(
+                self._initialize_tools(),
+                enabled=use_local_web_search,
+            )
             tools.extend(await self._initialize_mcp_tools())
             skills_middleware = SkillsMiddleware(
                 sources=[str(agent_runtime_manager.skills_dir)],
@@ -1179,11 +1284,15 @@ class MoviePilotAgent:
                 activity_log_tools = list(
                     getattr(activity_log_middleware, "tools", []) or []
                 )
-            subagent_tools = self._initialize_subagent_tools()
+            subagent_tools = self._filter_local_web_search_tools(
+                self._initialize_subagent_tools(),
+                enabled=use_local_web_search,
+            )
             subagent_tools.extend(await self._initialize_subagent_mcp_tools())
             subagent_middlewares, subagent_task_tools = create_subagent_middlewares(
                 model=non_streaming_model,
                 tools=subagent_tools,
+                server_tools=server_tools,
                 stream_handler=self.stream_handler,
             )
             max_tools = settings.LLM_MAX_TOOLS
@@ -1258,7 +1367,7 @@ class MoviePilotAgent:
 
             agent = create_agent(
                 model=agent_model,
-                tools=[*tools, *skill_tools, *activity_log_tools],
+                tools=[*tools, *skill_tools, *activity_log_tools, *server_tools],
                 system_prompt=system_prompt,
                 middleware=middlewares,
                 checkpointer=InMemorySaver(),
@@ -1627,20 +1736,21 @@ class MoviePilotAgent:
             if not streaming_stopped:
                 await self.stream_handler.stop_streaming()
 
-    async def send_agent_message(self, message: str, title: str = ""):
+    async def send_agent_message(self, message: str, title: str = "") -> None:
         """
-        通过原渠道发送消息给用户
+        发送 Agent 消息；后台任务不绑定原渠道，交由通知链广播。
         """
+        broadcast = self.is_background
         self._save_assistant_display_message_once(message)
         await AgentChain().async_post_message(
             Notification(
-                channel=self.channel,
-                source=self.source,
+                channel=None if broadcast else self.channel,
+                source=None if broadcast else self.source,
                 mtype=NotificationType.Agent,
-                userid=self.user_id,
-                username=self.username,
-                original_message_id=self.original_message_id,
-                original_chat_id=self.original_chat_id,
+                userid=None if broadcast else self.user_id,
+                username=self.username or (settings.SUPERUSER if broadcast else None),
+                original_message_id=None if broadcast else self.original_message_id,
+                original_chat_id=None if broadcast else self.original_chat_id,
                 title=title,
                 text=message,
                 save_history=False,
@@ -2000,12 +2110,11 @@ class AgentManager:
         else:
             agent = self.active_agents[session_id]
             agent.user_id = task.user_id
-            if task.channel:
-                agent.channel = task.channel
-            if task.source:
-                agent.source = task.source
-            if task.username:
-                agent.username = task.username
+            # 每条队列任务都携带完整消息上下文，None 也必须覆盖，避免后台任务
+            # 复用会话 Agent 时继续沿用上一条入站消息的渠道。
+            agent.channel = task.channel
+            agent.source = task.source
+            agent.username = task.username
             agent.original_message_id = task.original_message_id
             agent.original_chat_id = task.original_chat_id
             agent.reply_mode = task.reply_mode
@@ -2122,6 +2231,78 @@ class AgentManager:
         finally:
             await agent.cleanup()
             memory_manager.clear_memory(session_id, user_id)
+
+    async def execute_scheduled_task(self, task_id: int) -> tuple[bool, str]:
+        """
+        按持久化上下文唤醒 Agent 执行自主定时任务并向用户回传结果。
+
+        :param task_id: Agent 定时任务 ID
+        :return: 执行是否成功及结果摘要
+        """
+        if not settings.AI_AGENT_ENABLE:
+            return False, "AI Agent 未启用"
+        oper = AgentTaskOper()
+        task = oper.get(task_id)
+        if not task or not task.enabled:
+            return False, "Agent 定时任务不存在或已停用"
+        if not oper.mark_running(task_id):
+            return False, "Agent 定时任务当前不可执行"
+
+        task_message = (
+            f"定时任务已按计划触发。请立即完成下面的任务，不要只确认收到，"
+            f"也不要重复创建同一个定时任务。\n\n"
+            f"任务名称：{task.name}\n"
+            f"任务内容：{task.content}\n\n"
+            "完成后请直接向用户发送消息报告本次执行结果；如果无法完成，也需发送消息说明原因。"
+        )
+        success = True
+        result = ""
+        notification_username = task.username or settings.SUPERUSER
+        try:
+            result = await self.process_message(
+                session_id=task.session_id,
+                user_id=task.user_id,
+                message=task_message,
+                channel=None,
+                source=None,
+                username=notification_username,
+                original_chat_id=None,
+                reply_mode=ReplyMode.DISPATCH,
+                allow_message_tools=True,
+                wait_for_completion=True,
+            )
+            result_text = str(result or "").strip()
+            success = not result_text.startswith(
+                (AGENT_EXECUTION_ERROR_PREFIX, "处理消息时发生错误")
+            )
+        except Exception as err:
+            success = False
+            result = f"Agent 定时任务执行失败：{str(err)}"
+            logger.error(f"Agent 定时任务 {task_id} 执行失败: {str(err)}")
+            await AgentChain().async_post_message(
+                Notification(
+                    mtype=NotificationType.Agent,
+                    username=notification_username,
+                    title=f"定时任务执行失败：{task.name}",
+                    text=result,
+                    save_history=False,
+                )
+            )
+        finally:
+            current_task = oper.get(task_id)
+            oper.finish(
+                task_id=task_id,
+                success=success,
+                result=str(result or ""),
+                disable=bool(
+                    current_task
+                    and task.trigger_type == "date"
+                    and current_task.trigger_type == task.trigger_type
+                    and current_task.run_at == task.run_at
+                ),
+            )
+
+        return success, str(result or "任务执行完成")
 
     @staticmethod
     def _build_heartbeat_prompt() -> str:

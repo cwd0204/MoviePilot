@@ -27,11 +27,13 @@ class MediaServerChain(ChainBase):
 
     def _sign_library_images(
         self, libraries: Optional[List[MediaServerLibrary]]
-    ) -> List[MediaServerLibrary]:
+    ) -> Optional[List[MediaServerLibrary]]:
         """
-        给媒体库列表中的封面和封面组添加代理签名。
+        给媒体库列表中的封面和封面组添加代理签名，并保留提供方失败状态。
         """
-        for library in libraries or []:
+        if libraries is None:
+            return None
+        for library in libraries:
             if library.image:
                 library.image = self._sign_image_url(library.image)
             if library.image_list:
@@ -40,21 +42,23 @@ class MediaServerChain(ChainBase):
                     for image in library.image_list
                     if image
                 ]
-        return libraries or []
+        return libraries
 
     def _sign_play_item_images(
         self, items: Optional[List[MediaServerPlayItem]]
-    ) -> List[MediaServerPlayItem]:
+    ) -> Optional[List[MediaServerPlayItem]]:
         """
-        给媒体服务器播放条目中的图片 URL 添加代理签名。
+        给媒体服务器播放条目中的图片 URL 添加代理签名，并保留提供方失败状态。
         """
-        for item in items or []:
+        if items is None:
+            return None
+        for item in items:
             if item.image:
                 item.image = self._sign_image_url(item.image)
-        return items or []
+        return items
 
     def librarys(self, server: str, username: Optional[str] = None,
-                 hidden: bool = False) -> List[MediaServerLibrary]:
+                 hidden: bool = False) -> Optional[List[MediaServerLibrary]]:
         """
         获取媒体服务器所有媒体库
         """
@@ -151,7 +155,7 @@ class MediaServerChain(ChainBase):
         return self.run_module("mediaserver_tv_episodes", server=server, item_id=item_id)
 
     def playing(self, server: str, count: Optional[int] = 20,
-                username: Optional[str] = None) -> List[MediaServerPlayItem]:
+                username: Optional[str] = None) -> Optional[List[MediaServerPlayItem]]:
         """
         获取媒体服务器正在播放信息
         """
@@ -165,7 +169,7 @@ class MediaServerChain(ChainBase):
         )
 
     def latest(self, server: str, count: Optional[int] = 20,
-               username: Optional[str] = None) -> List[MediaServerPlayItem]:
+               username: Optional[str] = None) -> Optional[List[MediaServerPlayItem]]:
         """
         获取媒体服务器最新入库条目
         """
@@ -238,11 +242,16 @@ class MediaServerChain(ChainBase):
             "mediaserver_image_cookies", server=server, image_url=image_url
         )
 
-    def sync(self, progress_callback: Optional[Callable[..., None]] = None) -> None:
+    def sync(
+            self,
+            progress_callback: Optional[Callable[..., None]] = None,
+            server: Optional[str] = None,
+    ) -> None:
         """
-        同步媒体库所有数据到本地数据库
+        同步全部或指定媒体服务器的媒体库数据到本地数据库
 
         :param progress_callback: 定时服务进度更新回调
+        :param server: 指定媒体服务器名称，为空时同步全部已启用服务器
         """
         # 设置的媒体服务器
         mediaservers = ServiceConfigHelper.get_mediaserver_configs()
@@ -257,7 +266,14 @@ class MediaServerChain(ChainBase):
             enabled_servers = [mediaserver.name for mediaserver in mediaservers
                                if mediaserver and mediaserver.enabled and mediaserver.name]
             dboper.delete_excluded_servers(enabled_servers)
+            if server:
+                mediaservers = [
+                    mediaserver for mediaserver in mediaservers
+                    if mediaserver and mediaserver.enabled and mediaserver.name == server
+                ]
             total_servers = len(enabled_servers)
+            if server:
+                total_servers = len(mediaservers)
             if progress_callback:
                 progress_callback(
                     value=0,
@@ -266,7 +282,13 @@ class MediaServerChain(ChainBase):
                 )
             if not total_servers:
                 if progress_callback:
-                    progress_callback(value=100, text="没有已启用的媒体服务器")
+                    progress_callback(
+                        value=100,
+                        text=(
+                            f"媒体服务器 {server} 未启用或不存在"
+                            if server else "没有已启用的媒体服务器"
+                        ),
+                    )
                 return
 
             server_sync_contexts = {}

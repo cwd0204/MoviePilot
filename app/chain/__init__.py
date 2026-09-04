@@ -20,6 +20,7 @@ from app.core.meta import MetaBase
 from app.core.module import ModuleManager
 from app.core.plugin import PluginManager
 from app.db.message_oper import MessageOper
+from app.db.systemconfig_oper import SystemConfigOper
 from app.db.user_oper import UserOper
 from app.helper.message import MessageHelper, MessageQueueManager, MessageTemplateHelper
 from app.helper.server import MoviePilotServerHelper
@@ -40,6 +41,7 @@ from app.schemas import (
     MessageResponse,
 )
 from app.utils.identity import normalize_internal_user_id
+from app.utils.media import normalize_media_source
 from app.schemas.message import ChannelCapability, ChannelCapabilityManager
 from app.schemas.category import CategoryConfig
 from app.schemas.types import (
@@ -48,6 +50,7 @@ from app.schemas.types import (
     MediaImageType,
     EventType,
     MessageChannel,
+    SystemConfigKey,
 )
 from app.utils.object import ObjectUtils
 
@@ -464,15 +467,20 @@ class ChainBase(metaclass=ABCMeta):
                 )
         return result
 
-    def run_module(self, method: str, *args, **kwargs) -> Any:
+    def run_module(
+            self,
+            method: str,
+            *args,
+            **kwargs,
+    ) -> Any:
         """
         运行包含该方法的所有模块，然后返回结果
         当kwargs包含命名参数raise_exception时，如模块方法抛出异常且raise_exception为True，则同步抛出异常
-        """
-        result = None
 
+        :param method: 模块方法名称
+        """
         # 执行插件模块
-        result = self.__execute_plugin_modules(method, result, *args, **kwargs)
+        result = self.__execute_plugin_modules(method, None, *args, **kwargs)
 
         if not self.__is_valid_empty(result) and not isinstance(result, list):
             # 插件模块返回结果不为空且不是列表，直接返回
@@ -481,17 +489,22 @@ class ChainBase(metaclass=ABCMeta):
         # 执行系统模块
         return self.__execute_system_modules(method, result, *args, **kwargs)
 
-    async def async_run_module(self, method: str, *args, **kwargs) -> Any:
+    async def async_run_module(
+            self,
+            method: str,
+            *args,
+            **kwargs,
+    ) -> Any:
         """
         异步运行包含该方法的所有模块，然后返回结果
         当kwargs包含命名参数raise_exception时，如模块方法抛出异常且raise_exception为True，则同步抛出异常
         支持异步和同步方法的混合调用
-        """
-        result = None
 
+        :param method: 模块方法名称
+        """
         # 执行插件模块
         result = await self.__async_execute_plugin_modules(
-            method, result, *args, **kwargs
+            method, None, *args, **kwargs
         )
 
         if not self.__is_valid_empty(result) and not isinstance(result, list):
@@ -509,6 +522,7 @@ class ChainBase(metaclass=ABCMeta):
             tmdbid: Optional[int],
             doubanid: Optional[str],
             bangumiid: Optional[int],
+            anilistid: Optional[int],
     ) -> bool:
         """
         仅在名称识别场景下使用共享识别，显式ID识别不再重复回查
@@ -516,7 +530,7 @@ class ChainBase(metaclass=ABCMeta):
         return bool(
             settings.MEDIA_RECOGNIZE_SHARE
             and meta
-            and not any([tmdbid, doubanid, bangumiid])
+            and not any([tmdbid, doubanid, bangumiid, anilistid])
         )
 
     @staticmethod
@@ -560,13 +574,76 @@ class ChainBase(metaclass=ABCMeta):
             mediainfo=mediainfo,
         )
 
+    @staticmethod
+    def _record_media_recognize_share_hit() -> None:
+        """记录一次共享媒体识别成功命中，统计失败不影响识别结果。"""
+        try:
+            SystemConfigOper().increment(SystemConfigKey.MediaRecognizeShareCount)
+        except Exception as err:
+            logger.error(f"记录共享媒体识别命中次数失败：{str(err)}")
+
+    @staticmethod
+    def _resolve_media_source_params(
+            source: Optional[str] = None,
+            mediaid: Optional[str] = None,
+            tmdbid: Optional[int] = None,
+            doubanid: Optional[str] = None,
+            bangumiid: Optional[int] = None,
+            anilistid: Optional[int] = None,
+    ) -> Tuple[Optional[str], Optional[int], Optional[str], Optional[int], Optional[int]]:
+        """
+        统一请求级数据源ID与兼容字段，并保证同一次识别只携带一个来源ID。
+
+        :param source: 数据源名称
+        :param mediaid: 数据源原生ID
+        :param tmdbid: TMDB兼容ID
+        :param doubanid: 豆瓣兼容ID
+        :param bangumiid: Bangumi兼容ID
+        :param anilistid: AniList兼容ID
+        :return: 数据源及四种兼容ID
+        """
+        source = normalize_media_source(source)
+
+        def to_int(value) -> Optional[int]:
+            """将数字ID安全转换为整数。"""
+            return int(value) if value is not None and str(value).isdigit() else None
+
+        if source:
+            source_ids = {
+                "themoviedb": to_int(mediaid) if mediaid else to_int(tmdbid),
+                "douban": str(mediaid) if mediaid else str(doubanid) if doubanid else None,
+                "bangumi": to_int(mediaid) if mediaid else to_int(bangumiid),
+                "anilist": to_int(mediaid) if mediaid else to_int(anilistid),
+            }
+            selected_id = source_ids.get(source)
+            return (
+                source,
+                selected_id if source == "themoviedb" else None,
+                selected_id if source == "douban" else None,
+                selected_id if source == "bangumi" else None,
+                selected_id if source == "anilist" else None,
+            )
+
+        if tmdbid:
+            return "themoviedb", int(tmdbid), None, None, None
+        if doubanid:
+            return "douban", None, str(doubanid), None, None
+        if bangumiid:
+            return "bangumi", None, None, int(bangumiid), None
+        if anilistid:
+            return "anilist", None, None, None, int(anilistid)
+        return source, None, None, None, None
+
     def recognize_media(
             self,
             meta: MetaBase = None,
             mtype: Optional[MediaType] = None,
+            source: Optional[str] = None,
+            mediaid: Optional[str] = None,
             tmdbid: Optional[int] = None,
             doubanid: Optional[str] = None,
             bangumiid: Optional[int] = None,
+            anilistid: Optional[int] = None,
             episode_group: Optional[str] = None,
             cache: bool = True,
             share_meta: MetaBase = None,
@@ -576,9 +653,12 @@ class ChainBase(metaclass=ABCMeta):
         :param meta:     识别的元数据
         :param share_meta: 共享识别查询/上报使用的原始元数据
         :param mtype:    识别的媒体类型，与tmdbid配套
+        :param source:   请求级识别数据源
+        :param mediaid:  与source配套的数据源原生ID
         :param tmdbid:   tmdbid
         :param doubanid: 豆瓣ID
         :param bangumiid: BangumiID
+        :param anilistid: AniList ID
         :param episode_group: 剧集组
         :param cache:    是否使用缓存
         :return: 识别的媒体信息，包括剧集信息
@@ -588,25 +668,41 @@ class ChainBase(metaclass=ABCMeta):
             tmdbid = meta.tmdbid
         if not doubanid and hasattr(meta, "doubanid"):
             doubanid = meta.doubanid
+        if not source and hasattr(meta, "media_source"):
+            source = meta.media_source
+        if not mediaid and hasattr(meta, "media_id"):
+            mediaid = meta.media_id
+        requested_mediaid = mediaid
         if not episode_group and hasattr(meta, "episode_group"):
             episode_group = meta.episode_group
-        # 有tmdbid时，不使用meta推断的类型（由消歧逻辑决定），也不使用其它ID
-        if tmdbid:
-            doubanid = None
-            bangumiid = None
-        elif not mtype and meta and meta.type in [MediaType.TV, MediaType.MOVIE]:
+        source, tmdbid, doubanid, bangumiid, anilistid = self._resolve_media_source_params(
+            source=source,
+            mediaid=mediaid,
+            tmdbid=tmdbid,
+            doubanid=doubanid,
+            bangumiid=bangumiid,
+            anilistid=anilistid,
+        )
+        # 显式 TMDB ID 由模块自行消歧，不能被标题推断类型误导。
+        if not mtype and not tmdbid and meta and meta.type in [MediaType.TV, MediaType.MOVIE]:
             mtype = meta.type
         share_query_meta = share_meta or meta
+        module_kwargs = {
+            "meta": meta,
+            "mtype": mtype,
+            "source": source,
+            "mediaid": requested_mediaid,
+            "tmdbid": tmdbid,
+            "doubanid": doubanid,
+            "bangumiid": bangumiid,
+            "anilistid": anilistid,
+            "episode_group": episode_group,
+            "cache": cache,
+        }
         with fresh(not cache):
             mediainfo = self.run_module(
                 "recognize_media",
-                meta=meta,
-                mtype=mtype,
-                tmdbid=tmdbid,
-                doubanid=doubanid,
-                bangumiid=bangumiid,
-                episode_group=episode_group,
-                cache=cache,
+                **module_kwargs,
             )
         if mediainfo:
             if not mediainfo.recognize_cache_hit:
@@ -617,8 +713,8 @@ class ChainBase(metaclass=ABCMeta):
                 )
             return mediainfo
 
-        if self._can_use_media_recognize_share(
-                share_query_meta, tmdbid, doubanid, bangumiid
+        if not source and self._can_use_media_recognize_share(
+                share_query_meta, tmdbid, doubanid, bangumiid, anilistid
         ):
             shared_cache_meta = self._snapshot_recognize_cache_meta(meta)
             shared_item = MoviePilotServerHelper.query_recognize_share(
@@ -633,14 +729,18 @@ class ChainBase(metaclass=ABCMeta):
                         "recognize_media",
                         meta=meta,
                         mtype=shared_params.get("mtype") or mtype,
+                        source=shared_params.get("source"),
+                        mediaid=shared_params.get("mediaid"),
                         tmdbid=shared_params.get("tmdbid"),
                         doubanid=shared_params.get("doubanid"),
                         bangumiid=shared_params.get("bangumiid"),
+                        anilistid=shared_params.get("anilistid"),
                         episode_group=episode_group,
                         cache=cache,
                     )
                 if mediainfo:
                     self._update_local_recognize_cache(shared_cache_meta, mediainfo)
+                    self._record_media_recognize_share_hit()
                     return mediainfo
         return None
 
@@ -648,9 +748,12 @@ class ChainBase(metaclass=ABCMeta):
             self,
             meta: MetaBase = None,
             mtype: Optional[MediaType] = None,
+            source: Optional[str] = None,
+            mediaid: Optional[str] = None,
             tmdbid: Optional[int] = None,
             doubanid: Optional[str] = None,
             bangumiid: Optional[int] = None,
+            anilistid: Optional[int] = None,
             episode_group: Optional[str] = None,
             cache: bool = True,
             share_meta: MetaBase = None,
@@ -660,9 +763,12 @@ class ChainBase(metaclass=ABCMeta):
         :param meta:     识别的元数据
         :param share_meta: 共享识别查询/上报使用的原始元数据
         :param mtype:    识别的媒体类型，与tmdbid配套
+        :param source:   请求级识别数据源
+        :param mediaid:  与source配套的数据源原生ID
         :param tmdbid:   tmdbid
         :param doubanid: 豆瓣ID
         :param bangumiid: BangumiID
+        :param anilistid: AniList ID
         :param episode_group: 剧集组
         :param cache:    是否使用缓存
         :return: 识别的媒体信息，包括剧集信息
@@ -672,25 +778,41 @@ class ChainBase(metaclass=ABCMeta):
             tmdbid = meta.tmdbid
         if not doubanid and hasattr(meta, "doubanid"):
             doubanid = meta.doubanid
+        if not source and hasattr(meta, "media_source"):
+            source = meta.media_source
+        if not mediaid and hasattr(meta, "media_id"):
+            mediaid = meta.media_id
+        requested_mediaid = mediaid
         if not episode_group and hasattr(meta, "episode_group"):
             episode_group = meta.episode_group
-        # 有tmdbid时，不使用meta推断的类型（由消歧逻辑决定），也不使用其它ID
-        if tmdbid:
-            doubanid = None
-            bangumiid = None
-        elif not mtype and meta and meta.type in [MediaType.TV, MediaType.MOVIE]:
+        source, tmdbid, doubanid, bangumiid, anilistid = self._resolve_media_source_params(
+            source=source,
+            mediaid=mediaid,
+            tmdbid=tmdbid,
+            doubanid=doubanid,
+            bangumiid=bangumiid,
+            anilistid=anilistid,
+        )
+        # 显式 TMDB ID 由模块自行消歧，不能被标题推断类型误导。
+        if not mtype and not tmdbid and meta and meta.type in [MediaType.TV, MediaType.MOVIE]:
             mtype = meta.type
         share_query_meta = share_meta or meta
+        module_kwargs = {
+            "meta": meta,
+            "mtype": mtype,
+            "source": source,
+            "mediaid": requested_mediaid,
+            "tmdbid": tmdbid,
+            "doubanid": doubanid,
+            "bangumiid": bangumiid,
+            "anilistid": anilistid,
+            "episode_group": episode_group,
+            "cache": cache,
+        }
         async with async_fresh(not cache):
             mediainfo = await self.async_run_module(
                 "async_recognize_media",
-                meta=meta,
-                mtype=mtype,
-                tmdbid=tmdbid,
-                doubanid=doubanid,
-                bangumiid=bangumiid,
-                episode_group=episode_group,
-                cache=cache,
+                **module_kwargs,
             )
         if mediainfo:
             if not mediainfo.recognize_cache_hit:
@@ -701,8 +823,8 @@ class ChainBase(metaclass=ABCMeta):
                 )
             return mediainfo
 
-        if self._can_use_media_recognize_share(
-                share_query_meta, tmdbid, doubanid, bangumiid
+        if not source and self._can_use_media_recognize_share(
+                share_query_meta, tmdbid, doubanid, bangumiid, anilistid
         ):
             shared_cache_meta = self._snapshot_recognize_cache_meta(meta)
             shared_item = await MoviePilotServerHelper.async_query_recognize_share(
@@ -717,14 +839,18 @@ class ChainBase(metaclass=ABCMeta):
                         "async_recognize_media",
                         meta=meta,
                         mtype=shared_params.get("mtype") or mtype,
+                        source=shared_params.get("source"),
+                        mediaid=shared_params.get("mediaid"),
                         tmdbid=shared_params.get("tmdbid"),
                         doubanid=shared_params.get("doubanid"),
                         bangumiid=shared_params.get("bangumiid"),
+                        anilistid=shared_params.get("anilistid"),
                         episode_group=episode_group,
                         cache=cache,
                     )
                 if mediainfo:
                     await self._async_update_local_recognize_cache(shared_cache_meta, mediainfo)
+                    await run_in_threadpool(self._record_media_recognize_share_hit)
                     return mediainfo
         return None
 
@@ -984,49 +1110,77 @@ class ChainBase(metaclass=ABCMeta):
         """
         return self.run_module("webhook_parser", body=body, form=form, args=args)
 
-    def search_medias(self, meta: MetaBase) -> Optional[List[MediaInfo]]:
+    def search_medias(
+        self, meta: MetaBase, source: Optional[str] = None
+    ) -> Optional[List[MediaInfo]]:
         """
         搜索媒体信息
         :param meta:  识别的元数据
-        :reutrn: 媒体信息列表
+        :param source: 请求级搜索数据源
+        :return: 媒体信息列表
         """
-        return self.run_module("search_medias", meta=meta)
+        return self.run_module("search_medias", meta=meta, source=source)
 
-    async def async_search_medias(self, meta: MetaBase) -> Optional[List[MediaInfo]]:
+    async def async_search_medias(
+        self, meta: MetaBase, source: Optional[str] = None
+    ) -> Optional[List[MediaInfo]]:
         """
         搜索媒体信息（异步版本）
         :param meta:  识别的元数据
-        :reutrn: 媒体信息列表
+        :param source: 请求级搜索数据源
+        :return: 媒体信息列表
         """
-        return await self.async_run_module("async_search_medias", meta=meta)
+        return await self.async_run_module(
+            "async_search_medias", meta=meta, source=source
+        )
 
-    def search_persons(self, name: str) -> Optional[List[MediaPerson]]:
+    def search_persons(
+        self, name: str, source: Optional[str] = None
+    ) -> Optional[List[MediaPerson]]:
         """
         搜索人物信息
         :param name:  人物名称
+        :param source: 请求级搜索数据源
+        :return: 人物信息列表
         """
-        return self.run_module("search_persons", name=name)
+        return self.run_module("search_persons", name=name, source=source)
 
-    async def async_search_persons(self, name: str) -> Optional[List[MediaPerson]]:
+    async def async_search_persons(
+        self, name: str, source: Optional[str] = None
+    ) -> Optional[List[MediaPerson]]:
         """
         搜索人物信息（异步版本）
         :param name:  人物名称
+        :param source: 请求级搜索数据源
+        :return: 人物信息列表
         """
-        return await self.async_run_module("async_search_persons", name=name)
+        return await self.async_run_module(
+            "async_search_persons", name=name, source=source
+        )
 
-    def search_collections(self, name: str) -> Optional[List[MediaInfo]]:
+    def search_collections(
+        self, name: str, source: Optional[str] = None
+    ) -> Optional[List[MediaInfo]]:
         """
         搜索集合信息
         :param name:  集合名称
+        :param source: 请求级搜索数据源
+        :return: 合集信息列表
         """
-        return self.run_module("search_collections", name=name)
+        return self.run_module("search_collections", name=name, source=source)
 
-    async def async_search_collections(self, name: str) -> Optional[List[MediaInfo]]:
+    async def async_search_collections(
+        self, name: str, source: Optional[str] = None
+    ) -> Optional[List[MediaInfo]]:
         """
         搜索集合信息（异步版本）
         :param name:  集合名称
+        :param source: 请求级搜索数据源
+        :return: 合集信息列表
         """
-        return await self.async_run_module("async_search_collections", name=name)
+        return await self.async_run_module(
+            "async_search_collections", name=name, source=source
+        )
 
     def get_search_page_size(
             self,

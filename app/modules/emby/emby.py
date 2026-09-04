@@ -118,38 +118,47 @@ class Emby:
             logger.error(f"连接Library/VirtualFolders/Query 出错：" + str(e))
             return []
 
-    def __get_emby_librarys(self, username: Optional[str] = None) -> List[dict]:
+    def __get_emby_librarys(self, username: Optional[str] = None) -> Optional[List[dict]]:
         """
         获取Emby媒体库列表
         """
         if not self._host or not self._apikey:
-            return []
+            return None
         if username:
             user = self.get_user(username)
         else:
             user = self.user
+        if not user:
+            return None
         url = f"{self._host}emby/Users/{user}/Views"
         params = {"api_key": self._apikey}
         try:
             res = RequestUtils().get_res(url, params)
             if res:
-                return res.json().get("Items")
+                items = res.json().get("Items")
+                return items if isinstance(items, list) else None
             else:
                 logger.error(f"User/Views 未获取到返回数据")
-                return []
+                return None
         except Exception as e:
             logger.error(f"连接User/Views 出错：" + str(e))
-            return []
+            return None
 
-    def get_librarys(self, username: Optional[str] = None, hidden: Optional[bool] = False) -> List[
-        schemas.MediaServerLibrary]:
+    def get_librarys(
+        self,
+        username: Optional[str] = None,
+        hidden: Optional[bool] = False,
+    ) -> Optional[List[schemas.MediaServerLibrary]]:
         """
         获取媒体服务器所有媒体库列表
         """
         if not self._host or not self._apikey:
-            return []
+            return None
+        source_libraries = self.__get_emby_librarys(username)
+        if source_libraries is None:
+            return None
         libraries = []
-        for library in self.__get_emby_librarys(username) or []:
+        for library in source_libraries:
             if hidden and self._sync_libraries and "all" not in self._sync_libraries \
                     and library.get("Id") not in self._sync_libraries:
                 continue
@@ -182,7 +191,12 @@ class Emby:
 
     def get_user(self, user_name: Optional[str] = None) -> Optional[Union[str, int]]:
         """
-        获得管理员用户
+        获取用于查询用户范围数据的用户ID
+
+        优先匹配指定用户名，其次匹配媒体服务器配置用户名，最后回退管理员。
+
+        :param user_name: 优先匹配的用户名
+        :return: 匹配到的用户ID，未找到可用用户时返回None
         """
         if not self._host or not self._apikey:
             return None
@@ -194,15 +208,18 @@ class Emby:
             res = RequestUtils().get_res(url, params)
             if res:
                 users = res.json()
-                # 先查询是否有与当前用户名称匹配的
-                if user_name:
-                    for user in users:
-                        if user.get("Name") == user_name:
-                            return user.get("Id")
+                candidate_usernames = []
+                for candidate_username in (user_name, self._username):
+                    if candidate_username and candidate_username not in candidate_usernames:
+                        candidate_usernames.append(candidate_username)
+                for candidate_username in candidate_usernames:
+                    for emby_user in users:
+                        if emby_user.get("Name") == candidate_username:
+                            return emby_user.get("Id")
                 # 查询管理员
-                for user in users:
-                    if user.get("Policy", {}).get("IsAdministrator"):
-                        return user.get("Id")
+                for emby_user in users:
+                    if emby_user.get("Policy", {}).get("IsAdministrator"):
+                        return emby_user.get("Id")
             else:
                 logger.error(f"Users 未获取到返回数据")
         except Exception as e:
@@ -1206,6 +1223,8 @@ class Emby:
             user = self.get_user(username)
         else:
             user = self.user
+        if not user:
+            return None
         url = f"{self._host}Users/{user}/Items/Resume"
         params = {
             "Limit": 100,
@@ -1266,7 +1285,7 @@ class Emby:
                 logger.error(f"Users/Items/Resume 未获取到返回数据")
         except Exception as e:
             logger.error(f"连接Users/Items/Resume出错：" + str(e))
-        return []
+        return None
 
     def get_latest(self, num: Optional[int] = 20, username: Optional[str] = None) -> Optional[
         List[schemas.MediaServerPlayItem]]:
@@ -1279,6 +1298,8 @@ class Emby:
             user = self.get_user(username)
         else:
             user = self.user
+        if not user:
+            return None
         url = f"{self._host}Users/{user}/Items/Latest"
         params = {
             "Limit": 100,
@@ -1323,7 +1344,7 @@ class Emby:
                 logger.error(f"Users/Items/Latest 未获取到返回数据")
         except Exception as e:
             logger.error(f"连接Users/Items/Latest出错：" + str(e))
-        return []
+        return None
 
     def get_user_library_folders(self):
         """

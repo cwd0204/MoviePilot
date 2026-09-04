@@ -240,6 +240,40 @@ def match_manual_transfer_target_path(
     )
 
 
+@router.post(
+    "/manual/history",
+    summary="查询手动转移成功历史",
+    response_model=schemas.Response,
+)
+def query_manual_transfer_history(
+    transer_item: ManualTransferItem,
+    db: Session = Depends(get_db),
+    _: User = Depends(get_current_active_manage_user),
+) -> Any:
+    """
+    查询文件或目录命中的成功整理记录。
+
+    :param transer_item: 手工整理项
+    :param db: 数据库
+    :param _: Token校验
+    """
+    src_fileitems, error_message = _resolve_manual_transfer_source_fileitems(
+        transer_item=transer_item,
+        db=db,
+    )
+    if error_message:
+        return schemas.Response(success=False, message=error_message)
+
+    histories = TransferChain().get_manual_transfer_histories(
+        _deduplicate_fileitems(src_fileitems)
+    )
+    history_info = schemas.ManualTransferHistoryInfo(
+        reorganize=bool(histories),
+        history_count=len(histories),
+    )
+    return schemas.Response(success=True, data=history_info.model_dump())
+
+
 @router.post("/manual", summary="手动转移", response_model=schemas.Response)
 def manual_transfer(
     transer_item: ManualTransferItem,
@@ -269,15 +303,20 @@ def manual_transfer(
             )
         # 强制转移
         force = True
-        downloader = history.downloader
-        download_hash = history.download_hash
+        # 下载器与 Hash 是同一组下载上下文，重新识别时由当前文件路径重新匹配。
+        downloader = history.downloader if transer_item.from_history else None
+        download_hash = history.download_hash if transer_item.from_history else None
         if history.status and ("move" in history.mode):
             # 重新整理成功的转移，则使用成功的 dest 做 in_path
             src_fileitems = [FileItem(**history.dest_fileitem)]
         else:
             # 源路径
             src_fileitems = [FileItem(**history.src_fileitem)]
-            if history.dest_fileitem and not transer_item.preview:
+            if (
+                history.dest_fileitem
+                and not transer_item.preview
+                and not transer_item.reorganize
+            ):
                 cleanup_dest_fileitem = FileItem(**history.dest_fileitem)
 
         # 从历史数据获取信息
@@ -290,6 +329,14 @@ def manual_transfer(
             )
             transer_item.doubanid = (
                 str(history.doubanid) if history.doubanid else transer_item.doubanid
+            )
+            transer_item.bangumiid = history.bangumiid or transer_item.bangumiid
+            transer_item.anilistid = history.anilistid or transer_item.anilistid
+            transer_item.media_source = (
+                history.media_source or transer_item.media_source
+            )
+            transer_item.media_id = (
+                history.media_id or transer_item.media_id
             )
             transer_item.season = (
                 int(str(history.seasons).replace("S", ""))
@@ -408,6 +455,10 @@ def manual_transfer(
                 target_path=target_path,
                 tmdbid=transer_item.tmdbid,
                 doubanid=transer_item.doubanid,
+                bangumiid=transer_item.bangumiid,
+                anilistid=transer_item.anilistid,
+                media_source=transer_item.media_source,
+                media_id=transer_item.media_id,
                 mtype=mtype,
                 season=transer_item.season,
                 episode_group=transer_item.episode_group,
@@ -422,6 +473,7 @@ def manual_transfer(
                 downloader=downloader,
                 download_hash=download_hash,
                 preview=transer_item.preview,
+                reorganize=transer_item.reorganize,
                 sync_extra_files=False,
                 cleanup_dest_fileitem=cleanup_dest_fileitem,
             )
@@ -490,6 +542,10 @@ def manual_transfer(
         target_path=target_path,
         tmdbid=transer_item.tmdbid,
         doubanid=transer_item.doubanid,
+        bangumiid=transer_item.bangumiid,
+        anilistid=transer_item.anilistid,
+        media_source=transer_item.media_source,
+        media_id=transer_item.media_id,
         mtype=mtype,
         season=transer_item.season,
         episode_group=transer_item.episode_group,
@@ -504,6 +560,7 @@ def manual_transfer(
         downloader=downloader,
         download_hash=download_hash,
         preview=transer_item.preview,
+        reorganize=transer_item.reorganize,
         sync_extra_files=True,
         cleanup_dest_fileitem=cleanup_dest_fileitem,
     )

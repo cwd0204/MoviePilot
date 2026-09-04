@@ -1,6 +1,6 @@
 ---
 name: moviepilot-api
-version: 2
+version: 9
 description: >-
   Use this skill when you need to call MoviePilot REST API endpoints directly
   with the bundled Python client. Covers MoviePilot HTTP endpoints across media
@@ -65,6 +65,25 @@ python scripts/mp-api.py <METHOD> <PATH> [key=value ...] [--json '<body>']
 - Both methods validate against the same `API_TOKEN` value.
 - Never print, summarize, or ask the user to paste the API key unless the script is being used outside the local project and no safer configuration source is available.
 
+### API versions and response envelopes
+
+- `/api/v1` preserves the existing endpoint-specific response shapes by
+  default; the login wallpaper URL is now returned in `data`.
+- `/api/v2` reuses the same routes, parameters, authentication dependencies,
+  and business handlers, but wraps ordinary JSON responses in the shared
+  `Response` envelope.
+- A successful raw v1 payload becomes
+  `{"success":true,"message":"","data":<original payload>}` in v2.
+- Existing `Response` payloads are not wrapped again. HTTP errors on both v1
+  and v2 keep their original status code and expose the error text in
+  `message` with `data={}`. Non-business HTTP exceptions are not translated.
+- SSE, files, images, empty responses, and OpenAI, Anthropic, or MCP protocol
+  endpoints keep their protocol-native response body.
+
+Use `/api/v2` for app clients that require one JSON envelope. Any ordinary
+REST path listed below can switch from `/api/v1/...` to `/api/v2/...` without
+changing its method, parameters, request body, or authentication.
+
 ### Examples
 
 ```bash
@@ -79,6 +98,9 @@ python scripts/mp-api.py DELETE /api/v1/subscribe/123
 
 # Endpoints that require ?token= auth
 python scripts/mp-api.py GET /api/v1/dashboard/statistic2 --token-param
+
+# Uniform v2 JSON response envelope
+python scripts/mp-api.py GET /api/v2/dashboard/cpu
 ```
 
 ## Complete API Reference
@@ -91,19 +113,19 @@ All endpoints are under the base URL `{MP_HOST}`. Path parameters are shown as `
 
 | Method | Path | Description |
 |--------|------|-------------|
-| GET | `/api/v1/media/search` | Search media/person by title. Params: `title` (required), `type`, `page`, `count` |
-| GET | `/api/v1/media/recognize` | Recognize media from torrent title. Params: `title` (required), `subtitle` |
-| GET | `/api/v1/media/recognize2` | Recognize media (API_TOKEN auth, use `--token-param`). Params: `title`, `subtitle` |
-| GET | `/api/v1/media/recognize_file` | Recognize media from file path. Params: `path` (required) |
-| GET | `/api/v1/media/recognize_file2` | Recognize file (API_TOKEN auth). Params: `path` |
-| POST | `/api/v1/media/scrape/{storage}` | Scrape media metadata. Body: FileItem JSON |
+| GET | `/api/v1/media/search` | Search media, collections, or people by title. Params: `title` (required), `type`, `page`, `count`, optional `source`. Supported sources: `media` = `themoviedb`, `douban`, `bangumi`, `anilist`; `collection` = `themoviedb`; `person` = `themoviedb`, `douban` |
+| GET | `/api/v1/media/recognize` | Recognize media from a torrent title or a media file path. Params: `title` (required), `subtitle`, `custom_words`, optional `source`; media file paths also use parent-directory metadata such as title and year |
+| GET | `/api/v1/media/recognize2` | Recognize media from a torrent title or media file path (API_TOKEN auth, use `--token-param`). Params: `title`, `subtitle`, `custom_words`, optional `source`; media file paths also use parent-directory metadata |
+| GET | `/api/v1/media/recognize_file` | Recognize media from file path. Params: `path` (required), optional `source` |
+| GET | `/api/v1/media/recognize_file2` | Recognize file (API_TOKEN auth). Params: `path`, optional `source` |
+| POST | `/api/v1/media/scrape/{storage}` | Scrape media metadata. Body: FileItem JSON. Optional params: `media_source`, `media_id`, `type_name` (`电影`/`电视剧`) |
 | GET | `/api/v1/media/category/config` | Get category strategy config |
 | POST | `/api/v1/media/category/config` | Save category strategy config. Body: CategoryConfig |
 | GET | `/api/v1/media/category` | Get auto-categorization config |
 | GET | `/api/v1/media/group/seasons/{episode_group}` | Get episode group seasons |
 | GET | `/api/v1/media/groups/{tmdbid}` | Get media episode groups |
 | GET | `/api/v1/media/seasons` | Get media season info. Params: `mediaid`, `title`, `year`, `season` |
-| GET | `/api/v1/media/{mediaid}` | Get media detail. Params: `type_name` (required: movie/tv), `title`, `year` |
+| GET | `/api/v1/media/{mediaid}` | Get media detail. `mediaid` supports `tmdb:`, `douban:`, `bangumi:`, `anilist:`, and plugin-defined source prefixes. Params: `type_name` (required: movie/tv), `title`, `year` |
 
 ### TMDB (8 endpoints)
 
@@ -138,30 +160,47 @@ All endpoints are under the base URL `{MP_HOST}`. Path parameters are shown as `
 | GET | `/api/v1/bangumi/person/{person_id}` | Person detail |
 | GET | `/api/v1/bangumi/person/credits/{person_id}` | Person filmography. Params: `page`, `count` |
 
+### AniList (8 endpoints)
+
+AniList endpoints prefer the `anilist-chinese` proxy and fall back to official AniList GraphQL plus the project's daily translation dataset when the public proxy is unavailable. Media titles prefer the provided Chinese title and fall back to the native-language title.
+
+| Method | Path | Description |
+|--------|------|-------------|
+| GET | `/api/v1/anilist/trending` | TRENDING NOW. Params: `page`, `count` |
+| GET | `/api/v1/anilist/popular-this-season` | POPULAR THIS SEASON. Params: `page`, `count` |
+| GET | `/api/v1/anilist/discover` | Explore anime. Params: `search`, `genre`, `format`, `season`, `season_year`, `status`, `country`, `sort`, `page`, `count` |
+| GET | `/api/v1/anilist/{anilist_id}` | AniList media detail |
+| GET | `/api/v1/anilist/credits/{anilist_id}` | Japanese voice cast. Params: `page`, `count` |
+| GET | `/api/v1/anilist/recommend/{anilist_id}` | Recommendations. Params: `page`, `count` |
+| GET | `/api/v1/anilist/person/{person_id}` | Staff detail |
+| GET | `/api/v1/anilist/person/credits/{person_id}` | Staff anime credits. Params: `page`, `count` |
+
 ### Search / Torrents / Subtitles (11 endpoints)
 
 | Method | Path | Description |
 |--------|------|-------------|
-| GET | `/api/v1/search/media/{mediaid}` | Search torrents by media ID (format: `tmdb:123` / `douban:123` / `bangumi:123`). Params: `mtype`, `area`, `title`, `year`, `season`, `sites` |
+| GET | `/api/v1/search/media/{mediaid}` | Search torrents by media ID (four built-in prefixes or a plugin-defined source prefix). Params: `mtype`, `area`, `title`, `year`, `season`, `sites` |
 | GET | `/api/v1/search/media/{mediaid}/stream` | Stream torrent search by media ID with SSE. Params: `mtype`, `area`, `title`, `year`, `season`, `sites` |
 | GET | `/api/v1/search/title` | Fuzzy search torrents by keyword. Params: `keyword`, `page`, `sites` |
 | GET | `/api/v1/search/title/stream` | Stream fuzzy torrent search with SSE. Params: `keyword`, `page`, `sites` |
 | GET | `/api/v1/search/subtitle/title` | Fuzzy search site subtitles by keyword. Params: `keyword`, `page`, `sites` |
 | GET | `/api/v1/search/subtitle/title/stream` | Stream fuzzy site subtitle search with SSE. Params: `keyword`, `page`, `sites` |
-| GET | `/api/v1/search/subtitle/media/{mediaid}` | Exact subtitle search by media ID (format: `tmdb:123` / `douban:123` / `bangumi:123`). Params: `mtype`, `title`, `year`, `season`, `episode`, `sites` |
+| GET | `/api/v1/search/subtitle/media/{mediaid}` | Exact subtitle search by media ID (four built-in prefixes or a plugin-defined source prefix). Params: `mtype`, `title`, `year`, `season`, `episode`, `sites` |
 | GET | `/api/v1/search/subtitle/media/{mediaid}/stream` | Stream exact subtitle search by media ID with SSE. Params: `mtype`, `title`, `year`, `season`, `episode`, `sites` |
 | GET | `/api/v1/search/last` | Get latest search results |
 | GET | `/api/v1/search/last/context` | Get latest search results with replayable params. `params.result_type` is `torrent` or `subtitle` |
 | POST | `/api/v1/search/recommend` | AI recommended resources. Body: `filtered_indices`, `check_only`, `force` |
 
+Streaming search sends `{"type":"heartbeat"}` every 15 seconds without business events; use it only to keep the connection alive. Final `replace` payloads above 48 items are batched: the first event uses `type=replace`, later events use `type=append`, and every batch includes `replace_batch=true`, zero-based `batch_index`, `batch_count`, and final `total_items`. Collect all batches in order and replace the visible result atomically. After a `replace`, the final `done` event omits duplicate `items`.
+
 ### Download (8 endpoints)
 
 | Method | Path | Description |
 |--------|------|-------------|
-| GET | `/api/v1/download/` | List active downloads. Params: `name` (downloader name) |
+| GET | `/api/v1/download/` | List active downloads. Params: `name` (downloader name); linked history adds media type and source `site_name` |
 | POST | `/api/v1/download/` | Add download (with media info). Body: JSON |
-| POST | `/api/v1/download/add` | Add download (without media info). Body: JSON with `torrent_url` |
-| POST | `/api/v1/download/subtitle` | Download subtitle file to the recognized media download directory. Body: `subtitle_in`, optional `tmdbid`, `doubanid`, `save_path` |
+| POST | `/api/v1/download/add` | Add download without media info. Body: `torrent_in`, optional `media_source` + `media_id` (all four dedicated IDs remain supported), `downloader`, `save_path` |
+| POST | `/api/v1/download/subtitle` | Download subtitle file to the recognized media download directory. Body: `subtitle_in`, optional `media_source` + `media_id` (all four dedicated IDs remain supported), `save_path` |
 | GET | `/api/v1/download/start/{hashString}` | Resume download task |
 | GET | `/api/v1/download/stop/{hashString}` | Pause download task |
 | GET | `/api/v1/download/clients` | List available download clients |
@@ -172,14 +211,14 @@ All endpoints are under the base URL `{MP_HOST}`. Path parameters are shown as `
 | Method | Path | Description |
 |--------|------|-------------|
 | GET | `/api/v1/subscribe/` | List all subscriptions |
-| POST | `/api/v1/subscribe/` | Add subscription. Body: Subscribe JSON |
+| POST | `/api/v1/subscribe/` | Add subscription. Body accepts `media_source` + `media_id` and compatible `tmdbid`, `doubanid`, `bangumiid`, `anilistid` fields |
 | PUT | `/api/v1/subscribe/` | Update subscription. Body: Subscribe JSON |
 | GET | `/api/v1/subscribe/list` | List subscriptions (API_TOKEN auth, use `--token-param`) |
 | GET | `/api/v1/subscribe/{subscribe_id}` | Subscription detail |
 | DELETE | `/api/v1/subscribe/{subscribe_id}` | Delete subscription |
 | PUT | `/api/v1/subscribe/status/{subid}` | Update subscription status. Params: `state` (required) |
-| GET | `/api/v1/subscribe/media/{mediaid}` | Query subscription by media ID. Params: `season`, `title` |
-| DELETE | `/api/v1/subscribe/media/{mediaid}` | Delete subscription by media ID. Params: `season` |
+| GET | `/api/v1/subscribe/media/{mediaid}` | Query subscription by a built-in or plugin-prefixed media ID. Params: `season`, `title` |
+| DELETE | `/api/v1/subscribe/media/{mediaid}` | Delete subscription by a built-in or plugin-prefixed media ID. Params: `season` |
 | GET | `/api/v1/subscribe/refresh` | Refresh all subscriptions |
 | GET | `/api/v1/subscribe/reset/{subid}` | Reset subscription |
 | GET | `/api/v1/subscribe/check` | Refresh subscription TMDB info |
@@ -234,7 +273,7 @@ All endpoints are under the base URL `{MP_HOST}`. Path parameters are shown as `
 
 | Method | Path | Description |
 |--------|------|-------------|
-| GET | `/api/v1/history/download` | Download history. Params: `page`, `count` |
+| GET | `/api/v1/history/download` | Download history, newest first. Params: `page`, `count`. `poster` is the poster image; legacy `image` is the backdrop image. |
 | DELETE | `/api/v1/history/download` | Delete download history. Body: DownloadHistory JSON |
 | GET | `/api/v1/history/transfer` | Transfer history. Params: `title`, `page`, `count`, `status` |
 | DELETE | `/api/v1/history/transfer` | Delete transfer history. Params: `deletesrc`, `deletedest`. Body: TransferHistory |
@@ -271,15 +310,16 @@ All endpoints are under the base URL `{MP_HOST}`. Path parameters are shown as `
 | POST | `/api/v1/storage/save/{name}` | Save storage config. Body: JSON object |
 | GET | `/api/v1/storage/reset/{name}` | Reset storage config |
 
-### Transfer (6 endpoints)
+### Transfer (7 endpoints)
 
 | Method | Path | Description |
 |--------|------|-------------|
 | GET | `/api/v1/transfer/name` | Preview transfer name. Params: `path` (required), `filetype` (required) |
 | GET | `/api/v1/transfer/queue` | Transfer queue |
 | DELETE | `/api/v1/transfer/queue` | Remove from transfer queue. Body: FileItem JSON |
-| POST | `/api/v1/transfer/manual/target-path` | Match manual transfer target path. Body: ManualTransferItem JSON |
-| POST | `/api/v1/transfer/manual` | Manual transfer. Params: `background`. Body: ManualTransferItem JSON |
+| POST | `/api/v1/transfer/manual/target-path` | Match manual transfer target path. Body: ManualTransferItem JSON; optional `media_source` + `media_id` select the recognition source |
+| POST | `/api/v1/transfer/manual/history` | Query successful transfer-history summary for selected files or directories. Body: ManualTransferItem JSON |
+| POST | `/api/v1/transfer/manual` | Manual transfer. Params: `background`. Body: ManualTransferItem JSON; optional `media_source` + `media_id` select recognition and scraping source; matching failed history is cleared automatically, while `reorganize=true` removes matched successful history and old non-move targets before retrying |
 | GET | `/api/v1/transfer/now` | Run immediate transfer |
 
 ### Dashboard (19 endpoints)
@@ -306,13 +346,16 @@ All endpoints are under the base URL `{MP_HOST}`. Path parameters are shown as `
 | GET | `/api/v1/dashboard/network` | Network traffic |
 | GET | `/api/v1/dashboard/network2` | Network traffic (API_TOKEN) |
 
-### Plugin (22 endpoints)
+### Plugin (25 endpoints)
 
 | Method | Path | Description |
 |--------|------|-------------|
 | GET | `/api/v1/plugin/` | List plugins. Params: `state` (installed/market/all), `force` |
 | GET | `/api/v1/plugin/installed` | List installed plugins |
 | GET | `/api/v1/plugin/statistic` | Plugin install statistics |
+| GET | `/api/v1/plugin/rating` | Batch plugin ratings. Params: comma-separated `plugin_ids` |
+| GET | `/api/v1/plugin/rating/{plugin_id}` | Get average rating, rating count, and this installation's rating |
+| POST | `/api/v1/plugin/rating/{plugin_id}` | Rate an installed plugin. Body: `{"rating": 4.5}`; range 0.1-5.0 |
 | GET | `/api/v1/plugin/install/{plugin_id}` | Install plugin. Params: `repo_url`, `force` |
 | GET | `/api/v1/plugin/reload/{plugin_id}` | Reload plugin |
 | GET | `/api/v1/plugin/reset/{plugin_id}` | Reset plugin config & data |
@@ -423,6 +466,17 @@ All endpoints are under the base URL `{MP_HOST}`. Path parameters are shown as `
 | POST | `/api/v1/torrent/cache/refresh` | Refresh torrent cache |
 | POST | `/api/v1/torrent/cache/reidentify/{domain}/{torrent_hash}` | Re-identify torrent. Params: `tmdbid`, `doubanid` |
 
+### Recognition Cache (3 endpoints)
+
+The list endpoint returns local cache totals plus `shared_recognized` and
+`shared_recognize_enabled` for the persisted successful shared-recognition count.
+
+| Method | Path | Description |
+|--------|------|-------------|
+| GET | `/api/v1/tmdb/cache` | Get TheMovieDb recognition cache statistics |
+| DELETE | `/api/v1/tmdb/cache/{cache_key}` | Delete one URL-encoded TheMovieDb recognition cache key |
+| DELETE | `/api/v1/tmdb/cache` | Clear TheMovieDb recognition cache |
+
 ### Message (8 endpoints)
 
 | Method | Path | Description |
@@ -447,7 +501,7 @@ All endpoints are under the base URL `{MP_HOST}`. Path parameters are shown as `
 | GET | `/api/v1/user/{username}` | User detail |
 | DELETE | `/api/v1/user/id/{user_id}` | Delete user by ID |
 | DELETE | `/api/v1/user/name/{user_name}` | Delete user by username |
-| POST | `/api/v1/user/avatar/{user_id}` | Upload avatar. Body: multipart/form-data |
+| POST | `/api/v1/user/avatar/{user_id}` | Upload avatar. Body: multipart/form-data; original filename is returned in `data.filename` |
 | GET | `/api/v1/user/config/{key}` | Get user config |
 | POST | `/api/v1/user/config/{key}` | Update user config |
 
@@ -456,7 +510,7 @@ All endpoints are under the base URL `{MP_HOST}`. Path parameters are shown as `
 | Method | Path | Description |
 |--------|------|-------------|
 | POST | `/api/v1/login/access-token` | Get JWT access token. Body: form (username, password) |
-| GET | `/api/v1/login/wallpaper` | Login page wallpaper |
+| GET | `/api/v1/login/wallpaper` | Login page wallpaper; URL is returned in `data` |
 | GET | `/api/v1/login/wallpapers` | Login page wallpaper list |
 
 ### MCP Tools (6 endpoints)
@@ -469,6 +523,11 @@ All endpoints are under the base URL `{MP_HOST}`. Path parameters are shown as `
 | POST | `/api/v1/mcp/tools/call` | Call a tool. Body: `{"tool_name":"...","arguments":{...}}` |
 | GET | `/api/v1/mcp/tools/{tool_name}` | Get tool definition |
 | GET | `/api/v1/mcp/tools/{tool_name}/schema` | Get tool input schema |
+
+The exposed tool list is dynamic: it includes tools declared by enabled plugins
+and is refreshed lazily after plugin startup, shutdown, reload, or configuration
+activation. Clients that cache MCP metadata must request `tools/list` again or
+reconnect after a plugin lifecycle change.
 
 ### Agent MCP Client (3 endpoints)
 

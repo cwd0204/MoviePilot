@@ -55,6 +55,43 @@ pip install -r requirements.txt
 pip install -r requirements-dev.in
 ```
 
+### 2.1 本地启动脚本
+
+不需要打开 IDE 时，可以直接使用仓库内的启动脚本。脚本会自动定位项目根目录和虚拟环境，并以模块方式启动后端，避免 `ModuleNotFoundError: No module named 'app'`。
+
+```bash
+# 默认启动后端开发服务，前台运行，按 Ctrl+C 停止
+./scripts/start-local.sh
+./scripts/start-local.sh backend
+
+# 如果已经安装前端发布包，可启动完整的前后端服务
+./scripts/start-local.sh service start
+
+# 管理完整服务
+./scripts/start-local.sh stop
+./scripts/start-local.sh restart
+./scripts/start-local.sh status
+./scripts/start-local.sh logs --follow
+```
+
+默认会使用 `DEBUG=true` 和 `DEV=true`，与 IDE 开发启动保持一致；如果不需要热重载，可以这样启动以降低资源占用：
+
+```bash
+DEV=false ./scripts/start-local.sh
+```
+
+脚本会优先使用 `CONFIG_DIR`，其次使用 `MOVIEPILOT_CONFIG_DIR`，再检测 `~/Documents/moviepilot`，最后回退到仓库内的 `config` 目录。需要使用其他配置目录时，可以这样运行：
+
+```bash
+MOVIEPILOT_CONFIG_DIR=/path/to/moviepilot-config ./scripts/start-local.sh
+```
+
+首次使用前如果脚本没有执行权限，运行：
+
+```bash
+chmod +x scripts/start-local.sh
+```
+
 ### 3. 修改主程序依赖
 
 新增或升级依赖时，先确认依赖属于哪个层级：
@@ -72,6 +109,25 @@ pip install -r requirements-dev.in
 - **插件源码**：需要开发或调试的插件放到本仓库的 `app/plugins/` 目录下，例如 `app/plugins/<插件目录>/`。主程序运行时从该目录加载插件，独立插件仓库只是源码来源。
 
 如果资源文件没有放到 `app/helper/`，站点索引、规则和内置资源相关能力可能无法按本地开发预期工作；如果插件没有放到 `app/plugins/`，主程序也不会在本地运行时发现该插件。
+
+### 4.1 GitHub 发版时生成插件市场默认值
+
+源码分支中的 `ConfigModel.PLUGIN_MARKET` 只保留官方插件仓库作为离线兜底。GitHub 的正式版与 Beta 镜像构建会检出 `MoviePilot-Wiki` 的 `main` 分支，并由 `scripts/generate_plugin_market_default.py` 读取 `plugin.md` 中 `plugin-market-repos:start/end` 标记区域，将规范化、去重后的公开仓库清单写入构建工作区。
+
+生成过程遵循以下约束：
+
+- 标记必须唯一、顺序正确，清单不能为空且必须包含 `jxxghp/MoviePilot-Plugins`；不满足时直接终止构建。
+- 生成脚本只替换 `ConfigModel` 中的 `PLUGIN_MARKET` 默认值，不写入运行时环境变量，因此用户仍可通过系统环境变量或 `/config/app.env` 覆盖。
+- 正式版工作流会创建仅由 Release Tag 引用的本地快照提交，Docker 镜像和 Tag 源码归档均来自该快照；Actions 不会将生成结果回写到 `v2` 分支。
+- Release Tag 快照提交信息和镜像标签会记录本次使用的 MoviePilot Wiki Commit，便于追溯清单来源。
+
+本地验证生成结果时，先激活项目虚拟环境，再执行：
+
+```bash
+python -m scripts.generate_plugin_market_default \
+  --wiki-file /path/to/MoviePilot-Wiki/plugin.md \
+  --config-file app/core/config.py
+```
 
 ### 5. 运行安全检查
 

@@ -281,6 +281,9 @@ def _load_subscribe_chain_class():
 
     helper_server_module.MoviePilotServerHelper = _MoviePilotServerHelper
 
+    helper_mediaserver_module = ensure_module("app.helper.mediaserver", types.ModuleType("app.helper.mediaserver"))
+    helper_mediaserver_module.MediaServerHelper = type("MediaServerHelper", (), {})
+
     helper_torrent_module = ensure_module("app.helper.torrent", types.ModuleType("app.helper.torrent"))
     helper_torrent_module.TorrentHelper = type("TorrentHelper", (), {})
 
@@ -288,6 +291,13 @@ def _load_subscribe_chain_class():
 
     class _SubscribeModel:
         def __init__(self, **kwargs):
+            self.best_version_full = 0
+            self.bangumiid = None
+            self.anilistid = None
+            self.media_source = None
+            self.media_id = None
+            self.mediaid = None
+            self.episode_group = None
             for key, value in kwargs.items():
                 setattr(self, key, value)
 
@@ -338,6 +348,7 @@ def _load_subscribe_chain_class():
     chain_dependencies = {
         "app.chain.download": "DownloadChain",
         "app.chain.media": "MediaChain",
+        "app.chain.mediaserver": "MediaServerChain",
         "app.chain.search": "SearchChain",
         "app.chain.tmdb": "TmdbChain",
         "app.chain.torrents": "TorrentsChain",
@@ -384,6 +395,10 @@ class SubscribeChainTest(TestCase):
             "imdbid": None,
             "tvdbid": None,
             "bangumiid": None,
+            "anilistid": None,
+            "media_source": "themoviedb",
+            "media_id": "1",
+            "mediaid": "tmdb:1",
             "episode_group": None,
             "poster": None,
             "backdrop": None,
@@ -403,6 +418,7 @@ class SubscribeChainTest(TestCase):
             selected_episodes=selected_episodes,
             meta_info=SimpleNamespace(season_list=[1], episode_list=meta_episodes or selected_episodes or []),
             media_info=SimpleNamespace(type=MediaType.TV, tmdb_id=1, douban_id=None),
+            confirmed_full_coverage=False,
         )
 
     def test_default_kwargs_respects_explicit_zero_best_version(self):
@@ -546,6 +562,7 @@ class SubscribeChainTest(TestCase):
         context = SimpleNamespace(
             media_info=torrent_media,
             media_recognize_fail_count=0,
+            match_source="unknown",
             meta_info=SimpleNamespace(
                 begin_season=0,
                 episode_list=[1],
@@ -606,6 +623,16 @@ class SubscribeChainTest(TestCase):
             SubscribeChain.get_episode_priority(subscribe),
             {"1": 80, "2": 80, "3": 80},
         )
+
+    def test_full_best_version_does_not_materialize_episode_priority_from_baseline(self):
+        subscribe = self._build_subscribe(
+            best_version_full=1,
+            current_priority=82,
+            episode_priority=None,
+        )
+
+        self.assertEqual(SubscribeChain.get_episode_priority(subscribe), {})
+        self.assertEqual(SubscribeChain.get_best_version_current_priority(subscribe), 82)
 
     def test_get_pending_best_version_episodes_uses_per_episode_status(self):
         subscribe = self._build_subscribe(
@@ -906,17 +933,21 @@ class SubscribeChainTest(TestCase):
         self.assertEqual(meta.begin_season, 0)
         self.assertEqual(meta.type, MediaType.TV)
 
-    def test_follow_preserves_shared_special_season_zero(self):
-        """follow 分享订阅携带 S0 时，标题规整不能把合法季号覆盖成未指定。"""
+    def test_follow_preserves_shared_special_season_and_episode_group(self):
+        """Follow 分享必须保留合法 S0 与自定义剧集组的完整订阅范围。"""
         added_calls = []
+        exists_calls = []
+        history_calls = []
 
         class _SubscribeOper:
             """提供订阅存在性查询，避免依赖真实数据库。"""
 
             def exists(self, *args, **kwargs):
+                exists_calls.append(kwargs)
                 return False
 
             def exist_history(self, *args, **kwargs):
+                history_calls.append(kwargs)
                 return False
 
         class _SystemConfigOper:
@@ -939,6 +970,7 @@ class SubscribeChainTest(TestCase):
                         "tmdbid": None,
                         "doubanid": "12345",
                         "season": 0,
+                        "episode_group": "eg-special",
                         "best_version": 0,
                         "save_path": None,
                         "search_imdbid": False,
@@ -976,6 +1008,9 @@ class SubscribeChainTest(TestCase):
 
         self.assertEqual(len(added_calls), 1)
         self.assertEqual(added_calls[0]["season"], 0)
+        self.assertEqual(added_calls[0]["episode_group"], "eg-special")
+        self.assertEqual(exists_calls[0]["episode_group"], "eg-special")
+        self.assertEqual(history_calls[0]["episode_group"], "eg-special")
 
     def test_resolve_subscribe_missing_accepts_downloaded_episode_best_version_targets(self):
         """外部完成守卫可按任意已下载版本判定分集洗版目标已满足。"""
@@ -1427,8 +1462,8 @@ class SubscribeChainTest(TestCase):
         self.assertEqual(calls[0]["contexts"], [episode_context, full_pack_context])
         self.assertIs(calls[0]["no_exists"], no_exists)
 
-    def test_episode_best_version_tries_full_pack_when_priority_exceeds_current_priority(self):
-        """整包候选按 current_priority 整体门槛判断，单集较高优先级不阻断整包优先。"""
+    def test_episode_best_version_falls_back_when_full_pack_does_not_exceed_every_target(self):
+        """整包候选未严格高于每个目标集时，应回退到按集下载。"""
         subscribe = self._build_subscribe(
             best_version_full=0,
             total_episode=3,
@@ -1470,66 +1505,117 @@ class SubscribeChainTest(TestCase):
 
         self.assertEqual(downloads, [])
         self.assertIs(lefts, no_exists)
-        self.assertEqual(len(calls), 2)
+        self.assertEqual(len(calls), 1)
         self.assertEqual(calls[0]["contexts"], [full_pack_context])
-        self.assertEqual(calls[0]["no_exists"]["media-key"][1].episodes, [])
-        self.assertIs(calls[1]["no_exists"], no_exists)
+        self.assertIs(calls[0]["no_exists"], no_exists)
+
+    def test_episode_full_pack_priority_must_strictly_exceed_all_targets(self):
+        """缺失集按 0 参与比较，且候选与任一目标集相等时也不优先整包。"""
+        subscribe = self._build_subscribe(
+            best_version_full=0,
+            total_episode=3,
+            episode_priority={"1": 90, "2": 80},
+            current_priority=0,
+        )
+
+        self.assertFalse(
+            SubscribeChain._SubscribeChain__should_prefer_full_pack_for_episode_best_version(
+                subscribe=subscribe,
+                priority=82,
+            )
+        )
+        self.assertFalse(
+            SubscribeChain._SubscribeChain__should_prefer_full_pack_for_episode_best_version(
+                subscribe=subscribe,
+                priority=90,
+            )
+        )
+        self.assertTrue(
+            SubscribeChain._SubscribeChain__should_prefer_full_pack_for_episode_best_version(
+                subscribe=subscribe,
+                priority=91,
+            )
+        )
 
     def test_full_pack_priority_check_uses_current_priority_fallback(self):
         """没有按集优先级状态时使用 current_priority 兜底判断。"""
         subscribe = self._build_subscribe(total_episode=3, current_priority=80, episode_priority=None)
 
         self.assertFalse(
-            SubscribeChain._SubscribeChain__is_full_season_priority_higher_than_all_targets(
+            SubscribeChain._SubscribeChain__should_prefer_full_pack_for_episode_best_version(
                 subscribe=subscribe,
                 priority=80,
             )
         )
 
-    def test_full_best_version_priority_check_uses_current_priority_directly(self):
-        """全集洗版优先判断使用 current_priority，避免部分 episode_priority 破坏整体优先级语义。"""
+    def test_full_best_version_completion_uses_baseline_priority(self):
+        """全集洗版完成只认整包准入基线，不受保留的按集事实影响。"""
         subscribe = self._build_subscribe(
             best_version_full=1,
-            total_episode=3,
+            current_priority=82,
+            episode_priority={"1": 100, "2": 100, "3": 100},
+        )
+
+        self.assertFalse(SubscribeChain.is_best_version_complete(subscribe))
+        subscribe.current_priority = 100
+        subscribe.episode_priority = {"1": 80}
+        self.assertTrue(SubscribeChain.is_best_version_complete(subscribe))
+
+    def test_full_best_version_candidate_uses_baseline_without_allowed_episodes(self):
+        """全集候选只比较整包准入基线，不进入按集 interested/allowed_episodes 路径。"""
+        subscribe = self._build_subscribe(
+            best_version_full=1,
+            current_priority=82,
+            episode_priority={"1": 100, "2": 100, "3": 100},
+        )
+        context = SimpleNamespace(
+            selected_episodes=None,
+            meta_info=SimpleNamespace(episode_list=[1, 2, 3]),
+            allowed_episodes=None,
+        )
+
+        with patch.object(
+            SubscribeChain,
+            "_SubscribeChain__get_best_version_interested_episodes",
+            side_effect=AssertionError("full mode must not inspect episode priorities"),
+        ):
+            self.assertFalse(
+                SubscribeChain._SubscribeChain__prepare_best_version_tv_candidate(
+                    subscribe=subscribe,
+                    context=context,
+                    priority=82,
+                )
+            )
+            self.assertTrue(
+                SubscribeChain._SubscribeChain__prepare_best_version_tv_candidate(
+                    subscribe=subscribe,
+                    context=context,
+                    priority=83,
+                )
+            )
+
+        self.assertIsNone(context.allowed_episodes)
+
+    def test_episode_best_version_candidate_sets_allowed_episodes(self):
+        """分集候选继续把实际可提升剧集下传到下载层。"""
+        subscribe = self._build_subscribe(
+            best_version_full=0,
             current_priority=80,
-            episode_priority={"1": 100},
+            episode_priority={"1": 90, "2": 80},
+        )
+        context = SimpleNamespace(
+            selected_episodes=None,
+            meta_info=SimpleNamespace(episode_list=[1, 2, 3]),
         )
 
-        self.assertFalse(
-            SubscribeChain._SubscribeChain__is_full_season_priority_higher_than_all_targets(
-                subscribe=subscribe,
-                priority=80,
-            )
-        )
-        self.assertTrue(
-            SubscribeChain._SubscribeChain__is_full_season_priority_higher_than_all_targets(
-                subscribe=subscribe,
-                priority=81,
-            )
-        )
-        subscribe.current_priority = 0
-        self.assertTrue(
-            SubscribeChain._SubscribeChain__is_full_season_priority_higher_than_all_targets(
-                subscribe=subscribe,
-                priority=10,
-            )
+        accepted = SubscribeChain._SubscribeChain__prepare_best_version_tv_candidate(
+            subscribe=subscribe,
+            context=context,
+            priority=85,
         )
 
-    def test_full_pack_priority_check_computes_gate_when_current_priority_is_none(self):
-        """没有持久 current_priority 时，整包门槛按当前按集事实计算。"""
-        subscribe = self._build_subscribe(
-            best_version_full=1,
-            total_episode=3,
-            current_priority=None,
-            episode_priority={"1": 100, "2": 80},
-        )
-
-        self.assertTrue(
-            SubscribeChain._SubscribeChain__is_full_season_priority_higher_than_all_targets(
-                subscribe=subscribe,
-                priority=1,
-            )
-        )
+        self.assertTrue(accepted)
+        self.assertEqual(context.allowed_episodes, {2, 3})
 
     def test_record_download_facts_uses_selected_episodes(self):
         subscribe = self._build_subscribe(
@@ -1706,6 +1792,11 @@ class SubscribeChainTest(TestCase):
             overview="overview",
             imdb_id="tt1234567",
             tvdb_id=99,
+            source="themoviedb",
+            tmdb_id=1,
+            douban_id=None,
+            bangumi_id=None,
+            anilist_id=None,
             get_poster_image=lambda: "poster",
             get_backdrop_image=lambda: "backdrop",
         )
@@ -1900,6 +1991,8 @@ class SubscribeNoteTrackingTest(TestCase):
                 type=MediaType.TV,
                 tmdb_id=1,
                 douban_id=None,
+                bangumi_id=None,
+                anilist_id=None,
             ),
             torrent_info=SimpleNamespace(pri_order=99, title="fake-torrent"),
             selected_episodes=list(episodes),
@@ -2337,6 +2430,31 @@ class SubscribeProgressEntrypointTest(TestCase):
         self.assertEqual(subscribe.current_priority, 0)
         self.assertEqual(updates[-1]["current_priority"], 0)
 
+    def test_refresh_full_best_version_progress_preserves_baseline_priority(self):
+        """全集洗版刷新缺集进度时，不从按集事实覆盖整包准入基线。"""
+        subscribe = self._build_subscribe(
+            best_version_full=1,
+            total_episode=3,
+            current_priority=82,
+            episode_priority={"1": 100},
+            lack_episode=0,
+        )
+        updates = []
+
+        class _SubscribeOper:
+            def update(self, subscribe_id, payload):
+                updates.append(payload)
+
+        with patch.object(self.module, "SubscribeOper", return_value=_SubscribeOper()):
+            self.SubscribeChain()._SubscribeChain__refresh_subscribe_progress_with_no_exists(
+                subscribe=subscribe,
+                no_exists={},
+                scene="unit",
+            )
+
+        self.assertEqual(subscribe.current_priority, 82)
+        self.assertNotIn("current_priority", updates[-1])
+
     def test_refresh_subscribe_progress_normal_tv_uses_resolve_missing_successfully(self):
         subscribe = self._build_subscribe(best_version=0, lack_episode=5)
         mediainfo = SimpleNamespace(
@@ -2372,7 +2490,7 @@ class SubscribeProgressEntrypointTest(TestCase):
         self.assertEqual(kwargs["meta"].name, subscribe.name)
         self.assertEqual(kwargs["meta"].season_seq, "1")
         self.assertIs(kwargs["mediainfo"], mediainfo)
-        self.assertEqual(kwargs["mediakey"], 10001)
+        self.assertEqual(kwargs["mediakey"], "tmdb:10001")
         self.assertTrue(summary["updated"])
         self.assertEqual(summary["lack_episode"], 2)
         self.assertEqual(subscribe.lack_episode, 2)
@@ -2455,6 +2573,8 @@ class SubscribeProgressConsolidationTest(TestCase):
             tmdb_id=31000,
             douban_id=None,
             bangumi_id=None,
+            anilist_id=None,
+            source="themoviedb",
             vote_average=9.5,
             overview="overview",
             imdb_id="tt1234567",
@@ -2666,6 +2786,94 @@ class SubscribeProgressConsolidationTest(TestCase):
             SubscribeChain._SubscribeChain__get_best_version_completed_episodes(subscribe),
             list(range(1, 11)),
         )
+
+    def test_full_best_version_total_expansion_resets_baseline_priority(self):
+        module, SubscribeChain = _load_subscribe_chain_class()
+        subscribe = module.Subscribe(
+            id=41,
+            name="全集洗版扩展剧",
+            type=MediaType.TV.value,
+            season=1,
+            total_episode=3,
+            start_episode=1,
+            lack_episode=0,
+            best_version=1,
+            best_version_full=1,
+            current_priority=82,
+            episode_priority={"1": 90, "2": 80, "3": 82},
+            note=[1, 2, 3],
+            tmdbid=31041,
+            doubanid=None,
+            manual_total_episode=0,
+        )
+
+        payload = SubscribeChain._SubscribeChain__prepare_best_version_total_change_fields(
+            subscribe=subscribe,
+            total_episode=5,
+            old_total_episode=3,
+        )
+
+        self.assertEqual(subscribe.current_priority, 0)
+        self.assertEqual(payload["current_priority"], 0)
+        self.assertEqual(subscribe.episode_priority, {"1": 90, "2": 80, "3": 82})
+
+    def test_full_best_version_total_expansion_does_not_derive_episode_map_from_baseline(self):
+        module, SubscribeChain = _load_subscribe_chain_class()
+        subscribe = module.Subscribe(
+            id=45,
+            name="全集洗版无按集事实扩展剧",
+            type=MediaType.TV.value,
+            season=1,
+            total_episode=3,
+            start_episode=1,
+            lack_episode=0,
+            best_version=1,
+            best_version_full=1,
+            current_priority=82,
+            episode_priority={},
+            note=[],
+            tmdbid=31045,
+            doubanid=None,
+            manual_total_episode=0,
+        )
+
+        payload = SubscribeChain._SubscribeChain__prepare_best_version_total_expansion_fields(
+            subscribe=subscribe,
+            total_episode=5,
+        )
+
+        self.assertEqual(subscribe.current_priority, 0)
+        self.assertEqual(payload["episode_priority"], {})
+
+    def test_full_best_version_total_shrink_preserves_baseline_priority(self):
+        module, SubscribeChain = _load_subscribe_chain_class()
+        subscribe = module.Subscribe(
+            id=43,
+            name="全集洗版缩小剧",
+            type=MediaType.TV.value,
+            season=1,
+            total_episode=5,
+            start_episode=1,
+            lack_episode=0,
+            best_version=1,
+            best_version_full=1,
+            current_priority=82,
+            episode_priority={"1": 90, "2": 80, "3": 82, "4": 70, "5": 60},
+            note=[1, 2, 3, 4, 5],
+            tmdbid=31043,
+            doubanid=None,
+            manual_total_episode=0,
+        )
+
+        payload = SubscribeChain._SubscribeChain__prepare_best_version_total_change_fields(
+            subscribe=subscribe,
+            total_episode=3,
+            old_total_episode=5,
+        )
+
+        self.assertEqual(subscribe.current_priority, 82)
+        self.assertEqual(payload["current_priority"], 82)
+        self.assertEqual(subscribe.episode_priority, {"1": 90, "2": 80, "3": 82})
 
     def test_refresh_total_episode_before_completion_resets_legacy_current_priority_when_filtered_empty(self):
         module, SubscribeChain = _load_subscribe_chain_class()
@@ -3163,6 +3371,23 @@ class SubscribeProgressConsolidationTest(TestCase):
         self.assertEqual(schema_subscribe.completed_episode, 3)
         self.assertEqual(schemas.compute_subscribe_completed_episode(chain_subscribe), 3)
 
+    def test_full_best_version_completed_episode_uses_baseline_not_episode_map(self):
+        data = {
+            "name": "全集洗版响应剧",
+            "type": MediaType.TV.value,
+            "best_version": 1,
+            "best_version_full": 1,
+            "start_episode": 1,
+            "total_episode": 3,
+            "current_priority": 82,
+            "episode_priority": {"1": 100, "2": 100, "3": 100},
+        }
+
+        self.assertEqual(schemas.compute_subscribe_completed_episode(SimpleNamespace(**data)), 0)
+        data["current_priority"] = 100
+        data["episode_priority"] = {"1": 80}
+        self.assertEqual(schemas.compute_subscribe_completed_episode(SimpleNamespace(**data)), 3)
+
 
 class SubscribeDownloadFactsTest(TestCase):
     def setUp(self):
@@ -3195,7 +3420,13 @@ class SubscribeDownloadFactsTest(TestCase):
             confirmed_full_coverage=confirmed_full_coverage,
             torrent_info=SimpleNamespace(pri_order=pri_order),
             meta_info=SimpleNamespace(episode_list=episodes or [], season_list=[1]),
-            media_info=SimpleNamespace(type=MediaType.TV, tmdb_id=30003, douban_id=None),
+            media_info=SimpleNamespace(
+                type=MediaType.TV,
+                tmdb_id=30003,
+                douban_id=None,
+                bangumi_id=None,
+                anilist_id=None,
+            ),
         )
 
     def test_normal_tv_download_records_note_and_episode_priority_without_current_priority(self):
@@ -3291,7 +3522,27 @@ class SubscribeDownloadFactsTest(TestCase):
         self.assertEqual(snapshot["episodes"], [1, 2, 3, 4])
         self.assertEqual(subscribe.note, [1, 2, 3, 4])
         self.assertEqual(subscribe.episode_priority, {"1": 90, "2": 90, "3": 90, "4": 90})
-        self.assertNotIn("current_priority", updates[-1])
+        self.assertEqual(subscribe.current_priority, 90)
+        self.assertEqual(updates[-1]["current_priority"], 90)
+
+    def test_full_best_version_does_not_write_baseline_without_confirmed_full_coverage(self):
+        subscribe = self._build_subscribe(
+            best_version=1,
+            best_version_full=1,
+            current_priority=82,
+            episode_priority={"1": 60},
+        )
+
+        with patch.object(self.module, "SubscribeOper") as subscribe_oper_cls:
+            self.SubscribeChain()._SubscribeChain__record_subscribe_download_facts(
+                subscribe,
+                mediainfo=SimpleNamespace(title_year="下载事实剧 (2026)"),
+                downloads=[self._download(episodes=[1], pri_order=90, confirmed_full_coverage=False)],
+            )
+
+        payload = subscribe_oper_cls.return_value.update.call_args.args[1]
+        self.assertEqual(subscribe.current_priority, 82)
+        self.assertNotIn("current_priority", payload)
 
     def test_normal_subscription_without_episode_list_does_not_use_target_range_without_download_confirmation(self):
         subscribe = self._build_subscribe(best_version=0, best_version_full=0)
@@ -3333,7 +3584,10 @@ class SubscribeDownloadFactsTest(TestCase):
             lack_episode=1,
         )
         download = self._download(episodes=[], pri_order=90)
-        download.media_info = SimpleNamespace(type=MediaType.MOVIE, tmdb_id=30003, douban_id=None)
+        download.media_info = SimpleNamespace(
+            type=MediaType.MOVIE, tmdb_id=30003, douban_id=None,
+            bangumi_id=None, anilist_id=None,
+        )
         download.meta_info = SimpleNamespace(episode_list=[], season_list=[])
         updates = []
 
@@ -3369,7 +3623,10 @@ class SubscribeDownloadFactsTest(TestCase):
             lack_episode=1,
         )
         download = self._download(episodes=[], pri_order=90)
-        download.media_info = SimpleNamespace(type=MediaType.MOVIE, tmdb_id=30003, douban_id=None)
+        download.media_info = SimpleNamespace(
+            type=MediaType.MOVIE, tmdb_id=30003, douban_id=None,
+            bangumi_id=None, anilist_id=None,
+        )
         download.meta_info = SimpleNamespace(episode_list=[], season_list=[])
         chain = self.SubscribeChain()
 
@@ -3402,7 +3659,10 @@ class SubscribeDownloadFactsTest(TestCase):
             lack_episode=1,
         )
         download = self._download(episodes=[], pri_order=90)
-        download.media_info = SimpleNamespace(type=MediaType.MOVIE, tmdb_id=30003, douban_id=None)
+        download.media_info = SimpleNamespace(
+            type=MediaType.MOVIE, tmdb_id=30003, douban_id=None,
+            bangumi_id=None, anilist_id=None,
+        )
         download.meta_info = SimpleNamespace(episode_list=[], season_list=[])
         chain = self.SubscribeChain()
 
@@ -3435,7 +3695,10 @@ class SubscribeDownloadFactsTest(TestCase):
             lack_episode=1,
         )
         download = self._download(episodes=[], pri_order=90)
-        download.media_info = SimpleNamespace(type=MediaType.MOVIE, tmdb_id=30003, douban_id=None)
+        download.media_info = SimpleNamespace(
+            type=MediaType.MOVIE, tmdb_id=30003, douban_id=None,
+            bangumi_id=None, anilist_id=None,
+        )
         download.meta_info = SimpleNamespace(episode_list=[], season_list=[])
         updates = []
         finished = []

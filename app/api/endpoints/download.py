@@ -1,4 +1,4 @@
-from typing import Any, List, Annotated, Optional
+from typing import Any, List, Annotated, Literal, Optional
 
 from fastapi import APIRouter, Depends, Body
 
@@ -17,6 +17,7 @@ from app.schemas.types import SystemConfigKey
 from app.utils.security import SecurityUtils
 
 router = APIRouter()
+MediaSource = Literal["themoviedb", "douban", "bangumi", "anilist"]
 
 
 def _prepare_subtitle_download(subtitle: SubtitleInfo) -> tuple[bool, str]:
@@ -97,6 +98,10 @@ def add(
     torrent_in: schemas.TorrentInfo,
     tmdbid: Annotated[int | None, Body()] = None,
     doubanid: Annotated[str | None, Body()] = None,
+    bangumiid: Annotated[int | None, Body()] = None,
+    anilistid: Annotated[int | None, Body()] = None,
+    media_source: Annotated[MediaSource | None, Body()] = None,
+    media_id: Annotated[str | None, Body()] = None,
     downloader: Annotated[str | None, Body()] = None,
     # 保存路径, 支持<storage>:<path>, 如rclone:/MP, smb:/server/share/Movies等
     save_path: Annotated[str | None, Body()] = None,
@@ -108,15 +113,20 @@ def add(
     # 元数据
     metainfo = MetaInfo(title=torrent_in.title, subtitle=torrent_in.description)
     # 媒体信息
-    if tmdbid or doubanid:
+    if tmdbid or doubanid or bangumiid or anilistid or media_id:
         mediainfo = MediaChain().recognize_media(
             meta=metainfo,
+            source=media_source,
+            mediaid=media_id,
             tmdbid=tmdbid,
             doubanid=doubanid,
+            bangumiid=bangumiid,
+            anilistid=anilistid,
         )
     else:
         mediainfo = MediaChain().recognize_by_meta(
             metainfo,
+            source=media_source,
             obtain_images=False,
         )
     if not mediainfo:
@@ -146,6 +156,10 @@ def download_subtitle(
     subtitle_in: schemas.SubtitleInfo,
     tmdbid: Annotated[int | None, Body()] = None,
     doubanid: Annotated[str | None, Body()] = None,
+    bangumiid: Annotated[int | None, Body()] = None,
+    anilistid: Annotated[int | None, Body()] = None,
+    media_source: Annotated[MediaSource | None, Body()] = None,
+    media_id: Annotated[str | None, Body()] = None,
     save_path: Annotated[str | None, Body()] = None,
     current_user: User = Depends(get_current_active_user),
 ) -> Any:
@@ -160,8 +174,12 @@ def download_subtitle(
 
     success, message, saved_files = DownloadChain().download_subtitle(
         subtitle=subtitle_info,
+        media_source=media_source,
+        media_id=media_id,
         tmdbid=tmdbid,
         doubanid=doubanid,
+        bangumiid=bangumiid,
+        anilistid=anilistid,
         save_path=save_path,
         username=current_user.name,
     )
