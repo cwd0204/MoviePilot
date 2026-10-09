@@ -1936,7 +1936,7 @@ class MediaInfo:
         overview = (overview[:max_len] + placeholder) if len(overview) > max_len else overview
         return overview
 
-    def to_dict(self):
+    def to_dict(self) -> dict[str, Any]:
         """
         返回字典
         """
@@ -2038,3 +2038,18 @@ class Context:
             "confirmed_full_coverage": self.confirmed_full_coverage,
             "music_track_keys": self.music_track_keys,
         }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> Self:
+        """
+        从 to_dict 输出恢复上下文。
+
+        嵌套的识别/媒体/种子对象需由调用方先行还原为实例再传入；未知键忽略，
+        剧集集合恢复 None / 空集 / 非空集三态语义。
+        """
+        names = {item.name for item in fields(cls)}
+        values = {key: value for key, value in data.items() if key in names}
+        allowed = values.get("allowed_episodes")
+        if allowed is not None:
+            values["allowed_episodes"] = set(allowed)
+        return cls(**values)

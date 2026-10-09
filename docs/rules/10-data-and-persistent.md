@@ -460,8 +460,11 @@ their values before writing). When an object cannot be JSON-encoded yet, encode 
 `SignedPickleCodec` from `app/runtime/cache.py`: it prefixes the pickle bytes with an HMAC-SHA256
 signature whose key is derived from the persisted `API_TOKEN` (so caches survive restarts), and
 `loads()` refuses unsigned, tampered or foreign payloads with `ValueError`. Never call `pickle.loads` directly on cache or database content. The
-Redis adapter treats legacy unsigned `PICKLE` payloads as cache misses, and Chain receives its
-codec through `ChainRuntimeContext.cache_codec` from the startup composition root.
+Redis adapter treats legacy unsigned `PICKLE` payloads as cache misses. Chain file caches use
+`JsonChainCacheCodec` (`app/chain/cache.py`), which encodes `Context`, `MediaInfo`, `MusicInfo`,
+`TorrentInfo`, `SubtitleInfo` and `MetaBase` subclasses as tagged JSON and restores them through
+`Context.from_dict`, the existing `from_dict` methods and `MetaBase.restore_state`; the codec is
+injected through `ChainRuntimeContext.cache_codec` from the startup composition root.
 
 ### Redis (Optional)
 

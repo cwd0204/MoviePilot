@@ -29,6 +29,7 @@ from app.chain._recognition import (
     configure_recognition_share_port,
     reset_recognition_share_port,
 )
+from app.chain.cache import JsonChainCacheCodec
 from app.chain.mediaserver import MediaServerChain
 from app.chain.subscribe.notify import (
     SubscriptionSharePort,
@@ -50,7 +51,7 @@ from app.db.oper.systemconfig import SystemConfigOper
 from app.db.session import SessionFactory
 from app.domain.context import MediaInfo, MusicInfo
 from app.domain.meta.metabase import MetaBase
-from app.runtime.cache import AsyncFileCache, FileCache, SignedPickleCodec
+from app.runtime.cache import AsyncFileCache, FileCache
 from app.runtime.events import EventManager
 from app.runtime.extensions.module.dispatcher import ModuleInvocationDispatcher
 from app.runtime.extensions.module.manager import ModuleManager
@@ -97,8 +98,8 @@ def build_chain_runtime_context(
         message_helper=dependencies.message_helper,
         file_cache=FileCache(),
         async_file_cache=AsyncFileCache(),
-        # Chain 缓存里的 Context 集合暂未 JSON 化，先用签名 pickle 兜底；密钥材料取配置快照中的 API_TOKEN
-        cache_codec=SignedPickleCodec(lambda: configuration().api_token),
+        # Chain 文件缓存按类型标签 JSON 编码，不再使用 pickle
+        cache_codec=JsonChainCacheCodec(),
         message_queue=dependencies.message_queue,
         module_dispatcher_factory=ModuleInvocationDispatcher,
         site_repository=dependencies.site,

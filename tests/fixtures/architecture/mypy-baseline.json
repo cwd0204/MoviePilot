@@ -370,8 +370,7 @@
   },
   "app/api/endpoints/anilist.py": {
     "attr-defined": 1,
-    "misc": 8,
-    "no-untyped-call": 2
+    "misc": 8
   },
   "app/api/endpoints/anthropic.py": {
     "misc": 1,
@@ -387,7 +386,6 @@
   "app/api/endpoints/bangumi.py": {
     "attr-defined": 1,
     "misc": 5,
-    "no-untyped-call": 3,
     "operator": 12
   },
   "app/api/endpoints/dashboard.py": {
@@ -401,13 +399,11 @@
     "attr-defined": 1,
     "misc": 6,
     "no-redef": 1,
-    "no-untyped-call": 5,
     "operator": 2
   },
   "app/api/endpoints/douban.py": {
     "attr-defined": 1,
-    "misc": 5,
-    "no-untyped-call": 2
+    "misc": 5
   },
   "app/api/endpoints/download.py": {
     "arg-type": 6,
@@ -442,7 +438,7 @@
     "assignment": 7,
     "attr-defined": 3,
     "misc": 13,
-    "no-untyped-call": 5,
+    "no-untyped-call": 2,
     "no-untyped-def": 1
   },
   "app/api/endpoints/mediaserver.py": {
@@ -531,7 +527,6 @@
     "attr-defined": 2,
     "misc": 23,
     "no-any-return": 1,
-    "no-untyped-call": 1,
     "no-untyped-def": 1,
     "type-arg": 2
   },
@@ -539,14 +534,13 @@
     "arg-type": 1,
     "attr-defined": 4,
     "misc": 30,
-    "no-untyped-call": 6,
+    "no-untyped-call": 4,
     "no-untyped-def": 24,
     "type-arg": 6
   },
   "app/api/endpoints/tmdb.py": {
     "attr-defined": 1,
     "misc": 11,
-    "no-untyped-call": 2,
     "operator": 4,
     "type-arg": 3
   },
@@ -809,7 +803,6 @@
     "arg-type": 1,
     "attr-defined": 26,
     "no-any-return": 6,
-    "no-untyped-call": 1,
     "no-untyped-def": 2,
     "type-arg": 4
   },
@@ -902,7 +895,6 @@
   "app/chain/subscribe/completion.py": {
     "arg-type": 2,
     "assignment": 3,
-    "no-untyped-call": 1,
     "operator": 3,
     "type-var": 1,
     "union-attr": 8,
@@ -926,7 +918,6 @@
     "union-attr": 7
   },
   "app/chain/subscribe/notify.py": {
-    "no-untyped-call": 2,
     "union-attr": 6
   },
   "app/chain/subscribe/policy.py": {
@@ -1216,9 +1207,8 @@
   },
   "app/domain/context.py": {
     "assignment": 86,
-    "no-any-return": 1,
-    "no-untyped-call": 4,
-    "no-untyped-def": 23,
+    "no-untyped-call": 2,
+    "no-untyped-def": 22,
     "operator": 1,
     "type-arg": 36
   },
@@ -1239,7 +1229,7 @@
     "arg-type": 2,
     "assignment": 1,
     "list-item": 1,
-    "no-untyped-def": 8,
+    "no-untyped-def": 7,
     "operator": 2,
     "return-value": 1,
     "type-arg": 4

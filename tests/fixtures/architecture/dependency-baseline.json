@@ -941,8 +941,8 @@
       "runtime_only": true
     }
   },
-  "edge_count": 9416,
-  "edge_sha256": "b1ea9dffbfa52f3cf110294c10113b24f592aca38a97d4025e3fa99f9bee7005",
+  "edge_count": 9423,
+  "edge_sha256": "3eaa7f42c5fcb0dec4354b6bc8221cbd65fe6e2fd84a620881851ce20d2d9672",
   "edges": [
     "app -> app.foundation",
     "app -> app.foundation.environment",
@@ -4477,6 +4477,12 @@
     "app.chain.base -> app.schemas.transfer",
     "app.chain.base -> app.schemas.types",
     "app.chain.base -> app.schemas.workflow",
+    "app.chain.cache -> app.domain",
+    "app.chain.cache -> app.domain.context",
+    "app.chain.cache -> app.domain.meta",
+    "app.chain.cache -> app.domain.meta.metabase",
+    "app.chain.cache -> app.schemas",
+    "app.chain.cache -> app.schemas.types",
     "app.chain.dashboard -> app.chain",
     "app.chain.dashboard -> app.chain.base",
     "app.chain.dashboard -> app.schemas",
@@ -9484,6 +9490,7 @@
     "app.startup.composition.chain -> app.application.system",
     "app.startup.composition.chain -> app.chain",
     "app.startup.composition.chain -> app.chain._recognition",
+    "app.startup.composition.chain -> app.chain.cache",
     "app.startup.composition.chain -> app.chain.mediaserver",
     "app.startup.composition.chain -> app.chain.subscribe",
     "app.startup.composition.chain -> app.chain.subscribe.notify",
@@ -10361,7 +10368,7 @@
     "app.workflow.actions.transfer_file -> app.workflow",
     "app.workflow.actions.transfer_file -> app.workflow.actions"
   ],
-  "module_count": 1114,
+  "module_count": 1115,
   "modules": [
     "app",
     "app.adapters",
@@ -10805,6 +10812,7 @@
     "app.chain.anilist",
     "app.chain.bangumi",
     "app.chain.base",
+    "app.chain.cache",
     "app.chain.dashboard",
     "app.chain.douban",
     "app.chain.download",

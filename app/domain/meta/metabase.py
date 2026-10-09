@@ -759,7 +759,7 @@ class MetaBase(object):
         else:
             self.media_source, self.media_id = resolve_media_identity(media=meta)
 
-    def to_dict(self):
+    def to_dict(self) -> dict[str, Any]:
         """
         转为字典
         """
@@ -770,3 +770,26 @@ class MetaBase(object):
         dicts["name"] = self.name
         dicts["episode_list"] = self.episode_list
         return dicts
+
+    # to_dict 附加的派生字段，恢复状态时跳过，由属性重新计算
+    _DERIVED_DICT_KEYS = frozenset({"season_episode", "edition", "name", "episode_list"})
+
+    @classmethod
+    def restore_state(cls, data: dict[str, Any]) -> Self:
+        """
+        从 to_dict 输出精确恢复解析结果，不重新解析标题。
+
+        用于缓存回读：解析后被调用方修正过的季集、识别词等实例状态原样还原，
+        派生字段跳过，枚举按值还原。
+        """
+        meta = cls.__new__(cls)
+        for key, value in data.items():
+            if key in cls._DERIVED_DICT_KEYS:
+                continue
+            if key == "type" and isinstance(value, str):
+                value = MediaType(value)
+            elif key == "media_source" and isinstance(value, str):
+                value = MediaSource(value)
+            # 直接写入实例字典，避免与同名属性描述符冲突
+            meta.__dict__[key] = value
+        return meta

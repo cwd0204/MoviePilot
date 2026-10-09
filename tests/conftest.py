@@ -228,7 +228,8 @@ def configure_plugin_system_services():
     from app.application.messaging.message import MessageHelper, MessageQueueManager
     from app.application.module import configure_module_runtime
     from app.application.plugin.runtime import configure_plugin_runtime
-    from app.runtime.cache import AsyncFileCache, FileCache, SignedPickleCodec
+    from app.chain.cache import JsonChainCacheCodec
+    from app.runtime.cache import AsyncFileCache, FileCache
     from app.runtime.events import EventManager
     from app.runtime.extensions.module.dispatcher import ModuleInvocationDispatcher
     from app.runtime.extensions.module.manager import ModuleManager
@@ -429,7 +430,7 @@ def configure_plugin_system_services():
             message_helper=MessageHelper(),
             file_cache=FileCache(),
             async_file_cache=AsyncFileCache(),
-            cache_codec=SignedPickleCodec(lambda: "pytest-cache-secret"),
+            cache_codec=JsonChainCacheCodec(),
             message_queue=message_queue,
             module_dispatcher_factory=ModuleInvocationDispatcher,
             site_repository=site_repository(),
