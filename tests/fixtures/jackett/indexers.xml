@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<indexers>
+  <indexer id="demo" configured="true">
+    <title>Demo Tracker</title>
+    <description>Demo private tracker</description>
+    <link>https://tracker.example/</link>
+    <language>en-US</language>
+    <type>private</type>
+    <caps><searching><search available="yes" supportedParams="q" /></searching></caps>
+  </indexer>
+  <indexer id="pub" configured="true">
+    <title>Public Tracker</title>
+    <description>Demo public tracker</description>
+    <link>https://public.example/</link>
+    <language>zh-CN</language>
+    <type>public</type>
+  </indexer>
+  <indexer id="off" configured="false">
+    <title>Unconfigured</title>
+    <type>public</type>
+  </indexer>
+</indexers>

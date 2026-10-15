@@ -1,0 +1,55 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0" xmlns:atom="http://www.w3.org/2005/Atom" xmlns:torznab="http://torznab.com/schemas/2015/feed">
+  <channel>
+    <atom:link href="http://jackett:9117/" rel="self" type="application/rss+xml" />
+    <title>AggregateSearch</title>
+    <description>This feed includes all configured trackers</description>
+    <link>http://127.0.0.1/</link>
+    <language>en-US</language>
+    <category>search</category>
+    <item>
+      <title>Some.Movie.2026.1080p.BluRay.x264-GRP</title>
+      <guid>https://tracker.example/torrent/1001</guid>
+      <jackettindexer id="demo">Demo Tracker</jackettindexer>
+      <type>private</type>
+      <comments>https://tracker.example/torrent/1001</comments>
+      <pubDate>Tue, 14 Oct 2026 10:00:00 +0000</pubDate>
+      <size>1073741824</size>
+      <grabs>12</grabs>
+      <description>Some Movie 2026 中字</description>
+      <link>http://jackett:9117/dl/demo/?jackett_apikey=KEY&amp;path=abc&amp;file=Some.Movie.torrent</link>
+      <category>2000</category>
+      <category>2040</category>
+      <enclosure url="http://jackett:9117/dl/demo/?jackett_apikey=KEY&amp;path=abc&amp;file=Some.Movie.torrent" length="1073741824" type="application/x-bittorrent" />
+      <torznab:attr name="category" value="2000" />
+      <torznab:attr name="category" value="2040" />
+      <torznab:attr name="seeders" value="10" />
+      <torznab:attr name="peers" value="13" />
+      <torznab:attr name="imdb" value="0123456" />
+      <torznab:attr name="imdbid" value="tt0123456" />
+      <torznab:attr name="tmdbid" value="550" />
+      <torznab:attr name="downloadvolumefactor" value="0" />
+      <torznab:attr name="uploadvolumefactor" value="1" />
+    </item>
+    <item>
+      <title>Some.Show.S01E02.1080p.WEB-DL</title>
+      <guid>magnet:?xt=urn:btih:abcdef</guid>
+      <jackettindexer id="pub">Public Tracker</jackettindexer>
+      <type>public</type>
+      <pubDate>Mon, 13 Oct 2026 08:30:00 +0000</pubDate>
+      <size>734003200</size>
+      <description>Some.Show.S01E02.1080p.WEB-DL</description>
+      <category>5000</category>
+      <torznab:attr name="category" value="5000" />
+      <torznab:attr name="seeders" value="3" />
+      <torznab:attr name="peers" value="2" />
+      <torznab:attr name="magneturl" value="magnet:?xt=urn:btih:abcdef" />
+      <torznab:attr name="tvdbid" value="81189" />
+    </item>
+    <item>
+      <title>Broken.Item.No.Link</title>
+      <guid>broken</guid>
+      <size>1</size>
+    </item>
+  </channel>
+</rss>

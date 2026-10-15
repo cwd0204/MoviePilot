@@ -1,0 +1,15 @@
+{
+  "Jackett": {
+    "name": "Jackett",
+    "description": "接入 Jackett 已配置的索引器，参与资源搜索与订阅刷新。",
+    "labels": "搜索",
+    "version": "1.0.0",
+    "icon": "https://raw.githubusercontent.com/Jackett/Jackett/master/src/Jackett.Common/Content/jacket_medium.png",
+    "author": "neiltsai",
+    "level": 1,
+    "system_version": ">=3.1.5",
+    "history": {
+      "v1.0.0": "初始版本：Torznab 关键字搜索与最新种子刷新接入搜索、订阅搜索和订阅刷新。"
+    }
+  }
+}
