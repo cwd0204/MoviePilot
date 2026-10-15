@@ -765,6 +765,68 @@ class ChainBase(RecognitionMixin, MessageProcessingMixin, NotificationMixin, met
             "async_refresh_torrents", site=site, keyword=keyword, cat=cat, page=page, mtype=mtype
         )
 
+    def refresh_plugin_torrents(
+        self,
+        keyword: Optional[str] = None,
+        cat: Optional[str] = None,
+        page: Optional[int] = 0,
+        mtype: Optional[MediaType] = None,
+    ) -> List[TorrentInfo]:
+        """仅刷新插件提供的资源源；site 固定为空字典，由订阅刷新链每轮统一调用一次。"""
+        return (
+            self._module_dispatcher.execute_plugin_modules(
+                "refresh_torrents", None, site={}, keyword=keyword, cat=cat, page=page, mtype=mtype
+            )
+            or []
+        )
+
+    def refresh_site_torrents(
+        self,
+        site: dict[str, Any],
+        keyword: Optional[str] = None,
+        cat: Optional[str] = None,
+        page: Optional[int] = 0,
+        mtype: Optional[MediaType] = None,
+    ) -> List[TorrentInfo]:
+        """仅通过宿主索引模块刷新指定站点；插件资源源不再按站点逐个调用。"""
+        return (
+            self._module_dispatcher.execute_system_modules(
+                "refresh_torrents", None, site=site, keyword=keyword, cat=cat, page=page, mtype=mtype
+            )
+            or []
+        )
+
+    async def async_refresh_plugin_torrents(
+        self,
+        keyword: Optional[str] = None,
+        cat: Optional[str] = None,
+        page: Optional[int] = 0,
+        mtype: Optional[MediaType] = None,
+    ) -> List[TorrentInfo]:
+        """异步刷新插件提供的资源源。"""
+        return (
+            await self._module_dispatcher.async_execute_plugin_modules(
+                "async_refresh_torrents", None, site={}, keyword=keyword, cat=cat, page=page, mtype=mtype
+            )
+            or []
+        )
+
+    async def async_refresh_site_torrents(
+        self,
+        site: dict[str, Any],
+        keyword: Optional[str] = None,
+        cat: Optional[str] = None,
+        page: Optional[int] = 0,
+        mtype: Optional[MediaType] = None,
+    ) -> List[TorrentInfo]:
+        """异步通过宿主索引模块刷新指定站点。"""
+        return (
+            await self._module_dispatcher.async_execute_system_modules(
+                "async_refresh_torrents", None, site=site, keyword=keyword, cat=cat, page=page, mtype=mtype
+            )
+            or []
+        )
+
     def filter_torrents(
         self,
         rule_groups: List[str],

@@ -237,3 +237,28 @@ def test_candidate_index_target_scale_avoids_subscription_candidate_product():
     assert len(fact_loads) == media_count
     assert lease.loads == media_count
     assert lease.hits == subscription_count - media_count
+
+
+def test_candidate_index_site_scope_keeps_plugin_candidates_without_site_id():
+    """订阅站点范围只约束 PT 站点候选，插件资源源候选（无站点 ID）仍参与匹配。"""
+    site_candidate = _context("目标剧集 S01E01", media_id="100", meta_media_id="100")
+    other_site_candidate = _context("目标剧集 S01E02", media_id="100", meta_media_id="100")
+    other_site_candidate.torrent_info.site = 2
+    plugin_candidate = _context("目标剧集 S01E03", media_id="100", meta_media_id="100")
+    plugin_candidate.torrent_info.site = None
+    plugin_candidate.torrent_info.site_name = "[Jackett] Demo"
+    candidates = {
+        "example.com": [site_candidate, other_site_candidate],
+        "plugin": [plugin_candidate],
+    }
+
+    routed = CandidateIndex(candidates).route_for_match(_subscribe(), site_ids={1})
+
+    assert routed == {"example.com": [site_candidate], "plugin": [plugin_candidate]}
+
+    # 订阅显式限定站点域名时，插件桶不在域名范围内，按既有语义排除
+    routed = CandidateIndex(candidates).route_for_match(
+        _subscribe(), domains={"example.com"}, site_ids={1}
+    )
+
+    assert routed == {"example.com": [site_candidate]}

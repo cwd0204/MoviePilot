@@ -11,9 +11,9 @@ from app.schemas.types import MediaType
 
 
 def test_async_browse_passes_music_type_to_indexer():
-    """站点浏览应把音乐类型传入现有索引刷新接口。"""
+    """站点浏览应把音乐类型传入站点专用的索引刷新接口。"""
     chain = TorrentsChain()
-    chain.async_refresh_torrents = AsyncMock(return_value=[])
+    chain.async_refresh_site_torrents = AsyncMock(return_value=[])
     sites_helper = Mock()
     sites_helper.async_get_indexer = AsyncMock(
         return_value={"id": 1, "domain": "example.com"}
@@ -28,7 +28,7 @@ def test_async_browse_passes_music_type_to_indexer():
             )
         )
 
-    chain.async_refresh_torrents.assert_awaited_once_with(
+    chain.async_refresh_site_torrents.assert_awaited_once_with(
         site={"id": 1, "domain": "example.com"},
         keyword="Daft Punk",
         cat=None,

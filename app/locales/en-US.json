@@ -564,6 +564,7 @@
     "安装版本统计上报": "Installation Version Statistics Report",
     "开始清理数据表 ...": "Starting data table cleanup ...",
     "站点资源刷新完成": "Site resource refresh completed",
+    "正在刷新插件资源源 ...": "Refreshing plugin resource sources ...",
     "未配置媒体服务器，跳过同步": "No media server configured, skipping sync",
     "没有已启用的媒体服务器": "No enabled media servers",
     "媒体服务器同步完成": "Media server sync completed",

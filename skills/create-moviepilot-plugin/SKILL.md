@@ -394,6 +394,12 @@ Use only the extension points the requested plugin actually needs:
   `ActionContent` first and return `(success, action_content)`.
 - Agent tools: use `get_agent_tools()`; each tool class must inherit
   `app.agent.tools.base.MoviePilotTool`.
+- Resource sources: declare `search_torrents` / `refresh_torrents` (and the
+  `async_` variants) in `get_module()`. The host calls each enabled provider
+  once per search or subscription refresh with `site={}` and merges the
+  returned `TorrentInfo` list with PT-site results; return `[]` when `page > 0`
+  (plugin sources have one page) or when `site` carries a real site `id`.
+  Set `site=None`, a descriptive `site_name`, and a downloadable `enclosure`.
 - Custom Vue UI: implement `get_render_mode()` when Vue is the selected UI
   mode. Return `("vue", "<compiled-assets-path>")` and include
   built frontend assets in the plugin directory.

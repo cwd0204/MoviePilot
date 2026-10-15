@@ -22,6 +22,10 @@ from app.schemas.media import resolve_media_identity
 from app.schemas.message import Message
 from app.schemas.types import MediaType, MessageType, NotificationChannel, SystemConfigKey
 
+# 插件资源源在刷新缓存中的固定桶键与展示名；每轮只调用一次，不与任何站点混合
+PLUGIN_TORRENT_SOURCE_DOMAIN = "plugin"
+PLUGIN_TORRENT_SOURCE_NAME = "插件资源源"
+
 
 class TorrentsChain(ChainBase):
     """
@@ -286,7 +290,7 @@ class TorrentsChain(ChainBase):
         if not site:
             logger.error(f'站点 {domain} 不存在！')
             return []
-        return self.refresh_torrents(
+        return self.refresh_site_torrents(
             site=site, keyword=keyword, cat=cat, page=page, mtype=mtype
         )
 
@@ -306,7 +310,7 @@ class TorrentsChain(ChainBase):
         if not site:
             logger.error(f'站点 {domain} 不存在！')
             return []
-        return await self.async_refresh_torrents(
+        return await self.async_refresh_site_torrents(
             site=site, keyword=keyword, cat=cat, page=page, mtype=mtype
         )
 
@@ -425,7 +429,7 @@ class TorrentsChain(ChainBase):
             torrents_cache: Dict[str, List[Context]],
             music_cache: Dict[str, List[Context]],
     ) -> str:
-        """抓取并写入单个站点的影视、音乐资源缓存。"""
+        """抓取单个站点的最新资源并写入影视、音乐缓存，返回站点域名键。"""
         domain = site_rules.extract_domain(indexer.get("domain"))
         if stype == "spider":
             torrents: List[TorrentInfo] = []
@@ -438,7 +442,67 @@ class TorrentsChain(ChainBase):
             torrents = self.rss(domain=domain)
         if include_music and self._music_browse_paths(indexer):
             torrents = self.__append_music_browse_torrents(domain=domain, torrents=torrents)
-        torrents.sort(key=lambda item: item.pubdate or "", reverse=True)
+        self._store_refresh_torrents(
+            name=str(indexer.get("name") or domain),
+            domain=domain,
+            torrents=torrents,
+            stype=stype,
+            torrents_cache=torrents_cache,
+            music_cache=music_cache,
+            no_cache=self._is_no_cache_site(domain),
+        )
+        return domain
+
+    def _refresh_plugin_sources(
+            self,
+            *,
+            stype: str,
+            torrents_cache: Dict[str, List[Context]],
+            music_cache: Dict[str, List[Context]],
+            progress_callback: Optional[Callable[..., None]],
+            site_observer: Optional[Callable[[dict[str, object]], None]],
+            total_indexers: int,
+    ) -> str:
+        """每轮调用一次插件资源源并写入独立缓存桶，返回该桶的域名键。"""
+        if runtime_stop_state.is_system_stopped:
+            return PLUGIN_TORRENT_SOURCE_DOMAIN
+        if progress_callback:
+            progress_callback(
+                value=total_indexers / (total_indexers + 1) * 100,
+                text="正在刷新插件资源源 ...",
+                data={"total": total_indexers, "finished": total_indexers},
+            )
+        torrents = self.refresh_plugin_torrents()
+        if not torrents:
+            logger.debug(f"{PLUGIN_TORRENT_SOURCE_NAME}没有返回种子")
+            return PLUGIN_TORRENT_SOURCE_DOMAIN
+        self._store_refresh_torrents(
+            name=PLUGIN_TORRENT_SOURCE_NAME,
+            domain=PLUGIN_TORRENT_SOURCE_DOMAIN,
+            torrents=torrents,
+            stype=stype,
+            torrents_cache=torrents_cache,
+            music_cache=music_cache,
+            no_cache=False,
+        )
+        if site_observer:
+            site_observer({"id": None, "name": PLUGIN_TORRENT_SOURCE_NAME,
+                           "candidates": len(torrents), "status": "checked"})
+        return PLUGIN_TORRENT_SOURCE_DOMAIN
+
+    def _store_refresh_torrents(
+            self,
+            *,
+            name: str,
+            domain: str,
+            torrents: List[TorrentInfo],
+            stype: str,
+            torrents_cache: Dict[str, List[Context]],
+            music_cache: Dict[str, List[Context]],
+            no_cache: bool,
+    ) -> None:
+        """排序、截断、去重并识别一个来源的最新资源，分别写入影视与音乐缓存。"""
+        torrents = sorted(torrents, key=lambda item: item.pubdate or "", reverse=True)
         music_torrents = [
             item for item in torrents if item.category == MediaType.MUSIC.value
         ][:self.runtime_config.refresh_batch_size]
@@ -446,21 +510,19 @@ class TorrentsChain(ChainBase):
             item for item in torrents if item.category != MediaType.MUSIC.value
         ][:self.runtime_config.refresh_batch_size]
         if not torrents and not music_torrents:
-            logger.info(f'{indexer.get("name")} 没有获取到种子')
-            return domain
-        if self._is_no_cache_site(domain):
-            logger.info(
-                f'{indexer.get("name")} 有 {len(torrents) + len(music_torrents)} 个种子 (不缓存)'
-            )
+            logger.info(f'{name} 没有获取到种子')
+            return
+        if no_cache:
+            logger.info(f'{name} 有 {len(torrents) + len(music_torrents)} 个种子 (不缓存)')
             torrents_cache[domain] = []
             music_cache[domain] = []
         else:
             torrents = self._refresh_cached_torrents(torrents, torrents_cache.setdefault(domain, []))
             music_torrents = self._refresh_cached_torrents(music_torrents, music_cache.setdefault(domain, []))
         if not torrents and not music_torrents:
-            logger.info(f'{indexer.get("name")} 没有新种子')
-            return domain
-        logger.info(f'{indexer.get("name")} 有 {len(torrents) + len(music_torrents)} 个新种子')
+            logger.info(f'{name} 没有新种子')
+            return
+        logger.info(f'{name} 有 {len(torrents) + len(music_torrents)} 个新种子')
         for torrent in torrents + music_torrents:
             if runtime_stop_state.is_system_stopped:
                 break
@@ -472,7 +534,6 @@ class TorrentsChain(ChainBase):
             target_cache.setdefault(domain, []).append(context)
             if len(target_cache[domain]) > self.runtime_config.torrent_cache_size:
                 target_cache[domain] = target_cache[domain][-self.runtime_config.torrent_cache_size:]
-        return domain
 
     @staticmethod
     def _torrent_cache_key(torrent: TorrentInfo) -> tuple[object, ...]:
@@ -559,7 +620,7 @@ class TorrentsChain(ChainBase):
             site_observer: Optional[Callable[[dict[str, object]], None]] = None,
     ) -> Dict[str, List[Context]]:
         """
-        刷新站点最新资源并返回本轮可匹配的完整候选缓存。
+        刷新站点与插件资源源的最新资源并返回本轮可匹配的完整候选缓存。
 
         :param stype: 强制指定缓存类型，spider:爬虫缓存，rss:rss缓存
         :param sites: 强制指定站点ID列表，为空则读取设置的订阅站点
@@ -627,6 +688,18 @@ class TorrentsChain(ChainBase):
                 site_observer({"id": indexer.get("id"), "name": indexer.get("name"),
                                "candidates": len(torrents_cache.get(domain, [])) + len(music_cache.get(domain, [])),
                                "status": "checked"})
+
+        # 插件资源源每轮只调用一次，结果进入独立缓存桶并保留在站点过滤之后。
+        domains.append(
+            self._refresh_plugin_sources(
+                stype=stype,
+                torrents_cache=torrents_cache,
+                music_cache=music_cache,
+                progress_callback=progress_callback,
+                site_observer=site_observer,
+                total_indexers=total_indexers,
+            )
+        )
 
         # 保存缓存到本地，影视与音乐分别存储
         if stype == "spider":

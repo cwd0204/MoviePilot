@@ -88,8 +88,9 @@ class CandidateIndex:
             self.last_examined_count += 1
             if domains and domain not in domains:
                 continue
-            torrent_info = getattr(context, "torrent_info", None)
-            if site_ids and getattr(torrent_info, "site", None) not in site_ids:
+            # 插件资源源候选没有站点 ID，不受订阅站点范围限制，与搜索路径保持一致
+            site_id = getattr(getattr(context, "torrent_info", None), "site", None)
+            if site_ids and site_id is not None and site_id not in site_ids:
                 continue
             if not subscribe.custom_words and (
                 not self.media_type_matches(context, subscribe)

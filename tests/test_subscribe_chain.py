@@ -897,6 +897,108 @@ class TestSubscribeChain:
         assert replacement is not None
         assert chain._subscription_execution_admission.release(replacement) is True
 
+    def test_match_keeps_plugin_candidate_outside_site_scope(self):
+        """全局订阅站点范围只约束 PT 站点候选，插件资源源候选（site=None）仍应进入下载候选。"""
+
+        class _TorrentHelper:
+            def filter_torrent(self, *args, **kwargs):
+                return True
+
+        subscribe = self._build_subscribe(
+            best_version=0,
+            custom_words=None,
+            episode_group=None,
+            filter_groups=[],
+            keyword=None,
+            media_category=None,
+            save_path=None,
+            search_imdbid=False,
+            season=1,
+            sites=[],
+            username="",
+            downloader=None,
+        )
+        mediainfo = SimpleNamespace(
+            clear=lambda: None,
+            media_source="themoviedb",
+            media_id="1",
+            title_year="Test Show (2026)",
+            type=MediaType.TV,
+        )
+
+        def _context(site, title):
+            """构造一个已识别到目标媒体的候选，site 为 None 表示插件资源源。"""
+            return SimpleNamespace(
+                media_info=SimpleNamespace(
+                    clear=lambda: None,
+                    media_source="themoviedb",
+                    media_id="1",
+                    type=MediaType.TV,
+                ),
+                media_recognize_fail_count=0,
+                match_source="unknown",
+                meta_info=SimpleNamespace(
+                    begin_season=1,
+                    episode_list=[1],
+                    org_string=title,
+                    season_list=[1],
+                ),
+                torrent_info=SimpleNamespace(
+                    description="",
+                    pri_order=100,
+                    site=site,
+                    site_name="[Jackett] Demo" if site is None else "TestSite",
+                    title=title,
+                ),
+            )
+
+        plugin_context = _context(None, "Test Show S01E01 Plugin")
+        other_site_context = _context(2, "Test Show S01E01 Other")
+        download_calls = []
+
+        class _SubscribeOper:
+            """提供单条订阅，避免依赖真实数据库。"""
+
+            def list(self, *args, **kwargs):
+                """返回当前测试构造的订阅列表。"""
+                return [subscribe]
+
+            def get(self, *args, **kwargs):
+                """下载后仍返回当前订阅。"""
+                return subscribe
+
+        def _download(self, **kwargs):
+            download_calls.append(kwargs)
+            return kwargs["contexts"], {}
+
+        chain = SubscribeChain()
+        chain.subscription_repository = _SubscribeOper()
+        chain.check_and_handle_existing_media = lambda **kwargs: (False, {})
+        # 全局订阅站点只包含站点 1：站点 2 的候选被排除，插件候选不受影响
+        chain.get_sub_sites = lambda *_args, **_kwargs: [1]
+        chain.get_params = lambda *_args, **_kwargs: {}
+        chain.filter_torrents = lambda torrent_list, **_kwargs: list(torrent_list)
+        chain.finish_subscribe_or_not = lambda **_kwargs: None
+
+        with (
+            patch.object(
+                SUBSCRIBE_CHAIN_MODULE,
+                "TorrentHelper",
+                _TorrentHelper,
+            ),
+            patch.object(
+                SubscribeChain,
+                "_SubscribeChain__download_best_version_with_full_pack_first",
+                _download,
+            ),
+            _patch_media_recognize(SUBSCRIBE_CHAIN_MODULE, mediainfo),
+        ):
+            chain.match({"plugin": [plugin_context], "other.example": [other_site_context]})
+
+        assert len(download_calls) == 1
+        downloaded_titles = [context.torrent_info.title for context in download_calls[0]["contexts"]]
+        assert downloaded_titles == ["Test Show S01E01 Plugin"]
+
     def test_get_episode_priority_falls_back_to_current_priority(self):
         subscribe = self._build_subscribe(current_priority=80, episode_priority=None)
 

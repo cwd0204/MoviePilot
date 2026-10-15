@@ -642,8 +642,8 @@ class SubscribeMatchOwner(_SubscribeOwnerBase):
                 torrent_mediainfo = _context.media_info
                 torrent_info = _context.torrent_info
 
-                # 不在订阅站点范围的不处理
-                if sub_sites and torrent_info.site not in sub_sites:
+                # 不在订阅站点范围的不处理；插件资源源候选没有站点 ID，不受此限制
+                if sub_sites and torrent_info.site is not None and torrent_info.site not in sub_sites:
                     logger.debug(f"{torrent_info.site_name} - {torrent_info.title} 不符合订阅站点要求")
                     continue
 

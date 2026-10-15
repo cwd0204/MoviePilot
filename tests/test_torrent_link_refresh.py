@@ -46,12 +46,13 @@ def _torrent(**kwargs) -> TorrentInfo:
 
 @pytest.fixture
 def refresh_chain(monkeypatch):
-    """隔离资源缓存、识别和索引器，仅执行真实刷新编排。"""
+    """隔离资源缓存、识别、索引器和插件资源源，仅执行真实刷新编排。"""
     chain = object.__new__(TorrentsChain)
     chain.load_cache = Mock(return_value={})
     chain.save_cache = Mock()
     chain.browse = Mock(side_effect=lambda **kwargs: [] if kwargs.get("page") else chain.rss())
     chain.rss = Mock(return_value=[])
+    chain.refresh_plugin_torrents = Mock(return_value=[])
     chain._build_refresh_context = Mock(side_effect=lambda torrent, _stype: Context(torrent_info=torrent))
     sites = Mock()
     sites.get_indexers.return_value = [SITE]
