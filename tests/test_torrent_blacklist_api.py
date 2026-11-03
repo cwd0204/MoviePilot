@@ -20,6 +20,7 @@ from app.application.configuration import get_configured_system_config
 from app.application.history import DownloadHistoryWrite, HistoryQueryService
 from app.db.adapters.history.download import SessionDownloadHistoryRepository, TransactionalDownloadHistoryRepository
 from app.db.models.downloadhistory import DownloadHistory
+from app.db.oper.downloadhistory import DownloadHistoryOper
 from app.db.session import SessionFactory, async_session_scope
 from app.schemas.history import DownloadHistory as HistorySchema
 from app.schemas.types import SystemConfigKey
@@ -157,8 +158,28 @@ async def test_async_history_by_id_projects_inside_session(db):
         query = HistoryQueryService(download_repository=SessionDownloadHistoryRepository(session),
                                     transfer_repository=AsyncMock())
         dto = await query.get_download(history_id)
+        assert await query.get_download(-1) is None
     assert dto.id == history_id
     assert dto.note == {"custom": [1]}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("factory", [SessionDownloadHistoryRepository, DownloadHistoryOper])
+async def test_async_history_by_id_refuses_sync_session_without_io(factory, monkeypatch):
+    """
+    异步主键查询拒绝同步会话，不能阻塞请求线程或擅自执行和提交调用方事务。
+    """
+    with SessionFactory() as session:
+        execute = Mock()
+        commit = Mock()
+        monkeypatch.setattr(session, "execute", execute)
+        monkeypatch.setattr(session, "commit", commit)
+
+        with pytest.raises(RuntimeError, match="下载历史异步查询需要"):
+            await factory(session).async_get_by_id(7)
+
+        execute.assert_not_called()
+        commit.assert_not_called()
 
 
 def test_agent_routes_are_fixed_and_admin_only():
